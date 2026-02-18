@@ -1,0 +1,207 @@
+// Facet Compositor Scene Graph
+
+use std.core.ptr.Ptr
+
+// Assuming Affine and Path/Canvas are defined (will be concatenated in test)
+
+const NODE_GROUP: i32 = 0;
+const NODE_SHAPE: i32 = 1;
+
+struct NodeList {
+    nodes: Ptr<Ptr<Node>>,
+    count: i64,
+    capacity: i64,
+}
+
+// Unified Node struct (tagged union style)
+struct Node {
+    kind: i32,
+    transform: Affine,
+    opacity: f32,
+    
+    // Group data
+    children: Ptr<NodeList>,
+    
+    // Shape data
+    path: Ptr<Path>,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Node Constructors
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+
+fn node_alloc() -> Ptr<Node> {
+    let mem = malloc(112); // sizeof(Node) approx: 4+24+4+8+8+4 = ~52, padded to 64 or 128?
+                           // Affine is 6 floats (24 bytes).
+                           // kind: 4, opacity: 4.
+                           // children: 8, path: 8.
+                           // color: 4.
+                           // Total: 4+24+4+8+8+4 = 52. 
+                           // Safe to alloc 128 bytes.
+    return mem as Ptr<Node>;
+}
+
+fn node_group() -> Ptr<Node> {
+    let n = node_alloc();
+    n.kind = NODE_GROUP;
+    n.transform = affine_identity();
+    n.opacity = 1.0;
+    
+    // Init children list
+    let cap: i64 = 16;
+    let list_mem = malloc(24); // sizeof(NodeList)
+    let list = list_mem as Ptr<NodeList>;
+    list.count = 0;
+    list.capacity = cap;
+    list.nodes = malloc(cap * 8) as Ptr<Ptr<Node>>; // array of pointers
+    
+    n.children = list;
+    n.path = 0 as Ptr<Path>; // null
+    return n;
+}
+
+fn node_shape(p: Ptr<Path>, r: u8, g: u8, b: u8, a: u8) -> Ptr<Node> {
+    let n = node_alloc();
+    n.kind = NODE_SHAPE;
+    n.transform = affine_identity();
+    n.opacity = 1.0;
+    n.children = 0 as Ptr<NodeList>; // null
+    n.path = p;
+    n.r = r;
+    n.g = g;
+    n.b = b;
+    n.a = a;
+    return n;
+}
+
+fn node_add_child(group: Ptr<Node>, child: Ptr<Node>) {
+    if group.kind != NODE_GROUP { return; }
+    let list = group.children;
+    
+    if list.count >= list.capacity {
+        let new_cap = list.capacity * 2;
+        let new_mem = malloc(new_cap * 8);
+        let src = list.nodes;
+        let dst = new_mem as Ptr<Ptr<Node>>;
+        let mut i: i64 = 0;
+        while i < list.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(list.nodes as Ptr<u8>);
+        list.nodes = dst;
+        list.capacity = new_cap;
+    }
+    
+    list.nodes.offset(list.count).write(child);
+    list.count = list.count + 1;
+}
+
+fn node_set_transform(n: Ptr<Node>, t: Affine) {
+    n.transform = t;
+}
+
+fn node_set_opacity(n: Ptr<Node>, o: f32) {
+    n.opacity = o;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════
+
+// Forward declaration of fill_path from raster.salt (copy signature if needed, or assume present)
+// fn fill_path(c: &mut Canvas, p: &Path, r: u8, g: u8, b: u8, a: u8);
+
+// We need a version of fill_path that accepts a Transform!
+// Or we transform the path into a TEMPORARY path and then fill it?
+// Transforming the path is safer for now.
+
+fn path_transform(src: Ptr<Path>, matrix: Affine, dst: Ptr<Path>) {
+    // Copy src points to dst, applying transform
+    // We assume dst is empty or cleared.
+    // dst should count = 0 before calling.
+    
+    // We need to iterate over src commands.
+    // Path internals: cmds buffer.
+    
+    let mut i: i64 = 0;
+    while i < src.count {
+        let cmd = src.cmds.offset(i).read();
+        
+        // Transform all points in cmd
+        let p0_t = affine_transform_point(matrix, cmd.p0);
+        let p1_t = affine_transform_point(matrix, cmd.p1);
+        let p2_t = affine_transform_point(matrix, cmd.p2);
+        
+        let new_cmd = PathCmd {
+            tag: cmd.tag,
+            _pad: 0,
+            p0: p0_t,
+            p1: p1_t,
+            p2: p2_t
+        };
+        
+        path_push(dst, new_cmd);
+        i = i + 1;
+    }
+}
+
+fn render_node(c: &mut Canvas, node: Ptr<Node>, parent_tf: Affine, parent_opacity: f32) {
+    if node == (0 as Ptr<Node>) { return; }
+    
+    let local_tf = node.transform;
+    let global_tf = affine_multiply(local_tf, parent_tf); // parent * local? No, usually parent * local.
+    // Wait, multiply(A, B) -> Apply B then A.
+    // Point P local -> global: P' = Parent * (Local * P).
+    // So we want (Parent * Local).
+    // My multiply(A, B) implementation:
+    // A=m1, B=m2.
+    // result.tx = m1.a * m2.tx + ... + m1.tx
+    // This looks like m1 * m2 where m1 is Left and m2 is Right.
+    // So `affine_multiply(parent, local)` is correct for `Parent * Local`.
+    
+    let calc_tf = affine_multiply(parent_tf, local_tf);
+    let calc_opacity = parent_opacity * node.opacity;
+    
+    if node.kind == NODE_GROUP {
+        let list = node.children;
+        let mut i: i64 = 0;
+        while i < list.count {
+            let child = list.nodes.offset(i).read();
+            render_node(c, child, calc_tf, calc_opacity);
+            i = i + 1;
+        }
+    } else if node.kind == NODE_SHAPE {
+        // Transform path and fill
+        let temp_path_struct = path_new();
+        let temp_path = &mut temp_path_struct; // Stack reference? No, salt structs on stack handled by compiler
+        // path_new() returns by value.
+        // We need `temp_path` to be a pointer or mutable reference for path_transform.
+        // `path_transform(src, matrix, dst)`.
+        
+        // Use a temporary path on heap or stack?
+        // path_new allocates heap storage for cmds.
+        
+        path_transform(node.path, calc_tf, temp_path);
+        
+        // Apply opacity to alpha
+        let final_alpha = (node.a as f32) * calc_opacity;
+        let alpha_u8 = final_alpha as u8;
+        
+        fill_path(c, temp_path, node.r, node.g, node.b, alpha_u8);
+        
+        path_free(temp_path);
+    }
+}
+
+fn render_scene(c: &mut Canvas, root: Ptr<Node>) {
+    let identity = affine_identity();
+    render_node(c, root, identity, 1.0);
+}

@@ -1,0 +1,258 @@
+// ═══════════════════════════════════════════════════════════════
+// UI Widget System (Retained Mode -> Scene Graph)
+// ═══════════════════════════════════════════════════════════════
+
+const WIDGET_LABEL: i32 = 0;
+const WIDGET_BUTTON: i32 = 1;
+const WIDGET_COLUMN: i32 = 2;
+const WIDGET_ROW: i32 = 3;
+const WIDGET_PADDING: i32 = 4;
+
+struct AppState { count: i32 }
+// Since Salt fn pointers are tricky with closures, we pass AppState
+// type ClickCallback = fn(state: &mut AppState); 
+
+struct WidgetList {
+    count: i64,
+    capacity: i64,
+    items: Ptr<Ptr<Widget>>,
+}
+
+struct Widget {
+    kind: i32,
+    rect: Rect, // Calculated layout (relative to parent content box)
+    
+    // Label
+    text: Ptr<u8>,
+    r: u8, g: u8, b: u8, a: u8,
+    
+    // Single Child (Button/Padding)
+    child: Ptr<Widget>,
+    
+    // Events
+    on_click: fn(&mut AppState),
+    hovered: bool,
+    pressed: bool,
+    
+    // Multi Child (Column/Row)
+    children: Ptr<WidgetList>,
+    
+    // Metrics
+    padding: f32,
+}
+
+// Allocation Helpers
+fn widget_new(kind: i32) -> Ptr<Widget> {
+    let w_mem = facet_malloc(128); // Generous size for union struct
+    let w = w_mem as Ptr<Widget>;
+    w.kind = kind;
+    w.rect = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    w.child = 0 as Ptr<Widget>;
+    w.children = 0 as Ptr<WidgetList>;
+    return w;
+}
+
+fn widget_label(text: Ptr<u8>, r: u8, g: u8, b: u8) -> Ptr<Widget> {
+    let w = widget_new(WIDGET_LABEL);
+    w.text = text; w.r = r; w.g = g; w.b = b; w.a = 255;
+    return w;
+}
+
+fn widget_button(child: Ptr<Widget>, callback: fn(&mut AppState)) -> Ptr<Widget> {
+    let w = widget_new(WIDGET_BUTTON);
+    w.child = child; w.on_click = callback;
+    w.hovered = false; w.pressed = false;
+    return w;
+}
+
+fn widget_padding(child: Ptr<Widget>, pad: f32) -> Ptr<Widget> {
+    let w = widget_new(WIDGET_PADDING);
+    w.child = child; w.padding = pad;
+    return w;
+}
+
+fn widget_column() -> Ptr<Widget> {
+    let w = widget_new(WIDGET_COLUMN);
+    let list_mem = facet_malloc(24);
+    w.children = list_mem as Ptr<WidgetList>;
+    w.children.count = 0; w.children.capacity = 8;
+    w.children.items = facet_malloc(8 * 8) as Ptr<Ptr<Widget>>;
+    return w;
+}
+
+fn widget_add(parent: Ptr<Widget>, child: Ptr<Widget>) {
+    let list = parent.children;
+    if list.count >= list.capacity {
+        // Simple grow logic omitted for demo brevity (fixed cap 8)
+        return; 
+    }
+    list.items.offset(list.count).write(child);
+    list.count = list.count + 1;
+}
+
+// Layout Pass: Calculates `rect` size based on children
+fn widget_layout(w: Ptr<Widget>, max_w: f32, max_h: f32) {
+    if w.kind == WIDGET_LABEL {
+        // Measure text using text.salt helper
+        let bounds = text_layout_size(w.text); // Need helper
+        w.rect.w = bounds.w;
+        w.rect.h = bounds.h;
+    } else if w.kind == WIDGET_BUTTON {
+        widget_layout(w.child, max_w, max_h);
+        w.rect.w = w.child.rect.w + 10.0; // Minimal padding inside button
+        w.rect.h = w.child.rect.h + 10.0;
+    } else if w.kind == WIDGET_PADDING {
+        let inner_max_w = max_w - (w.padding * 2.0);
+        let inner_max_h = max_h - (w.padding * 2.0);
+        widget_layout(w.child, inner_max_w, inner_max_h);
+        w.rect.w = w.child.rect.w + (w.padding * 2.0);
+        w.rect.h = w.child.rect.h + (w.padding * 2.0);
+    } else if w.kind == WIDGET_COLUMN {
+        let list = w.children;
+        let mut i: i64 = 0;
+        let mut h_acc: f32 = 0.0;
+        let mut max_w_child: f32 = 0.0;
+        while i < list.count {
+            let child = list.items.offset(i).read();
+            widget_layout(child, max_w, max_h - h_acc);
+            // Position child relative to column
+            child.rect.x = 0.0; // Align left
+            child.rect.y = h_acc;
+            h_acc = h_acc + child.rect.h;
+            if child.rect.w > max_w_child { max_w_child = child.rect.w; }
+            i = i + 1;
+        }
+        w.rect.w = max_w_child;
+        w.rect.h = h_acc;
+    }
+}
+
+// Build Scene Graph from Widget Tree
+fn widget_build(w: Ptr<Widget>, x_offset: f32, y_offset: f32) -> Ptr<Node> {
+    let group = node_group();
+    
+    // Apply local offset
+    let my_x = x_offset;
+    let my_y = y_offset;
+    
+    // Note: Node transforms are applied recursively. 
+    // We can either set `group.transform` or just pass accum coords.
+    // Let's use `group.transform` for positioning the widget itself?
+    // Actually, `widget_layout` computed relative positions.
+    // If we use translation node for each widget, it simplifies logic.
+    // BUT we shouldn't nest too deeply. 
+    // Let's translate the group to (my_x, my_y).
+    // Wait, caller passes absolute offset? Or relative accumulates?
+    // Let's say `widget_build` returns a Node representing the widget at (0,0) local?
+    // No, layout computed positions.
+    // `widget_build` should return a Node positioned correctly if it's a child.
+    
+    // For simplicity: Return a Group containing visual elements + children.
+    // The Group transform handles (my_x, my_y).
+    
+    // Actually, if we use transforms, `layout` only needs size. 
+    // Positioning happens here.
+    
+    if w.kind == WIDGET_LABEL {
+        // Text Build
+        // Need to position text. Text path starts at 0,0.
+        // We might center it? layout says top-left.
+        let p = text_build_path(w.text, 0.0, 0.0);
+        let shape = node_shape(p, w.r, w.g, w.b, 255);
+        node_add_child(group, shape);
+        
+    } else if w.kind == WIDGET_BUTTON {
+        // Background
+        let bg_color_r = 100;
+        let bg_color_g = 100;
+        let bg_color_b = 100;
+        if w.hovered { bg_color_r = 150; bg_color_g = 150; bg_color_b = 200; }
+        if w.pressed { bg_color_r = 200; bg_color_g = 200; bg_color_b = 100; }
+        
+        // Rect path
+        let p = path_new();
+        // Assume path_rect helper
+        path_rect(p, 0.0, 0.0, w.rect.w, w.rect.h);
+        let bg = node_shape(p, bg_color_r as u8, bg_color_g as u8, bg_color_b as u8, 255);
+        node_add_child(group, bg);
+        
+        // Child (centered or padded)
+        // Currently layout added 10 padding total (5 each side)
+        let child_node = widget_build(w.child, 0.0, 0.0);
+        // Translate child to (5, 5)
+        child_node.transform = affine_translate(5.0, 5.0);
+        node_add_child(group, child_node);
+        
+    } else if w.kind == WIDGET_PADDING {
+        // Just translate child
+        let child_node = widget_build(w.child, 0.0, 0.0);
+        child_node.transform = affine_translate(w.padding, w.padding);
+        node_add_child(group, child_node);
+        
+    } else if w.kind == WIDGET_COLUMN {
+        let list = w.children;
+        let mut i: i64 = 0;
+        while i < list.count {
+            let child = list.items.offset(i).read();
+            let child_node = widget_build(child, 0.0, 0.0);
+            // Layout stores relative y in child.rect.y
+            child_node.transform = affine_translate(child.rect.x, child.rect.y);
+            node_add_child(group, child_node);
+            i = i + 1;
+        }
+    }
+    
+    return group;
+}
+
+// Event Handling
+// Returns true if event handled
+fn widget_event(w: Ptr<Widget>, mx: f32, my: f32, clicked: bool, state: &mut AppState) -> bool {
+    // Hit test
+    // Simple AABB check against (0,0, w,h) in local space?
+    // We need to transform coordinates as we descend!
+    // But here we don't have the transform stack.
+    // "Retained Mode" usually keeps absolute coords or re-traverses layout.
+    // For this simple demo: We assume layout pass set `rect` (size).
+    // But positions are relative.
+    // We need to pass `rel_mx, rel_my`.
+    
+    // Check bounds
+    if mx < 0.0 || mx > w.rect.w || my < 0.0 || my > w.rect.h {
+        w.hovered = false; // Mouse exit
+        return false;
+    }
+    
+    w.hovered = true;
+    
+    if w.kind == WIDGET_BUTTON {
+        if clicked {
+            w.pressed = true; // Visual feedback
+            if w.on_click as i64 != 0 {
+                let cb = w.on_click;
+                cb(state);
+                return true;
+            }
+        } else {
+            w.pressed = false;
+        }
+        // Pass to child? Button usually consumes click.
+        return true;
+    } else if w.kind == WIDGET_PADDING {
+        return widget_event(w.child, mx - w.padding, my - w.padding, clicked, state);
+    } else if w.kind == WIDGET_COLUMN {
+        let list = w.children;
+        let mut i: i64 = 0;
+        while i < list.count {
+            let child = list.items.offset(i).read();
+            // Child is at (x, y) relative
+            // Only processing y for column (x=0)
+            if widget_event(child, mx - child.rect.x, my - child.rect.y, clicked, state) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    
+    return false;
+}

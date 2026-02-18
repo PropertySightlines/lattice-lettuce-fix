@@ -1,0 +1,16 @@
+// Test: Module namespace method dispatch in --lib mode
+// Validates that serial.init() style calls resolve correctly 
+// when compiled with --lib flag (MODULE NAMESPACE GUARD).
+//
+// This is a lib-mode test — it should compile to MLIR without errors
+// when running with --lib. It does not run as an executable.
+
+package test.module_dispatch
+
+use kernel.core.io
+
+pub fn test_dispatch() {
+    // This should resolve io.outb as a module-namespace call,
+    // NOT as a method on a struct receiver with &self.
+    io.outb(0x3F8, 0x41);
+}

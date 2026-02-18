@@ -1,0 +1,46 @@
+package kernel.core.panic
+
+import kernel.drivers.serial
+
+// Assembly stubs defined in kernel/arch/x86/boot.S
+// kernel_halt: cli; .Lhalt_loop: hlt; jmp .Lhalt_loop
+// disable_interrupts: cli; ret
+extern fn kernel_halt();
+extern fn disable_interrupts();
+
+pub fn panic_with_status(code: i32, msg: &u8)
+    requires(code != 0)
+{
+    // Disable interrupts first — no more ISRs after a panic
+    disable_interrupts();
+
+    serial.print("\n!!! KERNEL PANIC !!!\n");
+    serial.print("STATUS CODE: ");
+    serial.print_u64(code as u64);
+    serial.print("\nCONTEXT: ");
+    serial.print(msg);
+    serial.print("\n----------------\n");
+
+    // Halt the CPU — cli + hlt loop, never returns
+    kernel_halt();
+}
+
+pub fn panic(msg: &u8) {
+    // Disable interrupts first — no more ISRs after a panic
+    disable_interrupts();
+
+    serial.print("\n!!! KERNEL PANIC !!!\n");
+    serial.print("MSG: ");
+    serial.print(msg);
+    serial.print("\n----------------\n");
+
+    // Halt the CPU — cli + hlt loop, never returns
+    kernel_halt();
+}
+
+pub fn halt() {
+    // Disable interrupts, then halt the CPU.
+    // This is the clean shutdown path — used after benchmark completion.
+    disable_interrupts();
+    kernel_halt();
+}

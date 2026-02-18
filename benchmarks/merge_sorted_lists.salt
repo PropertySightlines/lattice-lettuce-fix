@@ -1,0 +1,51 @@
+package main
+
+// LeetCode 21: Merge Two Sorted Linked Lists — Ptr truthiness + arena allocation
+
+use std.core.ptr.Ptr
+use std.core.arena
+
+struct ListNode {
+    val: i32,
+    next: Ptr<ListNode>
+}
+
+fn create_list(len: i32, start: i32, step: i32) -> Ptr<ListNode> {
+    if len <= 0 { return Ptr::empty(); }
+    let node = arena::alloc(16) as Ptr<ListNode>;
+    node.val = start;
+    node.next = create_list(len - 1, start + step, step);
+    return node;
+}
+
+fn merge(a: Ptr<ListNode>, b: Ptr<ListNode>) -> Ptr<ListNode> {
+    if a {
+        if b {
+            if a.val < b.val {
+                a.next = merge(a.next, b);
+                return a;
+            } else {
+                b.next = merge(a, b.next);
+                return b;
+            }
+        }
+        return a;
+    }
+    return b;
+}
+
+fn main() -> i32 {
+    let mut checksum = 0;
+    for i in 0..5000 {
+        let m = arena::mark();
+        let merged = merge(create_list(100, 0, 2), create_list(100, 1, 2));
+        let mut curr = merged;
+        while curr {
+            checksum += curr.val;
+            curr = curr.next;
+        }
+        arena::reset_to(m);
+    }
+    println(f"Checksum: {checksum as i64}");
+    return 0;
+}

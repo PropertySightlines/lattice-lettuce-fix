@@ -1,0 +1,27 @@
+// Facet Layer 1: GPU Shader Coverage Test
+// This file verifies that @shader functions compile correctly.
+// The compiler translates @shader functions to MSL text,
+// embedded as global string constants in the LLVM module.
+
+@shader(compute)
+fn vector_add(a: Ptr<f32>, b: Ptr<f32>, out: Ptr<f32>, len: i32) {
+    let id = thread_id();
+    if id < len {
+        let sum = a.read_at(id) + b.read_at(id);
+        out.write_at(id, sum);
+    }
+}
+
+@shader(compute)
+fn scalar_multiply(data: Ptr<f32>, scale: Ptr<f32>, out: Ptr<f32>, len: i32) {
+    let id = thread_id();
+    if id < len {
+        out.write_at(id, data.read_at(id) * scale.read_at(0));
+    }
+}
+
+fn main() -> i32 {
+    // Host-side: shader MSL is compiled into constants.
+    // In Layer 2, these will be loaded via Metal API.
+    return 0;
+}

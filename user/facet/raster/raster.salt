@@ -1,0 +1,602 @@
+// Facet Raster — Resolution-Independent Path Rasterizer
+//
+// Core rendering engine for the Facet compositor. Written in pure Salt with
+// Z3-verified bounds checking on every pixel write.
+//
+// Architecture:
+//   Path construction → Bézier flattening → Edge table → Scanline sweep → Coverage → Pixels
+//
+// Performance targets: within 20% of equivalent C code (Salt's Pillar 1).
+// Safety targets: zero out-of-bounds writes, verified at compile time (Pillar 3).
+
+package facet.raster
+
+// ═══════════════════════════════════════════════════════════════
+// FFI declarations (libc, libm)
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn exit(code: i32);
+extern fn fabsf(x: f32) -> f32;
+extern fn sqrtf(x: f32) -> f32;
+extern fn floorf(x: f32) -> f32;
+extern fn ceilf(x: f32) -> f32;
+
+// ═══════════════════════════════════════════════════════════════
+// Core Types
+// ═══════════════════════════════════════════════════════════════
+
+/// 2D point in floating-point space.
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Point {
+    @inline
+    pub fn new(x: f32, y: f32) -> Point {
+        return Point { x: x, y: y };
+    }
+
+    @inline
+    pub fn midpoint(&self, other: &Point) -> Point {
+        return Point {
+            x: (self.x + other.x) * 0.5,
+            y: (self.y + other.y) * 0.5,
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Path Commands
+// ═══════════════════════════════════════════════════════════════
+
+// Command tags
+pub const CMD_MOVE_TO: i32  = 0;
+pub const CMD_LINE_TO: i32  = 1;
+pub const CMD_QUAD_TO: i32  = 2;
+pub const CMD_CUBIC_TO: i32 = 3;
+pub const CMD_CLOSE: i32    = 4;
+
+/// A path command stores up to 3 control points and a type tag.
+/// Layout: [tag: i32, pad: i32, p0.x, p0.y, p1.x, p1.y, p2.x, p2.y]
+/// Total: 32 bytes per command
+pub struct PathCmd {
+    pub tag: i32,
+    pub _pad: i32,
+    pub p0: Point,
+    pub p1: Point,
+    pub p2: Point,
+}
+
+/// A vector path: an ordered sequence of sub-paths.
+pub struct Path {
+    pub cmds: Ptr<PathCmd>,
+    pub count: i64,
+    pub capacity: i64,
+}
+
+impl Path {
+    /// Create a new empty path.
+    pub fn new() -> Path {
+        let cap: i64 = 64;
+        let bytes = cap * 32;  // sizeof(PathCmd) = 32
+        let mem = malloc(bytes);
+        return Path {
+            cmds: mem as Ptr<PathCmd>,
+            count: 0,
+            capacity: cap,
+        };
+    }
+
+    /// Ensure capacity for at least one more command.
+    fn grow(&mut self) {
+        if self.count >= self.capacity {
+            let new_cap = self.capacity * 2;
+            let new_mem = malloc(new_cap * 32);
+            // Copy old data
+            let mut i: i64 = 0;
+            let src = self.cmds;
+            let dst = new_mem as Ptr<PathCmd>;
+            while i < self.count {
+                dst.offset(i).write(src.offset(i).read());
+                i = i + 1;
+            }
+            free(self.cmds as Ptr<u8>);
+            self.cmds = dst;
+            self.capacity = new_cap;
+        }
+    }
+
+    fn push_cmd(&mut self, cmd: PathCmd) {
+        self.grow();
+        self.cmds.offset(self.count).write(cmd);
+        self.count = self.count + 1;
+    }
+
+    pub fn move_to(&mut self, x: f32, y: f32) {
+        self.push_cmd(PathCmd {
+            tag: CMD_MOVE_TO, _pad: 0,
+            p0: Point::new(x, y),
+            p1: Point::new(0.0, 0.0),
+            p2: Point::new(0.0, 0.0),
+        });
+    }
+
+    pub fn line_to(&mut self, x: f32, y: f32) {
+        self.push_cmd(PathCmd {
+            tag: CMD_LINE_TO, _pad: 0,
+            p0: Point::new(x, y),
+            p1: Point::new(0.0, 0.0),
+            p2: Point::new(0.0, 0.0),
+        });
+    }
+
+    pub fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.push_cmd(PathCmd {
+            tag: CMD_QUAD_TO, _pad: 0,
+            p0: Point::new(cx, cy),    // control point
+            p1: Point::new(x, y),       // end point
+            p2: Point::new(0.0, 0.0),
+        });
+    }
+
+    pub fn cubic_to(&mut self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+        self.push_cmd(PathCmd {
+            tag: CMD_CUBIC_TO, _pad: 0,
+            p0: Point::new(c1x, c1y),  // control point 1
+            p1: Point::new(c2x, c2y),  // control point 2
+            p2: Point::new(x, y),       // end point
+        });
+    }
+
+    pub fn close(&mut self) {
+        self.push_cmd(PathCmd {
+            tag: CMD_CLOSE, _pad: 0,
+            p0: Point::new(0.0, 0.0),
+            p1: Point::new(0.0, 0.0),
+            p2: Point::new(0.0, 0.0),
+        });
+    }
+
+    pub fn free(&mut self) {
+        free(self.cmds as Ptr<u8>);
+        self.count = 0;
+        self.capacity = 0;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Canvas — RGBA pixel buffer
+// ═══════════════════════════════════════════════════════════════
+
+/// An RGBA pixel buffer with pre-multiplied alpha.
+pub struct Canvas {
+    pub pixels: Ptr<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,   // bytes per row (= width * 4)
+}
+
+impl Canvas {
+    /// Create a new canvas, initialized to transparent black.
+    pub fn new(width: i32, height: i32) -> Canvas {
+        let stride = width * 4;
+        let bytes = (stride as i64) * (height as i64);
+        let mem = malloc(bytes);
+        // Zero-fill (transparent black)
+        let mut i: i64 = 0;
+        while i < bytes {
+            mem.offset(i).write(0 as u8);
+            i = i + 1;
+        }
+        return Canvas {
+            pixels: mem,
+            width: width,
+            height: height,
+            stride: stride,
+        };
+    }
+
+    /// Fill entire canvas with a solid RGBA color.
+    pub fn clear(&mut self, r: u8, g: u8, b: u8, a: u8) {
+        let mut y: i32 = 0;
+        while y < self.height {
+            let mut x: i32 = 0;
+            while x < self.width {
+                let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4);
+                self.pixels.offset(off).write(r);
+                self.pixels.offset(off + 1).write(g);
+                self.pixels.offset(off + 2).write(b);
+                self.pixels.offset(off + 3).write(a);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+
+    /// Set a single pixel (with bounds checking).
+    /// Z3 contract: requires 0 <= x < width && 0 <= y < height
+    pub fn set_pixel(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8)
+        requires(x >= 0 && x < self.width && y >= 0 && y < self.height)
+    {
+        let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4);
+        self.pixels.offset(off).write(r);
+        self.pixels.offset(off + 1).write(g);
+        self.pixels.offset(off + 2).write(b);
+        self.pixels.offset(off + 3).write(a);
+    }
+
+    /// Set pixel with safety check (no-op if out of bounds).
+    @inline
+    pub fn set_pixel_safe(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+        if x >= 0 && x < self.width && y >= 0 && y < self.height {
+            let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4);
+            self.pixels.offset(off).write(r);
+            self.pixels.offset(off + 1).write(g);
+            self.pixels.offset(off + 2).write(b);
+            self.pixels.offset(off + 3).write(a);
+        }
+    }
+
+    /// Blend a pixel with alpha compositing (Source Over, pre-multiplied).
+    pub fn blend_pixel(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return;
+        }
+        let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4);
+        if a == 255 {
+            // Fully opaque — direct write
+            self.pixels.offset(off).write(r);
+            self.pixels.offset(off + 1).write(g);
+            self.pixels.offset(off + 2).write(b);
+            self.pixels.offset(off + 3).write(a);
+        } else if a > 0 {
+            // Alpha blend (Source Over with pre-multiplied alpha)
+            let dst_r = self.pixels.offset(off).read() as i32;
+            let dst_g = self.pixels.offset(off + 1).read() as i32;
+            let dst_b = self.pixels.offset(off + 2).read() as i32;
+            let dst_a = self.pixels.offset(off + 3).read() as i32;
+            let src_a = a as i32;
+            let inv_a = 255 - src_a;
+            let out_r = ((r as i32) + (dst_r * inv_a) / 255) as u8;
+            let out_g = ((g as i32) + (dst_g * inv_a) / 255) as u8;
+            let out_b = ((b as i32) + (dst_b * inv_a) / 255) as u8;
+            let out_a = (src_a + (dst_a * inv_a) / 255) as u8;
+            self.pixels.offset(off).write(out_r);
+            self.pixels.offset(off + 1).write(out_g);
+            self.pixels.offset(off + 2).write(out_b);
+            self.pixels.offset(off + 3).write(out_a);
+        }
+    }
+
+    /// Get pixel alpha at (x, y). Returns 0 if out of bounds.
+    pub fn get_alpha(&self, x: i32, y: i32) -> u8 {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return 0;
+        }
+        let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4) + 3;
+        return self.pixels.offset(off).read();
+    }
+
+    /// Get pixel RGBA as packed u32 (R << 24 | G << 16 | B << 8 | A).
+    pub fn get_pixel(&self, x: i32, y: i32) -> u32 {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return 0;
+        }
+        let off = ((y as i64) * (self.stride as i64)) + ((x as i64) * 4);
+        let r = self.pixels.offset(off).read() as u32;
+        let g = self.pixels.offset(off + 1).read() as u32;
+        let b = self.pixels.offset(off + 2).read() as u32;
+        let a = self.pixels.offset(off + 3).read() as u32;
+        return (r << 24) | (g << 16) | (b << 8) | a;
+    }
+
+    pub fn free(&mut self) {
+        free(self.pixels);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Edge — used by the scanline rasterizer
+// ═══════════════════════════════════════════════════════════════
+
+struct Edge {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dir: f32,   // +1.0 for downward, -1.0 for upward (winding direction)
+}
+
+/// Dynamic array of edges
+struct EdgeTable {
+    edges: Ptr<Edge>,
+    count: i64,
+    capacity: i64,
+}
+
+impl EdgeTable {
+    fn new() -> EdgeTable {
+        let cap: i64 = 256;
+        let mem = malloc(cap * 24);  // sizeof(Edge) ≈ 20, round to 24
+        return EdgeTable { edges: mem as Ptr<Edge>, count: 0, capacity: cap };
+    }
+
+    fn push(&mut self, edge: Edge) {
+        if self.count >= self.capacity {
+            let new_cap = self.capacity * 2;
+            let new_mem = malloc(new_cap * 24);
+            let src = self.edges;
+            let dst = new_mem as Ptr<Edge>;
+            let mut i: i64 = 0;
+            while i < self.count {
+                dst.offset(i).write(src.offset(i).read());
+                i = i + 1;
+            }
+            free(self.edges as Ptr<u8>);
+            self.edges = dst;
+            self.capacity = new_cap;
+        }
+        self.edges.offset(self.count).write(edge);
+        self.count = self.count + 1;
+    }
+
+    fn free(&mut self) {
+        free(self.edges as Ptr<u8>);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Bézier Flattening — Adaptive de Casteljau Subdivision
+// ═══════════════════════════════════════════════════════════════
+
+/// Recursively flatten a quadratic Bézier into line segments,
+/// appending edges to the edge table.
+fn flatten_quad(edges: &mut EdgeTable, p0: Point, p1: Point, p2: Point,
+                tolerance: f32, depth: i32) {
+    if depth > 16 {
+        // Safety limit: just emit a line
+        add_line_edge(edges, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+
+    // Flatness test: distance from control point to chord midpoint
+    let mx = (p0.x + p2.x) * 0.5;
+    let my = (p0.y + p2.y) * 0.5;
+    let dx = p1.x - mx;
+    let dy = p1.y - my;
+    let dist_sq = dx * dx + dy * dy;
+
+    if dist_sq <= tolerance * tolerance {
+        // Flat enough — emit a line segment
+        add_line_edge(edges, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+
+    // Subdivide via de Casteljau
+    let p01 = p0.midpoint(&p1);
+    let p12 = p1.midpoint(&p2);
+    let mid = p01.midpoint(&p12);
+
+    flatten_quad(edges, p0, p01, mid, tolerance, depth + 1);
+    flatten_quad(edges, mid, p12, p2, tolerance, depth + 1);
+}
+
+/// Recursively flatten a cubic Bézier into line segments.
+fn flatten_cubic(edges: &mut EdgeTable, p0: Point, p1: Point, p2: Point, p3: Point,
+                 tolerance: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(edges, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+
+    // Flatness test: max distance of control points from chord
+    let ux = 3.0 * p1.x - 2.0 * p0.x - p3.x;
+    let uy = 3.0 * p1.y - 2.0 * p0.y - p3.y;
+    let vx = 3.0 * p2.x - p0.x - 2.0 * p3.x;
+    let vy = 3.0 * p2.y - p0.y - 2.0 * p3.y;
+    let ux2 = ux * ux;
+    let uy2 = uy * uy;
+    let vx2 = vx * vx;
+    let vy2 = vy * vy;
+    // Take the max of each component
+    let max_x = if ux2 > vx2 { ux2 } else { vx2 };
+    let max_y = if uy2 > vy2 { uy2 } else { vy2 };
+    let flat_sq = max_x + max_y;
+
+    if flat_sq <= 16.0 * tolerance * tolerance {
+        add_line_edge(edges, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+
+    // De Casteljau subdivision
+    let p01 = p0.midpoint(&p1);
+    let p12 = p1.midpoint(&p2);
+    let p23 = p2.midpoint(&p3);
+    let p012 = p01.midpoint(&p12);
+    let p123 = p12.midpoint(&p23);
+    let mid = p012.midpoint(&p123);
+
+    flatten_cubic(edges, p0, p01, p012, mid, tolerance, depth + 1);
+    flatten_cubic(edges, mid, p123, p23, p3, tolerance, depth + 1);
+}
+
+/// Add a directed edge to the table. Edges are oriented top-to-bottom.
+fn add_line_edge(edges: &mut EdgeTable, x0: f32, y0: f32, x1: f32, y1: f32) {
+    // Skip horizontal edges (they contribute no coverage)
+    if fabsf(y1 - y0) < 0.001 {
+        return;
+    }
+
+    if y0 < y1 {
+        // Already top-to-bottom (downward)
+        edges.push(Edge { x0: x0, y0: y0, x1: x1, y1: y1, dir: 1.0 });
+    } else {
+        // Flip to top-to-bottom (upward winding)
+        edges.push(Edge { x0: x1, y0: y1, x1: x0, y1: y0, dir: -1.0 });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Numeric Helpers
+// ═══════════════════════════════════════════════════════════════
+
+/// Convert f32 to i32 via explicit cast (avoids implicit promotion errors).
+fn f32_to_i32(v: f32) -> i32 {
+    let result: i32 = v as i32;
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Fill — Signed-Area Scanline Rasterizer
+// ═══════════════════════════════════════════════════════════════
+
+/// Fill a path onto the canvas with the given RGBA color.
+/// Uses scanline sweep with signed-area coverage (non-zero winding rule).
+pub fn fill(canvas: &mut Canvas, path: &Path, r: u8, g: u8, b: u8, a: u8) {
+    fill_with_rule(canvas, path, r, g, b, a, 0);
+}
+
+/// Fill with explicit winding rule: 0 = non-zero, 1 = even-odd.
+pub fn fill_with_rule(canvas: &mut Canvas, path: &Path, r: u8, g: u8, b: u8, a: u8, rule: i32) {
+    // Phase 1: Flatten all path commands into an edge table
+    let mut edges = EdgeTable::new();
+    let tolerance: f32 = 0.25;
+
+    let mut cur = Point::new(0.0, 0.0);
+    let mut sub_start = Point::new(0.0, 0.0);
+
+    let mut i: i64 = 0;
+    while i < path.count {
+        let cmd = path.cmds.offset(i).read();
+
+        if cmd.tag == CMD_MOVE_TO {
+            cur = cmd.p0;
+            sub_start = cmd.p0;
+        } else if cmd.tag == CMD_LINE_TO {
+            add_line_edge(&mut edges, cur.x, cur.y, cmd.p0.x, cmd.p0.y);
+            cur = cmd.p0;
+        } else if cmd.tag == CMD_QUAD_TO {
+            flatten_quad(&mut edges, cur, cmd.p0, cmd.p1, tolerance, 0);
+            cur = cmd.p1;  // end point
+        } else if cmd.tag == CMD_CUBIC_TO {
+            flatten_cubic(&mut edges, cur, cmd.p0, cmd.p1, cmd.p2, tolerance, 0);
+            cur = cmd.p2;  // end point
+        } else if cmd.tag == CMD_CLOSE {
+            add_line_edge(&mut edges, cur.x, cur.y, sub_start.x, sub_start.y);
+            cur = sub_start;
+        }
+
+        i = i + 1;
+    }
+
+    if edges.count == 0 {
+        edges.free();
+        return;
+    }
+
+    // Phase 2: Compute bounding box of all edges
+    let mut min_y: f32 = edges.edges.offset(0).read().y0;
+    let mut max_y: f32 = edges.edges.offset(0).read().y1;
+    let mut j: i64 = 1;
+    while j < edges.count {
+        let e = edges.edges.offset(j).read();
+        if e.y0 < min_y { min_y = e.y0; }
+        if e.y1 > max_y { max_y = e.y1; }
+        j = j + 1;
+    }
+
+    // Clamp to canvas bounds
+    let y_start = f32_to_i32(floorf(min_y));
+    let y_end = f32_to_i32(ceilf(max_y));
+    let y_start_c = if y_start < 0 { 0 } else { y_start };
+    let y_end_c = if y_end > canvas.height { canvas.height } else { y_end };
+
+    // Phase 3: Allocate coverage buffer (one f32 per pixel column)
+    let cov_bytes = (canvas.width as i64) * 4;
+    let cov_raw = malloc(cov_bytes);
+    let coverage = cov_raw as Ptr<f32>;
+
+    // Phase 4: Scanline sweep
+    let mut scanline: i32 = y_start_c;
+    while scanline < y_end_c {
+        let scan_y = (scanline as f32) + 0.5;  // Sample at pixel center
+
+        // Zero coverage buffer
+        let mut cx: i64 = 0;
+        while cx < (canvas.width as i64) {
+            coverage.offset(cx).write(0.0);
+            cx = cx + 1;
+        }
+
+        // Accumulate coverage from each edge that intersects this scanline
+        let mut ei: i64 = 0;
+        while ei < edges.count {
+            let e = edges.edges.offset(ei).read();
+
+            // Does this edge span the current scanline?
+            if scan_y >= e.y0 && scan_y < e.y1 {
+                // Compute x intersection via linear interpolation
+                let t = (scan_y - e.y0) / (e.y1 - e.y0);
+                let x_intersect = e.x0 + t * (e.x1 - e.x0);
+
+                // Clamp left-of-canvas edges to col 0 so winding propagates
+                let mut col = f32_to_i32(floorf(x_intersect));
+                if col < 0 {
+                    col = 0;
+                }
+                if col < canvas.width {
+                    let old_cov = coverage.offset(col as i64).read();
+                    coverage.offset(col as i64).write(old_cov + e.dir);
+                }
+            }
+
+            ei = ei + 1;
+        }
+
+        // Phase 5: Integrate coverage and emit pixels
+        let mut winding: f32 = 0.0;
+        let mut px: i32 = 0;
+        while px < canvas.width {
+            let delta = coverage.offset(px as i64).read();
+            winding = winding + delta;
+
+            // Determine fill based on winding rule
+            let abs_w = fabsf(winding);
+            let mut fill_amount: f32 = 0.0;
+            if rule == 0 {
+                // Non-zero: any non-zero winding is fully filled
+                if abs_w > 0.001 {
+                    fill_amount = 1.0;
+                }
+            } else {
+                // Even-odd: odd integer winding is filled
+                let w_floor = floorf(abs_w);
+                let w_frac = abs_w - w_floor;
+                let half = floorf(w_floor * 0.5);
+                let is_odd = (w_floor - half * 2.0) > 0.5;
+                if is_odd {
+                    fill_amount = 1.0;
+                } else if w_frac > 0.5 {
+                    fill_amount = 1.0;
+                }
+            }
+
+            if fill_amount > 0.001 {
+                let alpha_f = fill_amount * (a as f32);
+                let alpha = f32_to_i32(alpha_f) as u8;
+                canvas.blend_pixel(px, scanline, r, g, b, alpha);
+            }
+
+            px = px + 1;
+        }
+
+        scanline = scanline + 1;
+    }
+
+    // Cleanup
+    free(cov_raw);
+    edges.free();
+}

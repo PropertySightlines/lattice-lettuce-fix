@@ -1,0 +1,114 @@
+package kernel.core.main
+
+import kernel.arch.x86.gdt
+import kernel.arch.x86.idt
+import kernel.drivers.pit
+import kernel.core.io
+import kernel.drivers.serial
+import kernel.drivers.vga
+import kernel.core.scheduler
+import std.test
+import kernel.core.panic
+import kernel.sched.affinity
+import kernel.core.context_switch
+import benchmarks.ring_of_fire
+import benchmarks.ring_of_fire_1k
+import benchmarks.syscall_bench
+import benchmarks.ipc_bench
+import benchmarks.alloc_bench
+import kernel.core.timing
+
+// IPC responder fiber — defined in ipc_bench.salt with @no_mangle
+extern fn ipc_responder();
+
+
+// const VGA_VIRTUAL: u64 = 0xFFFFFFFF800B8000;
+// 
+// fn get_vga_window() -> Window<u16> {
+//     region vga(VGA_VIRTUAL, 4000) {
+//         return vga.window(0, 80);
+//     }
+// }
+
+@no_mangle
+pub fn salt_yield_check() {
+    // Heartbeat handler - no-op in kernel for now
+}
+
+@no_mangle
+pub fn kmain(magic: u32, mb_info: &u8) {
+    // EARLY SERIAL: Initialize first for debugging
+    serial.init();
+    serial.print("LATTICE BOOT: Serial OK\n");
+    
+    // 1. Critical Initialization
+    serial.print("LATTICE BOOT: GDT...\n");
+    gdt.init();
+    serial.print("LATTICE BOOT: IDT...\n");
+    idt.init();
+    serial.print("LATTICE BOOT: PIT...\n");
+    pit.init();
+    serial.print("LATTICE BOOT: Scheduler...\n");
+    scheduler.init();
+    
+    // 2. VGA Boot Banner — visible in QEMU display
+    vga.clear();
+    vga.print_colored(" LATTICE OS v0.5 ", 0x1F);
+    vga.print("\n");
+    vga.print_colored(" Salt-powered ", 0x0A);
+    vga.print_colored(" Z3-verified ", 0x0A);
+    vga.print("\n\n");
+    vga.print("Booting kernel...\n");
+
+    // 3. Start the scheduler before spawning fibers
+    serial.print("LATTICE KERNEL BOOT [OK]\n");
+    serial.print("STARTING RING OF FIRE BENCHMARK...\n");
+    
+    // 4. START PREEMPTIVE SCHEDULING
+    // This calls STI and enables the PIT timer fire
+    scheduler.start();
+    serial.print("[Lattice] PREEMPTIVE MODE (PIT Active)\n");
+    vga.print("Preemptive mode active (PIT @ 100Hz)\n");
+    
+    // 5. Run Benchmark Suite
+    serial.print("=== LATTICE OS BENCHMARK SUITE ===\n");
+    vga.print_colored("=== Benchmark Suite ===\n", 0x0E);
+
+    // 5a. Ring of Fire — context switch latency (4 fibers)
+    vga.print("Running Ring of Fire benchmark...\n");
+    ring_of_fire.run_benchmark();
+
+    // 5b. Ring of Fire 1K — scheduler scalability (1000 fibers)
+    vga.print("Running Ring of Fire 1K benchmark...\n");
+    ring_of_fire_1k.run_benchmark();
+
+    // 5c. Syscall Overhead — int 0x80 null round-trip
+    syscall_bench.run();
+
+    // 5d. IPC Ping-Pong — fiber-to-fiber message latency
+    let ipc_resp_addr = (&ipc_responder) as u64;
+    scheduler.spawn(ipc_resp_addr);
+    ipc_bench.run();
+
+    // 5e. Memory Allocation — slab bump allocator throughput
+    alloc_bench.run();
+
+    // 6. Suite complete — halt cleanly
+    serial.print("=== BENCHMARK SUITE COMPLETE ===\n");
+    vga.print_colored("\nBENCHMARK SUITE COMPLETE", 0x0A);
+    panic.halt();
+}
+
+fn task_alpha() {
+    let mut i = 0;
+    while i < 10000000 {
+        i = i + 1;
+    }
+}
+
+fn task_beta() {
+    let mut i = 0;
+    while i < 10000000 {
+        i = i + 1;
+    }
+}

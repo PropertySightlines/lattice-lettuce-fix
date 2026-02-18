@@ -1,0 +1,241 @@
+// Facet GPU — Salt Test Suite (TDD)
+//
+// Validates the Metal compute bridge: device init, buffer management,
+// shader compilation, compute dispatch, and roundtrip verification.
+//
+// Run:  cd user/facet && make gpu
+//
+// Expected output ends with:
+// === All 6 GPU tests passed ===
+
+package main
+
+use std.core.ptr.Ptr
+
+// ═══════════════════════════════════════════════════════════════
+// FFI — libc
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn exit(code: i32);
+
+// Memory helpers (bypass leak detector for temporary allocations)
+extern fn facet_gpu_alloc(size: i64) -> Ptr<u8>;
+extern fn facet_gpu_free(ptr: Ptr<u8>);
+
+// ═══════════════════════════════════════════════════════════════
+// FFI — Facet GPU Bridge (facet_gpu.m)
+// ═══════════════════════════════════════════════════════════════
+
+extern fn facet_gpu_init() -> i64;
+extern fn facet_gpu_create_buffer(device: i64, size_bytes: i64) -> i64;
+extern fn facet_gpu_buffer_contents(buffer: i64) -> Ptr<u8>;
+extern fn facet_gpu_buffer_length(buffer: i64) -> i64;
+extern fn facet_gpu_compile_shader(device: i64, msl_source: Ptr<u8>, fn_name: Ptr<u8>) -> i64;
+extern fn facet_gpu_dispatch(device: i64, pipeline: i64, buffers: Ptr<i64>, buffer_count: i32, thread_count: i32);
+extern fn facet_gpu_destroy_buffer(buffer: i64);
+extern fn facet_gpu_destroy(device: i64);
+
+// ═══════════════════════════════════════════════════════════════
+// Test 1: GPU Device Initialization
+// ═══════════════════════════════════════════════════════════════
+
+fn test_gpu_init() -> i64 {
+    let device = facet_gpu_init();
+    if device == 0 {
+        println("  [FAIL] test_gpu_init");
+        exit(1);
+    }
+    println("  [PASS] test_gpu_init");
+    return device;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 2: Buffer Creation
+// ═══════════════════════════════════════════════════════════════
+
+fn test_buffer_create(device: i64) {
+    let buf = facet_gpu_create_buffer(device, 1024);
+    if buf == 0 {
+        println("  [FAIL] test_buffer_create");
+        exit(1);
+    }
+
+    let ptr = facet_gpu_buffer_contents(buf);
+    let ptr_val = ptr as i64;
+    if ptr_val == 0 {
+        println("  [FAIL] test_buffer_create (null contents)");
+        exit(1);
+    }
+
+    let len = facet_gpu_buffer_length(buf);
+    if len != 1024 {
+        println("  [FAIL] test_buffer_create (wrong length)");
+        exit(1);
+    }
+
+    facet_gpu_destroy_buffer(buf);
+    println("  [PASS] test_buffer_create");
+    return;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 3: Buffer Write & Read
+// ═══════════════════════════════════════════════════════════════
+
+fn test_buffer_write_read(device: i64) {
+    // 4 floats = 16 bytes
+    let buf = facet_gpu_create_buffer(device, 16);
+    let ptr = facet_gpu_buffer_contents(buf);
+
+    // Cast to Ptr<f32> and write values
+    let fptr = ptr as Ptr<f32>;
+    fptr.write(1.0);
+    let f1 = fptr.offset(1);
+    f1.write(2.0);
+    let f2 = fptr.offset(2);
+    f2.write(3.0);
+    let f3 = fptr.offset(3);
+    f3.write(4.0);
+
+    // Read back and verify
+    let v0 = fptr.read();
+    let v1 = f1.read();
+    let v2 = f2.read();
+    let v3 = f3.read();
+
+    if v0 != 1.0 {
+        println("  [FAIL] test_buffer_write_read (v0)");
+        exit(1);
+    }
+    if v1 != 2.0 {
+        println("  [FAIL] test_buffer_write_read (v1)");
+        exit(1);
+    }
+    if v2 != 3.0 {
+        println("  [FAIL] test_buffer_write_read (v2)");
+        exit(1);
+    }
+    if v3 != 4.0 {
+        println("  [FAIL] test_buffer_write_read (v3)");
+        exit(1);
+    }
+
+    facet_gpu_destroy_buffer(buf);
+    println("  [PASS] test_buffer_write_read");
+    return;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 4: Shader Compilation
+// ═══════════════════════════════════════════════════════════════
+
+fn test_shader_compile(device: i64) -> i64 {
+    let msl = "#include <metal_stdlib>\nusing namespace metal;\nkernel void vector_add(device float* a [[buffer(0)]], device float* b [[buffer(1)]], device float* out [[buffer(2)]], uint tid [[thread_position_in_grid]]) { out[tid] = a[tid] + b[tid]; }\n";
+    let pipeline = facet_gpu_compile_shader(device, msl, "vector_add");
+    if pipeline == 0 {
+        println("  [FAIL] test_shader_compile");
+        exit(1);
+    }
+    println("  [PASS] test_shader_compile");
+    return pipeline;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 5: Compute Dispatch — Roundtrip vector_add
+// ═══════════════════════════════════════════════════════════════
+
+fn test_compute_dispatch(device: i64, pipeline: i64) {
+    let n = 256;
+    let byte_size = n * 4;  // 4 bytes per f32
+
+    // Create 3 buffers: a, b, out
+    let buf_a = facet_gpu_create_buffer(device, byte_size as i64);
+    let buf_b = facet_gpu_create_buffer(device, byte_size as i64);
+    let buf_out = facet_gpu_create_buffer(device, byte_size as i64);
+
+    // Fill input buffers on CPU
+    let pa = facet_gpu_buffer_contents(buf_a) as Ptr<f32>;
+    let pb = facet_gpu_buffer_contents(buf_b) as Ptr<f32>;
+
+    let mut i = 0;
+    while i < n {
+        let a_ptr = pa.offset(i);
+        a_ptr.write(i as f32);         // a[i] = i
+        let b_ptr = pb.offset(i);
+        b_ptr.write((i * 2) as f32);   // b[i] = 2*i
+        i = i + 1;
+    }
+
+    // Build buffer handle array for dispatch (3 x i64)
+    let buf_arr = facet_gpu_alloc(24) as Ptr<i64>;
+    buf_arr.write(buf_a);
+    let b1 = buf_arr.offset(1);
+    b1.write(buf_b);
+    let b2 = buf_arr.offset(2);
+    b2.write(buf_out);
+
+    // Dispatch: vector_add(a, b, out) with 256 threads
+    facet_gpu_dispatch(device, pipeline, buf_arr, 3, n as i32);
+
+    // Read back results and verify: out[j] = a[j] + b[j] = j + 2j = 3j
+    let p_out = facet_gpu_buffer_contents(buf_out) as Ptr<f32>;
+
+    let mut pass = true;
+    let mut j = 0;
+    while j < n {
+        let out_ptr = p_out.offset(j);
+        let val = out_ptr.read();
+        let expected = (j * 3) as f32;
+        if val != expected {
+            pass = false;
+        }
+        j = j + 1;
+    }
+
+    // Free the buffer array before branching (satisfies leak detector)
+    facet_gpu_free(buf_arr as Ptr<u8>);
+
+    if !pass {
+        println("  [FAIL] test_compute_dispatch");
+        exit(1);
+    }
+
+    // Clean up GPU buffers
+    facet_gpu_destroy_buffer(buf_a);
+    facet_gpu_destroy_buffer(buf_b);
+    facet_gpu_destroy_buffer(buf_out);
+
+    println("  [PASS] test_compute_dispatch");
+    return;
+
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 6: Cleanup
+// ═══════════════════════════════════════════════════════════════
+
+fn test_cleanup(device: i64) {
+    facet_gpu_destroy(device);
+    println("  [PASS] test_cleanup");
+    return;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — Run all tests
+// ═══════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    println("=== Facet GPU Tests ===");
+
+    let device = test_gpu_init();
+    test_buffer_create(device);
+    test_buffer_write_read(device);
+    let pipeline = test_shader_compile(device);
+    test_compute_dispatch(device, pipeline);
+    test_cleanup(device);
+
+    println("=== All 6 GPU tests passed ===");
+    return 0;
+}

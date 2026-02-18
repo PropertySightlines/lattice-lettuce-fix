@@ -1,0 +1,262 @@
+// =============================================================================
+// Basalt Transformer — Llama 2 Architecture
+// =============================================================================
+//
+// Defines the Config, Weights, and RunState structs.
+// Implements the forward pass orchestrating the compute kernels.
+//
+// =============================================================================
+
+package basalt.transformer
+
+use std.core.ptr.Ptr
+use basalt.kernels.{rmsnorm, softmax, mat_mul}
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn expf(x: f32) -> f32;
+extern fn sqrtf(x: f32) -> f32;
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+pub struct Config {
+    pub dim: i64,        // Transformer dimension
+    pub hidden_dim: i64, // FFN hidden dimension
+    pub n_layers: i64,   // Number of layers
+    pub n_heads: i64,    // Number of query heads
+    pub n_kv_heads: i64, // Number of key/value heads (can be < n_heads)
+    pub vocab_size: i64, // Vocabulary size
+    pub seq_len: i64,    // Max sequence length
+}
+
+// -----------------------------------------------------------------------------
+// Weights (Mmap View)
+// -----------------------------------------------------------------------------
+pub struct TransformerWeights {
+    pub token_embedding_table: Ptr<f32>, // (vocab_size, dim)
+    
+    pub rms_att_weight: Ptr<f32>, // (layer, dim)
+    pub wq: Ptr<f32>,             // (layer, dim, n_heads * head_size)
+    pub wk: Ptr<f32>,             // (layer, dim, n_kv_heads * head_size)
+    pub wv: Ptr<f32>,             // (layer, dim, n_kv_heads * head_size)
+    pub wo: Ptr<f32>,             // (layer, n_heads * head_size, dim)
+    
+    pub rms_ffn_weight: Ptr<f32>, // (layer, dim)
+    pub w1: Ptr<f32>,             // (layer, dim, hidden_dim)
+    pub w2: Ptr<f32>,             // (layer, hidden_dim, dim)
+    pub w3: Ptr<f32>,             // (layer, dim, hidden_dim)
+    
+    pub rms_final_weight: Ptr<f32>, // (dim)
+    
+    pub freq_cis_real: Ptr<f32>, // (seq_len, dim/2)
+    pub freq_cis_imag: Ptr<f32>, // (seq_len, dim/2)
+    
+    pub w_cls: Ptr<f32>, // (dim, vocab_size)
+}
+
+// -----------------------------------------------------------------------------
+// RunState (Activation Buffers)
+// -----------------------------------------------------------------------------
+pub struct RunState {
+    pub x: Ptr<f32>,      // (dim)
+    pub xb: Ptr<f32>,     // (dim)
+    pub xb2: Ptr<f32>,    // (dim)
+    pub hb: Ptr<f32>,     // (hidden_dim)
+    pub hb2: Ptr<f32>,    // (hidden_dim)
+    
+    pub q: Ptr<f32>,      // (dim)
+    pub k: Ptr<f32>,      // (dim)
+    pub v: Ptr<f32>,      // (dim)
+    pub att: Ptr<f32>,    // (n_heads, seq_len)
+    
+    pub logits: Ptr<f32>, // (vocab_size)
+    
+    pub key_cache: Ptr<f32>,   // (layer, seq_len, dim)
+    pub value_cache: Ptr<f32>, // (layer, seq_len, dim)
+}
+
+// -----------------------------------------------------------------------------
+// Initialization
+// -----------------------------------------------------------------------------
+
+fn alloc_f32(count: i64) -> Ptr<f32> {
+    let ptr: Ptr<u8> = malloc(count * 4);
+    return ptr as Ptr<f32>;
+}
+
+pub fn alloc_run_state(cfg: Config) -> RunState {
+    let kw_dim: i64 = (cfg.dim * cfg.n_kv_heads) / cfg.n_heads;
+    
+    return RunState {
+        x: alloc_f32(cfg.dim),
+        xb: alloc_f32(cfg.dim),
+        xb2: alloc_f32(cfg.dim),
+        hb: alloc_f32(cfg.hidden_dim),
+        hb2: alloc_f32(cfg.hidden_dim),
+        q: alloc_f32(cfg.dim),
+        k: alloc_f32(kw_dim),
+        v: alloc_f32(kw_dim),
+        att: alloc_f32(cfg.n_heads * cfg.seq_len),
+        logits: alloc_f32(cfg.vocab_size),
+        key_cache: alloc_f32(cfg.n_layers * cfg.seq_len * kw_dim),
+        value_cache: alloc_f32(cfg.n_layers * cfg.seq_len * kw_dim),
+    };
+}
+
+// -----------------------------------------------------------------------------
+// Forward Pass
+// -----------------------------------------------------------------------------
+
+@fast_math
+pub fn forward(cfg: Config, w: TransformerWeights, s: RunState, token: i64, pos: i64) {
+    let dim: i64 = cfg.dim;
+    let hidden_dim: i64 = cfg.hidden_dim;
+    let head_size: i64 = dim / cfg.n_heads;
+    let kv_dim: i64 = (dim * cfg.n_kv_heads) / cfg.n_heads;
+    let kv_mul: i64 = cfg.n_heads / cfg.n_kv_heads; 
+    let sqrt_head_size: f32 = sqrtf(head_size as f32);
+
+    // 1. Embedding
+    let embed_row = w.token_embedding_table;
+    let offset: i64 = token * dim;
+    for i in 0..dim {
+        let val: f32 = embed_row[offset + i];
+        s.x[i] = val;
+    }
+    
+    // 2. Layers Loop
+    for l in 0..cfg.n_layers {
+        // Attention RMSNorm
+        rmsnorm(s.xb, s.x, w.rms_att_weight.offset(l * dim), dim);
+
+        // QKV Projections
+        let wq_offset: i64 = l * dim * dim;
+        let wk_offset: i64 = l * kv_dim * dim;
+        let wv_offset: i64 = l * kv_dim * dim;
+        
+        mat_mul(s.q, w.wq.offset(wq_offset), s.xb, dim, 1, dim);
+        mat_mul(s.k, w.wk.offset(wk_offset), s.xb, kv_dim, 1, dim);
+        mat_mul(s.v, w.wv.offset(wv_offset), s.xb, kv_dim, 1, dim);
+
+        // RoPE Rotation
+        for h in 0..cfg.n_heads {
+            for i in 0..(head_size / 2) {
+                let idx: i64 = h * head_size + i * 2;
+                let idx_freq: i64 = pos * (head_size / 2) + i;
+                let f_cr: f32 = w.freq_cis_real[idx_freq];
+                let f_ci: f32 = w.freq_cis_imag[idx_freq];
+                
+                let v0: f32 = s.q[idx];
+                let v1: f32 = s.q[idx + 1];
+                s.q[idx] = v0 * f_cr - v1 * f_ci;
+                s.q[idx + 1] = v0 * f_ci + v1 * f_cr;
+            }
+        }
+        for h in 0..cfg.n_kv_heads {
+            for i in 0..(head_size / 2) {
+                let idx: i64 = h * head_size + i * 2;
+                let idx_freq: i64 = pos * (head_size / 2) + i;
+                let f_cr: f32 = w.freq_cis_real[idx_freq];
+                let f_ci: f32 = w.freq_cis_imag[idx_freq];
+                
+                let v0: f32 = s.k[idx];
+                let v1: f32 = s.k[idx + 1];
+                s.k[idx] = v0 * f_cr - v1 * f_ci;
+                s.k[idx + 1] = v0 * f_ci + v1 * f_cr;
+            }
+        }
+
+        // Cache KV
+        let cache_offset: i64 = l * cfg.seq_len * kv_dim + pos * kv_dim;
+        let k_cache_ptr = s.key_cache.offset(cache_offset);
+        let v_cache_ptr = s.value_cache.offset(cache_offset);
+        for i in 0..kv_dim {
+            k_cache_ptr[i] = s.k[i];
+            v_cache_ptr[i] = s.v[i];
+        }
+
+        // Attention (Multi-Head)
+        for h in 0..cfg.n_heads {
+            let att_offset: i64 = h * cfg.seq_len;
+            let q_offset: i64 = h * head_size;
+            
+            for t in 0..(pos + 1) {
+                let h_kv: i64 = h / kv_mul;
+                let k_cache_t_offset: i64 = l * cfg.seq_len * kv_dim + t * kv_dim + h_kv * head_size;
+                let k_ptr = s.key_cache.offset(k_cache_t_offset);
+                
+                let mut score: f32 = 0.0f32;
+                for i in 0..head_size {
+                    let q_val: f32 = s.q[q_offset + i];
+                    let k_val: f32 = k_ptr[i];
+                    score = score + q_val * k_val;
+                }
+                score = score / sqrt_head_size;
+                s.att[att_offset + t] = score;
+            }
+
+            let att_head_ptr = s.att.offset(att_offset);
+            softmax(att_head_ptr, pos + 1);
+
+            let out_offset: i64 = h * head_size;
+            for i in 0..head_size {
+                let mut val: f32 = 0.0f32;
+                for t in 0..(pos + 1) {
+                    let h_kv: i64 = h / kv_mul;
+                    let v_cache_t_offset: i64 = l * cfg.seq_len * kv_dim + t * kv_dim + h_kv * head_size;
+                    let v_ptr = s.value_cache.offset(v_cache_t_offset);
+                    
+                    let att_w: f32 = att_head_ptr[t];
+                    let v_val: f32 = v_ptr[i];
+                    val = val + att_w * v_val;
+                }
+                s.xb[out_offset + i] = val;
+            }
+        }
+
+        // Output Projection
+        let wo_offset: i64 = l * dim * dim;
+        mat_mul(s.xb2, w.wo.offset(wo_offset), s.xb, dim, 1, dim);
+
+        // Residual Connection
+        for i in 0..dim {
+            let v: f32 = s.xb2[i];
+            s.x[i] = s.x[i] + v;
+        }
+
+        // FFN RMSNorm
+        rmsnorm(s.xb, s.x, w.rms_ffn_weight.offset(l * dim), dim);
+
+        // FFN (SwiGLU)
+        let w1_offset: i64 = l * hidden_dim * dim;
+        let w2_offset: i64 = l * dim * hidden_dim;
+        let w3_offset: i64 = l * hidden_dim * dim;
+        
+        mat_mul(s.hb, w.w1.offset(w1_offset), s.xb, hidden_dim, 1, dim);
+        mat_mul(s.hb2, w.w3.offset(w3_offset), s.xb, hidden_dim, 1, dim);
+
+        for i in 0..hidden_dim {
+            let val: f32 = s.hb[i];
+            let val2: f32 = s.hb2[i];
+            let neg_val: f32 = 0.0f32 - val;
+            let sigmoid: f32 = 1.0f32 / (1.0f32 + expf(neg_val));
+            let silu: f32 = val * sigmoid;
+            s.hb[i] = silu * val2; 
+        }
+
+        // Down projection
+        mat_mul(s.xb, w.w2.offset(w2_offset), s.hb, dim, 1, hidden_dim);
+
+        // Residual Connection
+        for i in 0..dim {
+            let v: f32 = s.xb[i];
+            s.x[i] = s.x[i] + v;
+        }
+    } 
+    
+    // 3. Final Norm
+    rmsnorm(s.x, s.x, w.rms_final_weight, cfg.dim);
+    
+    // 4. Classifier
+    mat_mul(s.logits, w.w_cls, s.x, cfg.vocab_size, 1, cfg.dim);
+}

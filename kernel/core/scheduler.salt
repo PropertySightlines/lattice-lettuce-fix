@@ -1,0 +1,247 @@
+package kernel.core.scheduler
+
+import kernel.core.pmm
+import kernel.sched.affinity
+import std.test
+import kernel.drivers.serial
+
+// Cross-module extern declarations (avoids linker error during standalone compilation)
+extern fn ctz_u64(x: u64) -> u64;
+extern fn stack_init(stack_top: u64, entry: u64) -> u64;
+
+// Kernel Scheduler - O(1) Multi-Level Bitmap
+//
+// Uses a 2-level bitmap to find the next runnable fiber in O(1) via hardware
+// TZCNT instruction (llvm.intr.cttz). Supports up to 1024 fibers.
+//
+// L1 summary: 1 bit per group of 64 fibers (16 groups for 1024 fibers)
+// L2 details: 1 bit per fiber within each group
+
+const MAX_FIBERS: u64 = 1024;
+const STACK_SIZE: u64 = 4096;
+const L2_GROUPS: u64 = 16;
+const ALL_ONES: u64 = 0xFFFFFFFFFFFFFFFF;
+
+pub struct Fiber {
+    pub id: u64,
+    pub stack_ptr: u64,
+    pub active: bool,
+}
+
+pub struct SchedulerState {
+    pub fibers: [Fiber; 1024],
+    pub current: u64,
+    pub count: u64,
+    pub next_id: u64,
+    pub yield_pending: bool,
+    pub l1_summary: u64,
+    pub l2_details: [u64; 16],
+}
+
+global GLOBAL_SCHED: SchedulerState = SchedulerState {
+    fibers: [Fiber { id: 0, stack_ptr: 0, active: false }; 1024],
+    current: 0,
+    count: 0,
+    next_id: 1,
+    yield_pending: false,
+    l1_summary: 0,
+    l2_details: [0 as u64; 16]
+};
+
+
+extern fn switch_stacks(old_sp_ptr: *mut u64, new_sp: u64);
+
+@no_mangle
+pub fn timer_isr() {
+    region("sched_tick") {
+        GLOBAL_SCHED.yield_pending = true;
+    }
+}
+
+pub fn init() {
+    region("sched_init") {
+       GLOBAL_SCHED.fibers[0].active = true;
+       GLOBAL_SCHED.fibers[0].id = 0;
+       GLOBAL_SCHED.current = 0;
+       GLOBAL_SCHED.yield_pending = false;
+
+       // Mark fiber 0 as active in bitmap
+       GLOBAL_SCHED.l2_details[0] = 1 as u64;
+       GLOBAL_SCHED.l1_summary = 1 as u64;
+    }
+}
+
+// Mark a fiber as READY in the bitmap
+fn bitmap_set(fiber_id: u64) {
+    let l1_idx = fiber_id / 64;
+    let l2_bit = fiber_id % 64;
+    let bit_mask: u64 = (1 as u64) << l2_bit;
+
+    let old_l2 = GLOBAL_SCHED.l2_details[l1_idx];
+    GLOBAL_SCHED.l2_details[l1_idx] = old_l2 | bit_mask;
+
+    let group_mask: u64 = (1 as u64) << l1_idx;
+    let old_l1 = GLOBAL_SCHED.l1_summary;
+    GLOBAL_SCHED.l1_summary = old_l1 | group_mask;
+}
+
+// Mark a fiber as BLOCKED/EMPTY in the bitmap
+fn bitmap_clear(fiber_id: u64) {
+    let l1_idx = fiber_id / 64;
+    let l2_bit = fiber_id % 64;
+    let bit_mask: u64 = (1 as u64) << l2_bit;
+    let inv_mask: u64 = bit_mask ^ ALL_ONES;
+
+    let old_l2 = GLOBAL_SCHED.l2_details[l1_idx];
+    let new_l2 = old_l2 & inv_mask;
+    GLOBAL_SCHED.l2_details[l1_idx] = new_l2;
+
+    if new_l2 == 0 {
+        let group_mask: u64 = (1 as u64) << l1_idx;
+        let inv_group: u64 = group_mask ^ ALL_ONES;
+        let old_l1 = GLOBAL_SCHED.l1_summary;
+        GLOBAL_SCHED.l1_summary = old_l1 & inv_group;
+    }
+}
+
+// Build a mask of all bits strictly above position `bit`
+fn mask_above_bit(bit: u64) -> u64 {
+    if bit >= 63 {
+        return 0;
+    }
+    let shift = bit + 1;
+    let below: u64 = ((1 as u64) << shift) - 1;
+    return below ^ ALL_ONES;
+}
+
+// Build a mask of all bits strictly below position `bit`
+fn mask_below_bit(bit: u64) -> u64 {
+    if bit == 0 {
+        return 0;
+    }
+    return ((1 as u64) << bit) - 1;
+}
+
+pub fn spawn(entry_addr: u64) -> u64 {
+    region("sched_spawn") {
+        // O(1) free slot lookup via inverted bitmap
+        let mut group: u64 = 0;
+        let mut found = false;
+        let mut slot: u64 = 0;
+
+        while group < L2_GROUPS {
+            let l2_val = GLOBAL_SCHED.l2_details[group];
+            let free_mask = l2_val ^ ALL_ONES;
+            if free_mask != 0 {
+                let bit = ctz_u64(free_mask);
+                slot = group * 64 + bit;
+                if slot < MAX_FIBERS {
+                    found = true;
+                    group = L2_GROUPS;  // break
+                }
+            }
+            group = group + 1;
+        }
+        
+        if found {
+            GLOBAL_SCHED.fibers[slot].id = GLOBAL_SCHED.next_id;
+            GLOBAL_SCHED.fibers[slot].active = true;
+            
+            // Setup Initial Stack for 64-bit Long Mode
+            // Base at 60MB to stay within mapped 64MB region
+            // Each fiber gets 4KB stack, total: 1024 * 4KB = 4MB
+            let base_high: u64 = 0xFFFFFFFF;
+            let base_low: u64 = 0x83C00000;
+            let stack_base = (base_high << 32) | base_low;
+            let stack_top = stack_base - (slot as u64 * 0x1000);
+            
+            GLOBAL_SCHED.fibers[slot].stack_ptr = stack_init(stack_top, entry_addr);
+            
+            GLOBAL_SCHED.next_id = GLOBAL_SCHED.next_id + 1;
+            GLOBAL_SCHED.count = GLOBAL_SCHED.count + 1;
+
+            // Update bitmap
+            bitmap_set(slot);
+
+            return slot;
+        } else {
+            return 9999;
+        }
+    }
+    return 0;
+}
+
+extern fn enable_interrupts();
+
+pub fn start() {
+    region("sched_start") {
+        enable_interrupts();
+    }
+}
+
+
+@no_yield
+@no_mangle
+pub fn sched_yield() {
+    region("sched_yield") {
+        let current = GLOBAL_SCHED.current;
+        let current_group = current / 64;
+        let current_bit = current % 64;
+
+        // O(1) BITMAP SELECTION
+        // Find next set bit after `current` with wraparound.
+        //
+        // Phase 1: Remaining bits in current group (above current_bit)
+        // Phase 2: Higher groups via L1 summary
+        // Phase 3: Wrap to lower groups via L1 summary
+        // Phase 4: Lower bits in current group (wrap within group)
+
+        let mut next: u64 = current;
+
+        // Read bitmaps into locals
+        let l2_cur = GLOBAL_SCHED.l2_details[current_group];
+        let l1 = GLOBAL_SCHED.l1_summary;
+
+        // Phase 1: Mask off bits <= current in the current L2 word
+        let above = l2_cur & mask_above_bit(current_bit);
+        if above != 0 {
+            next = current_group * 64 + ctz_u64(above);
+        } else {
+            // Phase 2: Higher groups
+            let l1_above = l1 & mask_above_bit(current_group);
+            if l1_above != 0 {
+                let grp = ctz_u64(l1_above);
+                let l2_grp = GLOBAL_SCHED.l2_details[grp];
+                next = grp * 64 + ctz_u64(l2_grp);
+            } else {
+                // Phase 3: Wrap to lower groups
+                let l1_below = l1 & mask_below_bit(current_group);
+                if l1_below != 0 {
+                    let grp = ctz_u64(l1_below);
+                    let l2_grp = GLOBAL_SCHED.l2_details[grp];
+                    next = grp * 64 + ctz_u64(l2_grp);
+                } else {
+                    // Phase 4: Wrap within current group
+                    let below = l2_cur & mask_below_bit(current_bit);
+                    if below != 0 {
+                        next = current_group * 64 + ctz_u64(below);
+                    }
+                    // else: no other fiber, stay on current
+                }
+            }
+        }
+
+        if next != current {
+            GLOBAL_SCHED.current = next;
+            
+            let old = &GLOBAL_SCHED.fibers[current].stack_ptr;
+            let new_sp = GLOBAL_SCHED.fibers[next].stack_ptr;
+
+            switch_stacks(old, new_sp);
+        }
+    }
+}
+
+pub fn get_id() -> u64 {
+    return GLOBAL_SCHED.fibers[GLOBAL_SCHED.current].id;
+}

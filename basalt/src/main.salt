@@ -1,0 +1,214 @@
+// =============================================================================
+// Basalt — Inference Engine Entry Point
+// =============================================================================
+
+package main
+
+use std.io.println
+use std.core.ptr.Ptr
+
+use basalt.transformer.{Config, TransformerWeights, RunState, alloc_run_state, forward}
+use basalt.sampler.{sample_argmax, sample_token}
+use basalt.model_loader.{load_config, get_weights}
+use basalt.tokenizer.{Tokenizer, load_tokenizer, decode_token, decode_token_len}
+
+// -----------------------------------------------------------------------------
+// Externs (libc / runtime)
+// -----------------------------------------------------------------------------
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn cosf(x: f32) -> f32;
+extern fn sinf(x: f32) -> f32;
+extern fn powf(base: f32, exp: f32) -> f32;
+
+extern fn salt_get_argc() -> i32;
+extern fn salt_get_argv(idx: i32) -> Ptr<u8>;
+
+extern fn open(path: Ptr<u8>, flags: i32) -> i32;
+extern fn mmap(addr: Ptr<u8>, len: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> Ptr<u8>;
+extern fn close(fd: i32) -> i32;
+
+// Write raw bytes to stdout (for printing token text without newline)
+extern fn write(fd: i32, buf: Ptr<u8>, count: i64) -> i64;
+
+// Monotonic nanosecond clock (from runtime.c)
+extern fn salt_clock_now() -> i64;
+
+// -----------------------------------------------------------------------------
+// Precompute RoPE
+// -----------------------------------------------------------------------------
+
+fn build_freq_cis(cfg: Config) -> TransformerWeights {
+    let head_size = cfg.dim / cfg.n_heads;
+    let n_elem = cfg.seq_len * (head_size / 2);
+    
+    let real_ptr = malloc(n_elem * 4) as Ptr<f32>;
+    let imag_ptr = malloc(n_elem * 4) as Ptr<f32>;
+    
+    for pos in 0..cfg.seq_len {
+        for i in 0..(head_size / 2) {
+            let exponent = (i * 2) as f32 / head_size as f32;
+            let freq = 1.0f32 / powf(10000.0f32, exponent);
+            let val = pos as f32 * freq;
+            
+            let idx = pos * (head_size / 2) + i;
+            real_ptr[idx] = cosf(val);
+            imag_ptr[idx] = sinf(val);
+        }
+    }
+    
+    return TransformerWeights {
+        token_embedding_table: 0 as Ptr<f32>, rms_att_weight: 0 as Ptr<f32>,
+        wq: 0 as Ptr<f32>, wk: 0 as Ptr<f32>, wv: 0 as Ptr<f32>, wo: 0 as Ptr<f32>,
+        rms_ffn_weight: 0 as Ptr<f32>, w1: 0 as Ptr<f32>, w2: 0 as Ptr<f32>, w3: 0 as Ptr<f32>,
+        rms_final_weight: 0 as Ptr<f32>, w_cls: 0 as Ptr<f32>,
+        freq_cis_real: real_ptr,
+        freq_cis_imag: imag_ptr
+    };
+}
+
+// -----------------------------------------------------------------------------
+// File Helpers
+// -----------------------------------------------------------------------------
+
+fn mmap_file(path: Ptr<u8>) -> Ptr<u8> {
+    let fd = open(path, 0); // O_RDONLY
+    if fd < 0 {
+        return 0 as Ptr<u8>;
+    }
+    // PROT_READ=1, MAP_PRIVATE=2
+    let data = mmap(0 as Ptr<u8>, 1024 * 1024 * 1024, 1, 2, fd, 0);
+    let data_addr = data as i64;
+    if data_addr == -1 {
+        close(fd);
+        return 0 as Ptr<u8>;
+    }
+    // Don't close fd — mmap needs it alive on some systems
+    return data;
+}
+
+// -----------------------------------------------------------------------------
+// Logic
+// -----------------------------------------------------------------------------
+
+fn run_mock() -> i32 {
+    println("Running in MOCK mode (no model file provided).");
+    let cfg = Config {
+        dim: 256, hidden_dim: 512, n_layers: 4, n_heads: 8, n_kv_heads: 8,
+        vocab_size: 1000, seq_len: 128,
+    };
+    
+    let state = alloc_run_state(cfg);
+    
+    let dummy_bytes: i64 = 128 * 1024 * 1024;
+    let dummy_ptr: Ptr<u8> = malloc(dummy_bytes);
+    let dummy_float: Ptr<f32> = dummy_ptr as Ptr<f32>;
+
+    let w = TransformerWeights {
+        token_embedding_table: dummy_float, rms_att_weight: dummy_float,
+        wq: dummy_float, wk: dummy_float, wv: dummy_float, wo: dummy_float,
+        rms_ffn_weight: dummy_float, w1: dummy_float, w2: dummy_float, w3: dummy_float,
+        rms_final_weight: dummy_float, freq_cis_real: dummy_float, freq_cis_imag: dummy_float,
+        w_cls: dummy_float,
+    };
+
+    forward(cfg, w, state, 1, 0);
+    let next_token = sample_argmax(state.logits, cfg.vocab_size);
+    println("Sampled token: {}", next_token);
+    
+    free(dummy_ptr);
+    return 0;
+}
+
+fn run_inference(model_path: Ptr<u8>, tok_path: Ptr<u8>) -> i32 {
+    println("Loading model...");
+    
+    let model_data = mmap_file(model_path);
+    if (model_data as i64) == 0 {
+        println("Failed to open model file.");
+        return 1;
+    }
+
+    // Load Config
+    let cfg = load_config(model_data);
+    println("Config: dim={}, layers={}, heads={}, vocab={}", cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size);
+    
+    // Load Weights
+    let mut w = get_weights(model_data, cfg);
+    
+    // Setup RoPE
+    let rope_w = build_freq_cis(cfg);
+    w.freq_cis_real = rope_w.freq_cis_real;
+    w.freq_cis_imag = rope_w.freq_cis_imag;
+    
+    // Load Tokenizer (optional)
+    let tok_data = mmap_file(tok_path);
+    let has_tok = (tok_data as i64) != 0;
+    let mut tok = Tokenizer {
+        vocab: 0 as Ptr<TokenizerEntry>,
+        vocab_size: 0,
+        max_token_length: 0,
+    };
+    if has_tok {
+        tok = load_tokenizer(tok_data, cfg.vocab_size);
+        println("Tokenizer loaded ({} entries).", tok.vocab_size);
+    }
+    
+    // Run Loop
+    let state = alloc_run_state(cfg);
+    let steps: i64 = cfg.seq_len; // Generate up to max context
+    
+    println("Generating {} tokens...", steps);
+    let mut token: i64 = 1; // BOS
+    
+    // Start timing AFTER model loading (matches llama2.c methodology)
+    let t_start = salt_clock_now();
+    
+    for pos in 0..steps {
+        forward(cfg, w, state, token, pos);
+        token = sample_argmax(state.logits, cfg.vocab_size);
+        
+        if has_tok {
+            // Print decoded text (raw write to stdout, no newline)
+            let text = decode_token(tok, token);
+            let text_len = decode_token_len(tok, token);
+            write(1, text, text_len as i64);
+        }
+    }
+    
+    let t_end = salt_clock_now();
+    let elapsed_ns = t_end - t_start;
+    let elapsed_ms = elapsed_ns / 1000000;
+    
+    // Compute tok/s: (steps * 1_000_000_000) / elapsed_ns
+    // Use integer arithmetic to avoid float precision issues
+    let toks_per_sec = (steps * 1000000000) / elapsed_ns;
+    
+    println("");
+    println("---");
+    println("tokens: {}", steps);
+    println("elapsed: {}ms", elapsed_ms);
+    println("tok/s: {}", toks_per_sec);
+    
+    return 0;
+}
+
+fn main() -> i32 {
+    println("Basalt v0.3.0 (Llama 2 Inference)");
+    
+    let argc = salt_get_argc();
+    if argc < 2 {
+        return run_mock();
+    }
+    
+    let model_path = salt_get_argv(1);
+    
+    // Optional tokenizer path (arg 2)
+    let mut tok_path: Ptr<u8> = 0 as Ptr<u8>;
+    if argc >= 3 {
+        tok_path = salt_get_argv(2);
+    }
+    
+    return run_inference(model_path, tok_path);
+}

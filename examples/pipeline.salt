@@ -1,0 +1,43 @@
+// =============================================================================
+// Pipelines & F-Strings — Salt's Ergonomic Features
+// =============================================================================
+// Demonstrates: |> pipe operator, f-strings, for loops, closures
+// =============================================================================
+
+package main
+
+fn square(x: i32) -> i32 {
+    return x * x;
+}
+
+fn double(x: i32) -> i32 {
+    return x * 2;
+}
+
+fn add_one(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn main() -> i32 {
+    // Pipeline operator: read transformations left-to-right
+    let result = 5 |> square() |> double() |> add_one();
+    // 5 → square → 25 → double → 50 → add_one → 51
+
+    // F-strings for interpolation
+    let name = "Salt";
+    let year = 2026;
+    let greeting = f"Hello from {name} in {year}!";
+
+    // For-in-range loops
+    let mut sum = 0;
+    for i in 1..11 {
+        sum += i;
+    }
+    // sum = 55 (1 + 2 + ... + 10)
+
+    if result == 51 && sum == 55 {
+        println("✓ pipeline and f-string examples work");
+        return 0;
+    }
+    return 1;
+}

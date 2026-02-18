@@ -1,0 +1,68 @@
+// =============================================================================
+// Pattern Matching — Enums, Result, and Match
+// =============================================================================
+// Demonstrates: enum, match, Result<T,E>, Option, exhaustive matching
+// =============================================================================
+
+package main
+
+// A simple shape enum (Algebraic Data Type)
+enum Shape {
+    Circle(f32),
+    Rect(f32, f32)
+}
+
+fn area(s: Shape) -> f32 {
+    match s {
+        Shape::Circle(r) => return 3.14159f32 * r * r,
+        Shape::Rect(w, h) => return w * h
+    }
+}
+
+// Using Result<T,E> for error handling
+enum MathError {
+    DivideByZero
+}
+
+fn safe_div(a: i32, b: i32) -> Result<i32, MathError> {
+    if b == 0 {
+        return Result::Err(MathError::DivideByZero);
+    }
+    return Result::Ok(a / b);
+}
+
+fn main() -> i32 {
+    // Pattern matching on enums
+    let circle = Shape::Circle(5.0f32);
+    let rect = Shape::Rect(3.0f32, 4.0f32);
+    
+    let circle_area = area(circle);    // ~78.54
+    let rect_area = area(rect);        // 12.0
+
+    // Result<T,E> for safe operations
+    let good = safe_div(10, 3);
+    let bad = safe_div(10, 0);
+
+    match good {
+        Result::Ok(val) if val == 3 => {
+            println("✓ safe_div(10, 3) = 3");
+        },
+        Result::Ok(_) => {},
+        Result::Err(_) => {
+            println("✗ unexpected error");
+            return 1;
+        }
+    }
+
+    match bad {
+        Result::Ok(_) => {
+            println("✗ should have been an error");
+            return 1;
+        },
+        Result::Err(_) => {
+            println("✓ safe_div(10, 0) correctly returned Err");
+        }
+    }
+
+    return 0;
+}

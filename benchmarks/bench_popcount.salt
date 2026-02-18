@@ -1,0 +1,13 @@
+
+
+fn main_salt() {
+    let mut x: u64 = 0x5555555555555555; // Alternating bits
+    let iterations = 10000000;
+    let mut i = 0;
+    let mut total: u64 = 0;
+    while i < iterations {
+        total = total + popcount(x);
+        i = i + 1;
+    }
+    println(f"10M Popcounts Complete. Total: {total as i64}");
+}

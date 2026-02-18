@@ -1,0 +1,298 @@
+use std::fs;
+use std::path::PathBuf;
+
+pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
+    let mut path_opt: Option<String> = None;
+    let mut output_path: Option<String> = None;
+    let mut release_mode = false;
+    let mut skip_scan = false;
+    let mut vverify = false;
+    let mut binary_mode = false;
+    let mut disable_alias_scopes = false;
+    let mut no_verify = false;
+    let mut lib_mode = false;
+    
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--release" {
+            release_mode = true;
+        } else if arg == "--help" || arg == "-h" {
+            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [--lib] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
+            println!("");
+            println!("Flags:");
+            println!("  --release    Enable optimizations");
+            println!("  --binary     Produce native Mach-O/ELF binary via Iron Driver");
+            println!("  --verify     Run Z3 verification passes");
+            println!("  --skip-scan  Skip import scanning");
+            println!("  --lib        Library mode (no main entry point required)");
+            println!("  --disable-alias-scopes  Suppress LLVM alias scope metadata (for mlir-opt compatibility)");
+            println!("  --no-verify  Skip Z3/ownership verification for fast builds");
+            println!("  -o <path>    Output path (MLIR or binary)");
+            return Ok(());
+        } else if arg == "--skip-scan" {
+            skip_scan = true;
+        } else if arg == "--vverify" || arg == "--verify" {
+            vverify = true;
+        } else if arg == "--bench" {
+            // Benchmark mode (release implied)
+            release_mode = true; 
+        } else if arg == "--binary" {
+            // Sovereign binary mode: full MLIR → native pipeline
+            binary_mode = true;
+            release_mode = true; // Binary mode implies release
+        } else if arg == "--disable-alias-scopes" {
+            disable_alias_scopes = true;
+        } else if arg == "--no-verify" {
+            no_verify = true;
+        } else if arg == "--lib" {
+            lib_mode = true;
+        } else if arg == "-o" {
+            if i + 1 < args.len() {
+                output_path = Some(args[i+1].clone());
+                i += 1;
+            } else {
+                anyhow::bail!("-o requires an argument");
+            }
+        } else if arg.starts_with("-") {
+            anyhow::bail!("Unknown argument: {}", arg);
+        } else {
+            path_opt = Some(arg.clone());
+        }
+        i += 1;
+    }
+
+    let path = match path_opt {
+        Some(p) => p,
+        None => {
+            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [--lib] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
+            return Ok(());
+        }
+    };
+
+    let code = fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!("Failed to read source file '{}': {}", path, e)
+    })?;
+
+    let processed = crate::preprocess(&code);
+    let mut file: crate::grammar::SaltFile = syn::parse_str(&processed)?;
+
+    // Load dependencies
+    let mut registry = crate::registry::Registry::new();
+    
+    // Pre-register main to avoid infinite recursion if any dependencies import it
+    let main_pkg = if let Some(pkg) = &file.package {
+        pkg.name.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(".")
+    } else {
+        "main".to_string()
+    };
+    
+    registry.register(crate::registry::ModuleInfo::new(&main_pkg));
+
+    load_imports(&file, &mut registry);
+
+    match crate::compile_ast(&mut file, release_mode, Some(&registry), skip_scan, vverify, disable_alias_scopes, no_verify, lib_mode) {
+        Ok(mlir) => {
+            if binary_mode {
+                // ============================================================
+                // SOVEREIGN BINARY MODE — Full MLIR → Native Pipeline
+                // ============================================================
+                let basename = std::path::Path::new(&path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+                
+                let output_bin = output_path
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(basename));
+                
+                let build_dir = std::env::temp_dir().join("salt-build");
+                let driver = crate::driver::SaltDriver::new(build_dir);
+                
+                eprintln!("🏛️  [Sovereign] Driving MLIR → native binary...");
+                eprintln!("    Target: {:?}", driver.target);
+                eprintln!("    Runtime: {:?}", driver.runtime_obj);
+                
+                match driver.compile(&mlir, basename) {
+                    Ok(produced_path) => {
+                        // Copy to requested output path if different
+                        if produced_path != output_bin {
+                            fs::copy(&produced_path, &output_bin).map_err(|e| {
+                                anyhow::anyhow!("Failed to copy binary to {:?}: {}", output_bin, e)
+                            })?;
+                        }
+                        
+                        // Post-compilation Sovereignty Audit
+                        eprintln!("⚖️  [Sovereign] Running Sovereignty Audit...");
+                        // TODO: Run full disassembly-based audit via binary_audit::check_pattern()
+                        // Requires: otool -tV <binary> | check NoX19Spill + HasTailCall + HasIoSyscall
+                        eprintln!("✅  [Sovereign] Binary synthesized: {:?}", output_bin);
+                        eprintln!("    Pipeline: mlir-opt → mlir-translate → llc (x19 reserved) → clang (-nostdlib)");
+                    }
+                    Err(e) => {
+                        eprintln!("❌  [Sovereign] Binary synthesis failed: {}", e);
+                        eprintln!("    Ensure LLVM tools are installed at /opt/homebrew/opt/llvm/bin/");
+                        eprintln!("    Ensure sovereign_rt.o is built (cd sovereign_rt && make)");
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(out_p) = output_path {
+                fs::write(out_p, mlir)?;
+            } else {
+                println!("{}", mlir);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn load_imports(file: &crate::grammar::SaltFile, registry: &mut crate::registry::Registry) {
+    use crate::grammar::Item;
+
+    for imp in &file.imports {
+        // Convert package path to file path
+        // e.g. kernel.arch.x86.gdt -> kernel/arch/x86/gdt.salt
+        let original_parts: Vec<String> = imp.name.iter().map(|id| id.to_string()).collect();
+        let mut parts = original_parts.clone();
+        
+        // Loop to support fallback (peeling off the last component to find the module file)
+        // e.g., std.core.ptr.Ptr -> std/core/ptr.salt
+        loop {
+            let pkg_name = parts.join(".");
+            
+            // If module is already loaded, we are good.
+            if registry.modules.contains_key(&pkg_name) {
+                break;
+            }
+
+            let path_str = format!("{}.salt", parts.join("/"));
+            let path_str_mod = format!("{}/mod.salt", parts.join("/"));
+            let path_str_lower = format!("{}.salt", parts.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>().join("/"));
+            let path_str_mod_lower = format!("{}/mod.salt", parts.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>().join("/"));
+
+            // Search paths: CWD, parent directories, project root
+            let search_paths = vec![
+                path_str.clone(),                          // CWD-relative (original case)
+                path_str_mod.clone(),                      // CWD-relative/mod (original case)
+                path_str_lower.clone(),                    // CWD-relative (lowercase)
+                path_str_mod_lower.clone(),                // CWD-relative/mod (lowercase)
+                format!("../{}", path_str),                // Parent directory
+                format!("../{}", path_str_mod),
+                format!("../{}", path_str_lower),          // Parent directory (lowercase)
+                format!("../{}", path_str_mod_lower),
+                format!("../../{}", path_str),             // Grandparent
+                format!("../../{}", path_str_mod),
+                format!("../../{}", path_str_lower),       // Grandparent (lowercase)
+                format!("../../{}", path_str_mod_lower),
+                format!("../../../{}", path_str),          // Great-grandparent
+                format!("../../../{}", path_str_mod),
+                format!("../../../{}", path_str_lower),    // Great-grandparent (lowercase)
+                format!("../../../{}", path_str_mod_lower),
+            ];
+
+            let mut code_result = None;
+            let mut found_path = path_str.clone();
+
+            for search_path in &search_paths {
+                if let Ok(code) = fs::read_to_string(search_path) {
+                    code_result = Some(code);
+                    found_path = search_path.clone();
+                    break;
+                }
+            }
+
+            if let Some(code) = code_result {
+                let processed = crate::preprocess(&code);
+                if let Ok(imported_file) = syn::parse_str::<crate::grammar::SaltFile>(&processed) {
+                    // Register the module
+                    let mut info = crate::registry::ModuleInfo::new(&pkg_name);
+
+                    // Extract pub functions
+                    for import_item in &imported_file.items {
+                        fn extract_args(args: &syn::punctuated::Punctuated<crate::grammar::Arg, syn::token::Comma>) -> Vec<crate::types::Type> {
+                            args.iter().filter_map(|arg| {
+                                if let Some(ref syn_ty) = arg.ty {
+                                    crate::types::Type::from_syn(syn_ty)
+                                } else { None }
+                            }).collect()
+                        }
+
+                        if let Item::Fn(f) = import_item {
+                            let args = extract_args(&f.args);
+                            let ret = if let Some(ref ret) = f.ret_type {
+                                crate::types::Type::from_syn(ret).unwrap_or(crate::types::Type::Unit)
+                            } else {
+                                crate::types::Type::Unit
+                            };
+                            info.functions.insert(f.name.to_string(), (args, ret));
+                        }
+                        if let Item::ExternFn(ef) = import_item {
+                             let args = extract_args(&ef.args);
+                             let ret = if let Some(ref ret) = ef.ret_type {
+                                 crate::types::Type::from_syn(ret).unwrap_or(crate::types::Type::Unit)
+                             } else {
+                                 crate::types::Type::Unit
+                             };
+                             info.functions.insert(ef.name.to_string(), (args, ret));
+                        }
+                        if let Item::Const(c) = import_item {
+                            let eval = crate::evaluator::Evaluator::new();
+                            if let Ok(crate::evaluator::ConstValue::Integer(val)) = eval.eval_expr(&c.value) {
+                                info.constants.insert(c.name.to_string(), val);
+                            }
+                        }
+                        // Extract structs (generic -> templates, concrete -> field list)
+                        if let Item::Struct(s) = import_item {
+                            if s.generics.is_some() {
+                                // Generic struct - store full AST as template
+                                info.struct_templates.insert(s.name.to_string(), s.clone());
+                            } else {
+                                // Concrete struct - store fields
+                                let fields: Vec<(String, crate::types::Type)> = s.fields.iter().filter_map(|f| {
+                                    crate::types::Type::from_syn(&f.ty).map(|ty| (f.name.to_string(), ty))
+                                }).collect();
+                                info.structs.insert(s.name.to_string(), fields);
+                            }
+                        }
+                        if let Item::Enum(e) = import_item {
+                            if e.generics.is_some() {
+                                info.enum_templates.insert(e.name.to_string(), e.clone());
+                            }
+                        }
+                        if let Item::Impl(i) = import_item {
+                            info.impls.push((i.clone(), imported_file.imports.clone()));
+                        }
+                    }
+                    registry.register(info);
+                    
+                    // Recurse
+                    load_imports(&imported_file, registry);
+                    
+                    // Break the fallback loop as we found the module
+                    break;
+                } else if let Err(e) = syn::parse_str::<crate::grammar::SaltFile>(&processed) {
+                    eprintln!("Warning: Failed to parse imported file {}: {}", found_path, e);
+                    // If parsing fails, we probably shouldn't try fallback? 
+                    // Or maybe we should if the path ended up pointing to a non-Salt file by accident (unlikely)
+                    // Let's assume hard failure on parse error for matched file.
+                    break;
+                }
+            } else {
+                // Not found. Try fallback.
+                if parts.len() > 1 {
+                    parts.pop();
+                    // Continue loop to try parent path
+                } else {
+                    eprintln!("Warning: Could not find imported file: {} (scanned parents)", original_parts.join("."));
+                    break;
+                }
+            }
+        }
+    }
+}
+

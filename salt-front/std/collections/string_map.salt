@@ -1,0 +1,452 @@
+// std/collections/string_map - Sovereign String SwissTable V1.0
+// Data-Oriented StringView→StringView map using SoA layout + Arena storage.
+//
+// Decouples the Search Index (ctrl bytes + metadata arrays) from
+// Data Storage (Arena). Achieves mechanical sympathy with L1/L2:
+//   L1: Load 8 ctrl bytes → SWAR match_tag (branch: 99% skip)
+//   L2: On hit → load key offset/len → memcmp against Arena
+//
+// Uses the same Group + ctrl byte protocol as HashMap:
+//   EMPTY = -128 (0x80), DELETED = -2 (0xFE), tag = hash & 0x7F
+//
+// Compacting rehash clears tombstones AND defragments Arena simultaneously.
+//
+// NOTE: Uses copy_bytes() free function for Ptr<u8> copies to work around
+// intrin::memcpy segfault with Ptr<u8> args. StringView fields (ptr, length)
+// are extracted as locals inside each use-site branch to avoid register
+// liveness issues in deep control flow.
+
+package std.collections.string_map
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+use std.simd.Group
+use std.simd.prefetch_read
+use std.simd.unlikely
+use std.math.ctz_u64
+
+extern fn malloc(size: i64) -> u64;
+extern fn free(ptr: u64);
+
+// =============================================================================
+// SwissTable Control Constants
+// =============================================================================
+
+@inline
+pub fn SM_EMPTY() -> i8 { return -128; }
+
+@inline
+pub fn SM_DELETED() -> i8 { return -2; }
+
+// =============================================================================
+// FNV-1a Hash for StringView
+// =============================================================================
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+pub fn fnv1a(sv: StringView) -> u64 {
+    let mut hash = FNV_OFFSET;
+    let mut i: i64 = 0;
+    while i < sv.length() {
+        hash = hash ^ (sv.byte_at(i) as u64);
+        hash = hash * FNV_PRIME;
+        i = i + 1;
+    }
+    return hash;
+}
+
+// =============================================================================
+// Byte copy helper (workaround: intrin::memcpy segfaults with Ptr<u8>)
+// =============================================================================
+@inline
+fn copy_bytes(dst: Ptr<u8>, src: Ptr<u8>, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        dst.offset(i).write(src.offset(i).read());
+        i = i + 1;
+    }
+}
+
+// =============================================================================
+// StringMap — SwissTable with SoA Parallel Arrays
+// =============================================================================
+
+pub struct StringMap {
+    ctrl: Ptr<i8>,
+    key_offsets: Ptr<i64>,
+    key_lens: Ptr<i64>,
+    val_offsets: Ptr<i64>,
+    val_lens: Ptr<i64>,
+    cap: i64,
+    cap_mask: i64,
+    len: i64,
+    growth_left: i64,
+    // Inline arena
+    data_arena: Ptr<u8>,
+    arena_cap: i64,
+    arena_used: i64,
+}
+
+impl StringMap {
+    pub fn new() -> StringMap {
+        return StringMap::with_capacity(16);
+    }
+
+    pub fn with_capacity(min_cap: i64) -> StringMap {
+        let mut cap: i64 = 16;
+        while cap < min_cap {
+            cap = cap * 2;
+        }
+
+        // ctrl + mirror region
+        let ctrl = malloc(cap + Group::width()) as Ptr<i8>;
+        intrin::memset(ctrl, SM_EMPTY(), cap + Group::width());
+
+        let key_off = malloc(cap * 8) as Ptr<i64>;
+        let key_len = malloc(cap * 8) as Ptr<i64>;
+        let val_off = malloc(cap * 8) as Ptr<i64>;
+        let val_len = malloc(cap * 8) as Ptr<i64>;
+
+        // Arena: start at 4x capacity
+        let arena_cap = cap * 64;
+        let arena = malloc(arena_cap) as Ptr<u8>;
+
+        let growth = (cap * 7) >> 3;
+
+        return StringMap {
+            ctrl: ctrl,
+            key_offsets: key_off,
+            key_lens: key_len,
+            val_offsets: val_off,
+            val_lens: val_len,
+            cap: cap,
+            cap_mask: cap - 1,
+            len: 0,
+            growth_left: growth,
+            data_arena: arena,
+            arena_cap: arena_cap,
+            arena_used: 0,
+        };
+    }
+
+    // Zero-copy view into arena data
+    @inline
+    fn arena_view(&self, off: i64, len: i64) -> StringView {
+        return StringView::from_raw(self.data_arena.offset(off), len);
+    }
+
+    // Mirror ctrl byte to both slot and mirror region
+    @inline
+    fn mirror_ctrl(&mut self, idx: i64, tag: i8) {
+        self.ctrl.offset(idx).write(tag);
+        if idx < Group::width() {
+            self.ctrl.offset(self.cap + idx).write(tag);
+        }
+    }
+
+    // Check if arena key at slot matches needle
+    fn key_eq(&self, slot: i64, needle: StringView) -> bool {
+        let klen = self.key_lens.offset(slot).read();
+        if klen != needle.length() {
+            return false;
+        }
+        let koff = self.key_offsets.offset(slot).read();
+        let kptr = self.data_arena.offset(koff);
+        let nptr = needle.ptr;
+        let mut i: i64 = 0;
+        while i < klen {
+            if kptr.offset(i).read() != nptr.offset(i).read() {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // =================================================================
+    // get — SWAR probe → key verification → return slot index
+    // =================================================================
+    pub fn get(&self, key: StringView) -> i64 {
+        if self.cap == 0 { return -1; }
+
+        let hash = fnv1a(key);
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        let mut idx = h1 & mask;
+        let num_groups = (self.cap + 7) >> 3;
+
+        for _ in 0..num_groups {
+            let group = Group::load(self.ctrl.offset(idx));
+            prefetch_read(self.key_offsets.offset(idx) as Ptr<i8>);
+
+            let match_bits = group.match_tag(tag);
+            if match_bits != 0 {
+                let mut bits = match_bits;
+                while bits != 0 {
+                    let tz = ctz_u64(bits);
+                    let byte_off = tz / 8;
+                    let slot = (idx + byte_off as i64) & mask;
+                    if self.key_eq(slot, key) {
+                        return slot;
+                    }
+                    bits = bits & (bits - 1);
+                }
+            }
+
+            if group.has_empty() {
+                return -1;
+            }
+            idx = (idx + Group::width()) & mask;
+        }
+        return -1;
+    }
+
+    // Get the value StringView at a slot (returned from get())
+    pub fn value_at(&self, slot: i64) -> StringView {
+        let voff = self.val_offsets.offset(slot).read();
+        let vlen = self.val_lens.offset(slot).read();
+        return StringView::from_raw(self.data_arena.offset(voff), vlen);
+    }
+
+    // =================================================================
+    // set — probe → insert or overwrite
+    // StringView fields are extracted inside each branch to avoid
+    // register liveness issues in deep control flow.
+    // =================================================================
+    pub fn set(&mut self, key: StringView, val: StringView) {
+        if unlikely(self.growth_left == 0) {
+            self.grow();
+        }
+
+        // Extract StringView fields BEFORE any function calls that consume them
+        let key_ptr = key.ptr;
+        let key_len = key.length();
+        let val_ptr = val.ptr;
+        let val_len = val.length();
+
+        // Reconstruct a StringView for fnv1a from the saved raw fields
+        let key_sv = StringView::from_raw(key_ptr, key_len);
+        let hash = fnv1a(key_sv);
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        let mut idx = h1 & mask;
+        let mut first_deleted: i64 = -1;
+
+        for _ in 0..self.cap {
+            let ctrl_byte = self.ctrl.offset(idx).read();
+
+            if ctrl_byte == tag {
+                let key_sv2 = StringView::from_raw(key_ptr, key_len);
+                if self.key_eq(idx, key_sv2) {
+                    // Overwrite value
+                    let voff = self.arena_used;
+                    copy_bytes(self.data_arena.offset(voff), val_ptr, val_len);
+                    self.arena_used = voff + val_len;
+                    self.val_offsets.offset(idx).write(voff);
+                    self.val_lens.offset(idx).write(val_len);
+                    return;
+                }
+            }
+
+            if ctrl_byte == SM_DELETED() {
+                if first_deleted == -1 {
+                    first_deleted = idx;
+                }
+            }
+
+            if ctrl_byte == SM_EMPTY() {
+                let mut ins_idx = idx;
+                if first_deleted >= 0 { ins_idx = first_deleted; }
+
+                // Arena append for key
+                let koff = self.arena_used;
+                let dst_k = self.data_arena.offset(koff);
+                copy_bytes(dst_k, key_ptr, key_len);
+                self.arena_used = koff + key_len;
+
+                // Arena append for val
+                let voff = self.arena_used;
+                let dst_v = self.data_arena.offset(voff);
+                copy_bytes(dst_v, val_ptr, val_len);
+                self.arena_used = voff + val_len;
+
+                self.key_offsets.offset(ins_idx).write(koff);
+                self.key_lens.offset(ins_idx).write(key_len);
+                self.val_offsets.offset(ins_idx).write(voff);
+                self.val_lens.offset(ins_idx).write(val_len);
+
+                self.mirror_ctrl(ins_idx, tag);
+                self.len = self.len + 1;
+
+                if first_deleted < 0 {
+                    self.growth_left = self.growth_left - 1;
+                }
+                return;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        // Fallback: insert at first deleted
+        if first_deleted >= 0 {
+            let koff = self.arena_used;
+            copy_bytes(self.data_arena.offset(koff), key_ptr, key_len);
+            self.arena_used = koff + key_len;
+            let voff = self.arena_used;
+            copy_bytes(self.data_arena.offset(voff), val_ptr, val_len);
+            self.arena_used = voff + val_len;
+            self.key_offsets.offset(first_deleted).write(koff);
+            self.key_lens.offset(first_deleted).write(key_len);
+            self.val_offsets.offset(first_deleted).write(voff);
+            self.val_lens.offset(first_deleted).write(val_len);
+            self.mirror_ctrl(first_deleted, tag);
+            self.len = self.len + 1;
+        }
+    }
+
+    // =================================================================
+    // del — tombstone ctrl byte
+    // =================================================================
+    pub fn del(&mut self, key: StringView) -> bool {
+        if self.cap == 0 { return false; }
+
+        let hash = fnv1a(key);
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        let mut idx = h1 & mask;
+
+        for _ in 0..self.cap {
+            let ctrl_byte = self.ctrl.offset(idx).read();
+
+            if ctrl_byte == tag {
+                if self.key_eq(idx, key) {
+                    self.mirror_ctrl(idx, SM_DELETED());
+                    self.len = self.len - 1;
+                    self.growth_left = self.growth_left - 1;
+                    return true;
+                }
+            }
+
+            if ctrl_byte == SM_EMPTY() {
+                return false;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+        return false;
+    }
+
+    // =================================================================
+    // grow — Compacting rehash: new ctrl + defragmented arena
+    // =================================================================
+    fn grow(&mut self) {
+        let old_cap = self.cap;
+        let mut new_cap: i64 = 16;
+        if old_cap > 0 {
+            if self.len * 2 < old_cap {
+                new_cap = old_cap;  // Clear tombstones only
+            } else {
+                new_cap = old_cap * 2;
+            }
+        }
+        let new_mask = new_cap - 1;
+
+        let new_ctrl = malloc(new_cap + Group::width()) as Ptr<i8>;
+        intrin::memset(new_ctrl, SM_EMPTY(), new_cap + Group::width());
+        let new_koff = malloc(new_cap * 8) as Ptr<i64>;
+        let new_klen = malloc(new_cap * 8) as Ptr<i64>;
+        let new_voff = malloc(new_cap * 8) as Ptr<i64>;
+        let new_vlen = malloc(new_cap * 8) as Ptr<i64>;
+
+        // New arena for defragmentation
+        let new_arena_cap = new_cap * 64;
+        let new_arena = malloc(new_arena_cap) as Ptr<u8>;
+        let mut new_arena_used: i64 = 0;
+
+        if old_cap > 0 {
+            for i in 0..old_cap {
+                let ctrl_byte = self.ctrl.offset(i).read();
+                if ctrl_byte >= 0 {
+                    // Live entry — copy to new arena
+                    let old_koff = self.key_offsets.offset(i).read();
+                    let old_klen = self.key_lens.offset(i).read();
+                    let old_voff = self.val_offsets.offset(i).read();
+                    let old_vlen = self.val_lens.offset(i).read();
+
+                    // Copy key to new arena
+                    let nk = new_arena_used;
+                    copy_bytes(new_arena.offset(nk), self.data_arena.offset(old_koff), old_klen);
+                    new_arena_used = nk + old_klen;
+
+                    // Copy value to new arena
+                    let nv = new_arena_used;
+                    copy_bytes(new_arena.offset(nv), self.data_arena.offset(old_voff), old_vlen);
+                    new_arena_used = nv + old_vlen;
+
+                    // Re-hash and insert into new table
+                    let kview = StringView::from_raw(new_arena.offset(nk), old_klen);
+                    let hash = fnv1a(kview);
+                    let tag = (hash & 0x7F) as i8;
+                    let h1 = (hash >> 7) as i64;
+                    let mut new_idx = h1 & new_mask;
+
+                    while new_ctrl.offset(new_idx).read() != SM_EMPTY() {
+                        new_idx = (new_idx + 1) & new_mask;
+                    }
+
+                    new_ctrl.offset(new_idx).write(tag);
+                    if new_idx < Group::width() {
+                        new_ctrl.offset(new_cap + new_idx).write(tag);
+                    }
+                    new_koff.offset(new_idx).write(nk);
+                    new_klen.offset(new_idx).write(old_klen);
+                    new_voff.offset(new_idx).write(nv);
+                    new_vlen.offset(new_idx).write(old_vlen);
+                }
+            }
+
+            free(self.ctrl as u64);
+            free(self.key_offsets as u64);
+            free(self.key_lens as u64);
+            free(self.val_offsets as u64);
+            free(self.val_lens as u64);
+            free(self.data_arena as u64);
+        }
+
+        self.ctrl = new_ctrl;
+        self.key_offsets = new_koff;
+        self.key_lens = new_klen;
+        self.val_offsets = new_voff;
+        self.val_lens = new_vlen;
+        self.cap = new_cap;
+        self.cap_mask = new_mask;
+        self.growth_left = ((new_cap * 7) >> 3) - self.len;
+        self.data_arena = new_arena;
+        self.arena_cap = new_arena_cap;
+        self.arena_used = new_arena_used;
+    }
+
+    pub fn length(&self) -> i64 {
+        return self.len;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        return self.len == 0;
+    }
+
+    pub fn drop(&mut self) {
+        if self.cap > 0 {
+            free(self.ctrl as u64);
+            free(self.key_offsets as u64);
+            free(self.key_lens as u64);
+            free(self.val_offsets as u64);
+            free(self.val_lens as u64);
+            free(self.data_arena as u64);
+            self.cap = 0;
+            self.len = 0;
+        }
+    }
+}

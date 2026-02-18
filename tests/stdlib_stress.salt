@@ -1,0 +1,135 @@
+// tests/stdlib_stress.salt - Recursion Guard Saturation Test
+// Tests nested collections and deeply recursive types to verify
+// the 33-level recursion guard in types.rs layout engine.
+
+package tests.stdlib_stress
+
+use std.collections.Vec
+
+// Test 1: Basic Vec operations
+fn test_vec_basic() -> i32 {
+    let mut v = Vec<i32>::new();
+    
+    // Push values
+    for i in 0..100 {
+        v.push(i);
+    }
+    
+    // Verify length
+    if v.len() != 100 {
+        return 1;
+    }
+    
+    // Verify values (Z3 should elide bounds checks)
+    for i in 0..100 {
+        if v.get(i) != i {
+            return 2;
+        }
+    }
+    
+    // Pop and verify
+    let popped = v.pop();
+    if v.len() != 99 {
+        return 3;
+    }
+    
+    return 0;
+}
+
+// Test 2: Vec growth (capacity doubling)
+fn test_vec_growth() -> i32 {
+    let mut v = Vec<i64>::with_capacity(4);
+    
+    // Initial capacity should be 4
+    if v.capacity() != 4 {
+        return 1;
+    }
+    
+    // Push beyond initial capacity
+    for i in 0..16 {
+        v.push(i as i64 * 10);
+    }
+    
+    // Capacity should have grown (to 16 or 32)
+    if v.capacity() < 16 {
+        return 2;
+    }
+    
+    // Verify values preserved after growth
+    for i in 0..16 {
+        if v.get(i) != (i * 10) as i64 {
+            return 3;
+        }
+    }
+    
+    return 0;
+}
+
+// Test 3: Nested Vec (2 levels) - targets recursion guard
+fn test_nested_vec_2() -> i32 {
+    let mut outer = Vec<Vec<i32>>::new();
+    
+    for i in 0..5 {
+        let mut inner = Vec<i32>::new();
+        for j in 0..10 {
+            inner.push(i * 10 + j);
+        }
+        outer.push(inner);
+    }
+    
+    if outer.len() != 5 {
+        return 1;
+    }
+    
+    return 0;
+}
+
+// Test 4: String operations
+fn test_string() -> i32 {
+    use std.string.String;
+    
+    let mut s = String::new();
+    
+    // Push ASCII characters
+    s.push_ascii(72);  // 'H'
+    s.push_ascii(105); // 'i'
+    s.push_ascii(33);  // '!'
+    
+    if s.len() != 3 {
+        return 1;
+    }
+    
+    // Verify byte values
+    if s.byte_at(0) != 72 {
+        return 2;
+    }
+    
+    return 0;
+}
+
+// Main test runner
+fn main() -> i32 {
+    let mut failures = 0;
+    
+    let r1 = test_vec_basic();
+    if r1 != 0 {
+        failures += 1;
+    }
+    
+    let r2 = test_vec_growth();
+    if r2 != 0 {
+        failures += 1;
+    }
+    
+    let r3 = test_nested_vec_2();
+    if r3 != 0 {
+        failures += 1;
+    }
+    
+    let r4 = test_string();
+    if r4 != 0 {
+        failures += 1;
+    }
+    
+    return failures;
+}

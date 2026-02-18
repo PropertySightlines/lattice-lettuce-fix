@@ -1,0 +1,923 @@
+// Facet Tiger — Headless Frame Recorder
+//
+// Renders the tiger scene step-by-step and writes each frame as a PPM file
+// to /tmp/facet_frames/frame_NNN.ppm. No window required — runs headlessly.
+//
+// Usage:
+//   cd user/facet && make rec-tiger
+//
+// Then encode to WebM:
+//   ffmpeg -framerate 5 -i /tmp/facet_frames/frame_%03d.ppm \
+//          -c:v libvpx-vp9 -pix_fmt yuva420p -b:v 0 -crf 30 \
+//          site/video/facet_tiger.webm
+//
+// Or to MP4:
+//   ffmpeg -framerate 5 -i /tmp/facet_frames/frame_%03d.ppm \
+//          -c:v libx264 -pix_fmt yuv420p -crf 20 \
+//          site/video/facet_tiger.mp4
+
+package main
+
+use std.core.ptr.Ptr
+
+// ═══════════════════════════════════════════════════════════════
+// FFI — libc + libm
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn fabsf(x: f32) -> f32;
+extern fn floorf(x: f32) -> f32;
+extern fn ceilf(x: f32) -> f32;
+
+// File I/O (libc)
+extern fn fopen(path: Ptr<u8>, mode: Ptr<u8>) -> Ptr<u8>;
+extern fn fwrite(buf: Ptr<u8>, size: i64, count: i64, fp: Ptr<u8>) -> i64;
+extern fn fclose(fp: Ptr<u8>) -> i32;
+extern fn snprintf(buf: Ptr<u8>, size: i64, fmt: Ptr<u8>, n: i32) -> i32;
+extern fn mkdir(path: Ptr<u8>, mode: i32) -> i32;
+
+// ═══════════════════════════════════════════════════════════════
+// Core Types (identical to demo_tiger.salt)
+// ═══════════════════════════════════════════════════════════════
+
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+fn pt(x: f32, y: f32) -> Point {
+    return Point { x: x, y: y };
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    return Point { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 };
+}
+
+const CMD_MOVE_TO: i32  = 0;
+const CMD_LINE_TO: i32  = 1;
+const CMD_QUAD_TO: i32  = 2;
+const CMD_CUBIC_TO: i32 = 3;
+const CMD_CLOSE: i32    = 4;
+
+struct PathCmd {
+    tag: i32,
+    _pad: i32,
+    p0: Point,
+    p1: Point,
+    p2: Point,
+}
+
+struct Path {
+    cmds: Ptr<PathCmd>,
+    count: i64,
+    capacity: i64,
+}
+
+struct Canvas {
+    pixels: Ptr<u8>,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+struct Edge {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dir: f32,
+}
+
+struct EdgeTable {
+    edges: Ptr<Edge>,
+    count: i64,
+    capacity: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Path Construction
+// ═══════════════════════════════════════════════════════════════
+
+fn path_new() -> Path {
+    let cap: i64 = 64;
+    let bytes = cap * 32;
+    let mem = malloc(bytes);
+    return Path { cmds: mem as Ptr<PathCmd>, count: 0, capacity: cap };
+}
+
+fn path_grow(p: &mut Path) {
+    if p.count >= p.capacity {
+        let new_cap = p.capacity * 2;
+        let new_mem = malloc(new_cap * 32);
+        let src = p.cmds;
+        let dst = new_mem as Ptr<PathCmd>;
+        let mut i: i64 = 0;
+        while i < p.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(p.cmds as Ptr<u8>);
+        p.cmds = dst;
+        p.capacity = new_cap;
+    }
+}
+
+fn path_push(p: &mut Path, cmd: PathCmd) {
+    path_grow(p);
+    p.cmds.offset(p.count).write(cmd);
+    p.count = p.count + 1;
+}
+
+fn path_move_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_MOVE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_line_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_LINE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_quad_to(p: &mut Path, cx: f32, cy: f32, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_QUAD_TO, _pad: 0,
+        p0: pt(cx, cy), p1: pt(x, y), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_cubic_to(p: &mut Path, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_CUBIC_TO, _pad: 0,
+        p0: pt(c1x, c1y), p1: pt(c2x, c2y), p2: pt(x, y),
+    });
+}
+
+fn path_close(p: &mut Path) {
+    path_push(p, PathCmd {
+        tag: CMD_CLOSE, _pad: 0,
+        p0: pt(0.0, 0.0), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_free(p: &mut Path) {
+    free(p.cmds as Ptr<u8>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Canvas
+// ═══════════════════════════════════════════════════════════════
+
+fn canvas_new(width: i32, height: i32) -> Canvas {
+    let stride = width * 4;
+    let bytes = (stride as i64) * (height as i64);
+    let mem = malloc(bytes);
+    let mut i: i64 = 0;
+    while i < bytes {
+        mem.offset(i).write(0);
+        i = i + 1;
+    }
+    return Canvas { pixels: mem, width: width, height: height, stride: stride };
+}
+
+fn canvas_clear(c: &mut Canvas, rgba: u32) {
+    let r = ((rgba >> 24) & 255) as u8;
+    let g = ((rgba >> 16) & 255) as u8;
+    let b = ((rgba >> 8) & 255) as u8;
+    let a = (rgba & 255) as u8;
+    let mut y: i32 = 0;
+    while y < c.height {
+        let row_off = (y as i64) * (c.stride as i64);
+        let mut x: i32 = 0;
+        while x < c.width {
+            let off = row_off + (x as i64) * 4;
+            c.pixels.offset(off).write(r);
+            c.pixels.offset(off + 1).write(g);
+            c.pixels.offset(off + 2).write(b);
+            c.pixels.offset(off + 3).write(a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn canvas_blend(c: &mut Canvas, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height {
+        return;
+    }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+    if a == 255 {
+        c.pixels.offset(off).write(r);
+        c.pixels.offset(off + 1).write(g);
+        c.pixels.offset(off + 2).write(b);
+        c.pixels.offset(off + 3).write(a);
+    } else if a > 0 {
+        let src_a = a as i32;
+        let inv_a = 255 - src_a;
+        let old_r = c.pixels.offset(off).read() as i32;
+        let old_g = c.pixels.offset(off + 1).read() as i32;
+        let old_b = c.pixels.offset(off + 2).read() as i32;
+        let old_a = c.pixels.offset(off + 3).read() as i32;
+        c.pixels.offset(off).write(((r as i32) + (old_r * inv_a) / 255) as u8);
+        c.pixels.offset(off + 1).write(((g as i32) + (old_g * inv_a) / 255) as u8);
+        c.pixels.offset(off + 2).write(((b as i32) + (old_b * inv_a) / 255) as u8);
+        c.pixels.offset(off + 3).write((src_a + (old_a * inv_a) / 255) as u8);
+    }
+}
+
+fn canvas_free(c: &mut Canvas) {
+    free(c.pixels);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PPM Frame Writer
+// ═══════════════════════════════════════════════════════════════
+
+// Writes a PPM header string into buf. Returns byte count written.
+// PPM header: "P6\n<width> <height>\n255\n"
+fn write_ppm_header(buf: Ptr<u8>, width: i32, height: i32) -> i64 {
+    // "P6\n512 512\n255\n" = 15 bytes for 512x512
+    // We write it manually byte-by-byte to avoid printf dependency.
+    let mut i: i64 = 0;
+    // "P6\n"
+    buf.offset(i).write(80 as u8); i = i + 1; // P
+    buf.offset(i).write(54 as u8); i = i + 1; // 6
+    buf.offset(i).write(10 as u8); i = i + 1; // \n
+    // width digits
+    i = write_u32_ascii(buf, i, width as u32);
+    buf.offset(i).write(32 as u8); i = i + 1; // space
+    // height digits
+    i = write_u32_ascii(buf, i, height as u32);
+    buf.offset(i).write(10 as u8); i = i + 1; // \n
+    // "255\n"
+    buf.offset(i).write(50 as u8); i = i + 1; // 2
+    buf.offset(i).write(53 as u8); i = i + 1; // 5
+    buf.offset(i).write(53 as u8); i = i + 1; // 5
+    buf.offset(i).write(10 as u8); i = i + 1; // \n
+    return i;
+}
+
+fn write_u32_ascii(buf: Ptr<u8>, start: i64, val: u32) -> i64 {
+    // Write decimal digits of val into buf starting at start.
+    // Returns new offset after last digit.
+    if val == 0 {
+        buf.offset(start).write(48 as u8);
+        return start + 1;
+    }
+    // Find digits (up to 10 digits for u32)
+    let tmp = malloc(12);
+    let mut n: u32 = val;
+    let mut len: i64 = 0;
+    while n > 0 {
+        let digit = (n % 10) as u8;
+        tmp.offset(len).write(digit + 48);
+        n = n / 10;
+        len = len + 1;
+    }
+    // Reverse into buf
+    let mut j: i64 = 0;
+    while j < len {
+        let ch = tmp.offset(len - 1 - j).read();
+        buf.offset(start + j).write(ch);
+        j = j + 1;
+    }
+    free(tmp);
+    return start + len;
+}
+
+fn save_frame(c: &Canvas, frame_num: i32) {
+    // Build path: "/tmp/facet_frames/frame_NNN.ppm" using snprintf
+    let path_buf = malloc(64);
+    snprintf(path_buf, 64, "/tmp/facet_frames/frame_%03d.ppm", frame_num);
+
+    let fp = fopen(path_buf, "wb");
+    if (fp as i64) == 0 {
+        println("  ERROR: could not open frame file for writing");
+        free(path_buf);
+        return;
+    }
+
+    // Write PPM header
+    let header_buf = malloc(32);
+    let header_len = write_ppm_header(header_buf, c.width, c.height);
+    fwrite(header_buf, 1, header_len, fp);
+    free(header_buf);
+
+    // Write RGB pixel data (strip alpha channel from RGBA)
+    let pixel_count = (c.width as i64) * (c.height as i64);
+    let rgb_buf = malloc(pixel_count * 3);
+    let mut pi2: i64 = 0;
+    while pi2 < pixel_count {
+        let src_off = pi2 * 4;
+        let dst_off = pi2 * 3;
+        rgb_buf.offset(dst_off).write(c.pixels.offset(src_off).read());
+        rgb_buf.offset(dst_off + 1).write(c.pixels.offset(src_off + 1).read());
+        rgb_buf.offset(dst_off + 2).write(c.pixels.offset(src_off + 2).read());
+        pi2 = pi2 + 1;
+    }
+    fwrite(rgb_buf, 1, pixel_count * 3, fp);
+    free(rgb_buf);
+
+    fclose(fp);
+    free(path_buf);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Edge Table + Bézier Flattening + Fill (identical to demo_tiger.salt)
+// ═══════════════════════════════════════════════════════════════
+
+fn et_new() -> EdgeTable {
+    let cap: i64 = 256;
+    let mem = malloc(cap * 24);
+    return EdgeTable { edges: mem as Ptr<Edge>, count: 0, capacity: cap };
+}
+
+fn et_push(et: &mut EdgeTable, e: Edge) {
+    if et.count >= et.capacity {
+        let new_cap = et.capacity * 2;
+        let new_mem = malloc(new_cap * 24);
+        let mut i: i64 = 0;
+        while i < et.count {
+            (new_mem as Ptr<Edge>).offset(i).write(et.edges.offset(i).read());
+            i = i + 1;
+        }
+        free(et.edges as Ptr<u8>);
+        et.edges = new_mem as Ptr<Edge>;
+        et.capacity = new_cap;
+    }
+    et.edges.offset(et.count).write(e);
+    et.count = et.count + 1;
+}
+
+fn et_free(et: &mut EdgeTable) {
+    free(et.edges as Ptr<u8>);
+}
+
+fn add_line_edge(et: &mut EdgeTable, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if fabsf(y1 - y0) < 0.001 {
+        return;
+    }
+    if y0 < y1 {
+        et_push(et, Edge { x0: x0, y0: y0, x1: x1, y1: y1, dir: 1.0 });
+    } else {
+        et_push(et, Edge { x0: x1, y0: y1, x1: x0, y1: y0, dir: -1.0 });
+    }
+}
+
+fn flatten_quad(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point,
+                tol: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(et, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+    let mx = (p0.x + p2.x) * 0.5;
+    let my = (p0.y + p2.y) * 0.5;
+    let dx = p1.x - mx;
+    let dy = p1.y - my;
+    if dx * dx + dy * dy <= tol * tol {
+        add_line_edge(et, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let mid = midpoint(p01, p12);
+    flatten_quad(et, p0, p01, mid, tol, depth + 1);
+    flatten_quad(et, mid, p12, p2, tol, depth + 1);
+}
+
+fn flatten_cubic(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point, p3: Point,
+                 tol: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let ux = 3.0 * p1.x - 2.0 * p0.x - p3.x;
+    let uy = 3.0 * p1.y - 2.0 * p0.y - p3.y;
+    let vx = 3.0 * p2.x - p0.x - 2.0 * p3.x;
+    let vy = 3.0 * p2.y - p0.y - 2.0 * p3.y;
+    let ux2 = ux * ux;
+    let uy2 = uy * uy;
+    let vx2 = vx * vx;
+    let vy2 = vy * vy;
+    let max_x = if ux2 > vx2 { ux2 } else { vx2 };
+    let max_y = if uy2 > vy2 { uy2 } else { vy2 };
+    if max_x + max_y <= 16.0 * tol * tol {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let mid = midpoint(p012, p123);
+    flatten_cubic(et, p0, p01, p012, mid, tol, depth + 1);
+    flatten_cubic(et, mid, p123, p23, p3, tol, depth + 1);
+}
+
+fn f32_to_i32(v: f32) -> i32 {
+    let result: i32 = v as i32;
+    return result;
+}
+
+fn fill_path(c: &mut Canvas, p: &Path, r: u8, g: u8, b: u8, a: u8) {
+    let mut et = et_new();
+    let tol: f32 = 0.25;
+    let mut cur = pt(0.0, 0.0);
+    let mut sub_start = pt(0.0, 0.0);
+
+    let mut i: i64 = 0;
+    while i < p.count {
+        let cmd = p.cmds.offset(i).read();
+        if cmd.tag == CMD_MOVE_TO {
+            cur = cmd.p0;
+            sub_start = cmd.p0;
+        } else if cmd.tag == CMD_LINE_TO {
+            add_line_edge(&mut et, cur.x, cur.y, cmd.p0.x, cmd.p0.y);
+            cur = cmd.p0;
+        } else if cmd.tag == CMD_QUAD_TO {
+            flatten_quad(&mut et, cur, cmd.p0, cmd.p1, tol, 0);
+            cur = cmd.p1;
+        } else if cmd.tag == CMD_CUBIC_TO {
+            flatten_cubic(&mut et, cur, cmd.p0, cmd.p1, cmd.p2, tol, 0);
+            cur = cmd.p2;
+        } else if cmd.tag == CMD_CLOSE {
+            add_line_edge(&mut et, cur.x, cur.y, sub_start.x, sub_start.y);
+            cur = sub_start;
+        }
+        i = i + 1;
+    }
+
+    if et.count == 0 {
+        et_free(&mut et);
+        return;
+    }
+
+    let mut min_y: f32 = et.edges.offset(0).read().y0;
+    let mut max_y: f32 = et.edges.offset(0).read().y1;
+    let mut j: i64 = 1;
+    while j < et.count {
+        let e = et.edges.offset(j).read();
+        if e.y0 < min_y { min_y = e.y0; }
+        if e.y1 > max_y { max_y = e.y1; }
+        j = j + 1;
+    }
+
+    let y_start = f32_to_i32(floorf(min_y));
+    let y_end = f32_to_i32(ceilf(max_y));
+    let y_start_c = if y_start < 0 { 0 } else { y_start };
+    let y_end_c = if y_end > c.height { c.height } else { y_end };
+
+    let cov_bytes = (c.width as i64) * 4;
+    let cov_raw = malloc(cov_bytes);
+    let coverage = cov_raw as Ptr<f32>;
+
+    let mut scanline: i32 = y_start_c;
+    while scanline < y_end_c {
+        let scan_y = (scanline as f32) + 0.5;
+
+        let mut cx: i64 = 0;
+        while cx < (c.width as i64) {
+            coverage.offset(cx).write(0.0);
+            cx = cx + 1;
+        }
+
+        let mut ei: i64 = 0;
+        while ei < et.count {
+            let e = et.edges.offset(ei).read();
+            if scan_y >= e.y0 && scan_y < e.y1 {
+                let t = (scan_y - e.y0) / (e.y1 - e.y0);
+                let x_int = e.x0 + t * (e.x1 - e.x0);
+                let mut col = f32_to_i32(floorf(x_int));
+                if col < 0 { col = 0; }
+                if col < c.width {
+                    let old = coverage.offset(col as i64).read();
+                    coverage.offset(col as i64).write(old + e.dir);
+                }
+            }
+            ei = ei + 1;
+        }
+
+        let mut winding: f32 = 0.0;
+        let mut px: i32 = 0;
+        while px < c.width {
+            let delta = coverage.offset(px as i64).read();
+            winding = winding + delta;
+
+            let abs_w = fabsf(winding);
+            if abs_w > 0.001 {
+                let alpha_f = 1.0 * (a as f32);
+                let alpha = f32_to_i32(alpha_f) as u8;
+                canvas_blend(c, px, scanline, r, g, b, alpha);
+            }
+
+            px = px + 1;
+        }
+
+        scanline = scanline + 1;
+    }
+
+    free(cov_raw);
+    et_free(&mut et);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tiger Draw Steps (identical to demo_tiger.salt)
+// ═══════════════════════════════════════════════════════════════
+
+fn draw_step_head(c: &mut Canvas) {
+    let mut p = path_new();
+    path_move_to(&mut p, 256.0, 60.0);
+    path_cubic_to(&mut p, 380.0, 60.0, 460.0, 140.0, 460.0, 240.0);
+    path_cubic_to(&mut p, 460.0, 300.0, 440.0, 360.0, 400.0, 400.0);
+    path_cubic_to(&mut p, 370.0, 430.0, 320.0, 460.0, 256.0, 470.0);
+    path_cubic_to(&mut p, 192.0, 460.0, 142.0, 430.0, 112.0, 400.0);
+    path_cubic_to(&mut p, 72.0, 360.0, 52.0, 300.0, 52.0, 240.0);
+    path_cubic_to(&mut p, 52.0, 140.0, 132.0, 60.0, 256.0, 60.0);
+    path_close(&mut p);
+    fill_path(c, &p, 240, 144, 48, 255);
+    path_free(&mut p);
+}
+
+fn draw_step_ears(c: &mut Canvas) {
+    let mut p = path_new();
+    path_move_to(&mut p, 120.0, 140.0);
+    path_cubic_to(&mut p, 100.0, 80.0, 60.0, 30.0, 40.0, 20.0);
+    path_cubic_to(&mut p, 20.0, 10.0, 30.0, 60.0, 50.0, 100.0);
+    path_cubic_to(&mut p, 60.0, 120.0, 80.0, 150.0, 120.0, 160.0);
+    path_close(&mut p);
+    fill_path(c, &p, 240, 144, 48, 255);
+    path_free(&mut p);
+
+    let mut p2 = path_new();
+    path_move_to(&mut p2, 392.0, 140.0);
+    path_cubic_to(&mut p2, 412.0, 80.0, 452.0, 30.0, 472.0, 20.0);
+    path_cubic_to(&mut p2, 492.0, 10.0, 482.0, 60.0, 462.0, 100.0);
+    path_cubic_to(&mut p2, 452.0, 120.0, 432.0, 150.0, 392.0, 160.0);
+    path_close(&mut p2);
+    fill_path(c, &p2, 240, 144, 48, 255);
+    path_free(&mut p2);
+}
+
+fn draw_step_inner_ears(c: &mut Canvas) {
+    let mut p = path_new();
+    path_move_to(&mut p, 115.0, 140.0);
+    path_cubic_to(&mut p, 100.0, 95.0, 75.0, 55.0, 60.0, 45.0);
+    path_cubic_to(&mut p, 50.0, 40.0, 55.0, 70.0, 65.0, 105.0);
+    path_cubic_to(&mut p, 72.0, 125.0, 90.0, 148.0, 115.0, 155.0);
+    path_close(&mut p);
+    fill_path(c, &p, 255, 128, 160, 192);
+    path_free(&mut p);
+
+    let mut p2 = path_new();
+    path_move_to(&mut p2, 397.0, 140.0);
+    path_cubic_to(&mut p2, 412.0, 95.0, 437.0, 55.0, 452.0, 45.0);
+    path_cubic_to(&mut p2, 462.0, 40.0, 457.0, 70.0, 447.0, 105.0);
+    path_cubic_to(&mut p2, 440.0, 125.0, 422.0, 148.0, 397.0, 155.0);
+    path_close(&mut p2);
+    fill_path(c, &p2, 255, 128, 160, 192);
+    path_free(&mut p2);
+}
+
+fn draw_step_stripes_forehead(c: &mut Canvas) {
+    let mut s1 = path_new();
+    path_move_to(&mut s1, 180.0, 90.0);
+    path_cubic_to(&mut s1, 175.0, 110.0, 155.0, 140.0, 140.0, 170.0);
+    path_cubic_to(&mut s1, 130.0, 190.0, 120.0, 200.0, 125.0, 180.0);
+    path_cubic_to(&mut s1, 135.0, 150.0, 160.0, 115.0, 185.0, 88.0);
+    path_close(&mut s1);
+    fill_path(c, &s1, 48, 32, 16, 255);
+    path_free(&mut s1);
+
+    let mut s2 = path_new();
+    path_move_to(&mut s2, 215.0, 75.0);
+    path_cubic_to(&mut s2, 210.0, 95.0, 200.0, 130.0, 195.0, 160.0);
+    path_cubic_to(&mut s2, 192.0, 175.0, 188.0, 185.0, 195.0, 165.0);
+    path_cubic_to(&mut s2, 202.0, 135.0, 212.0, 100.0, 218.0, 73.0);
+    path_close(&mut s2);
+    fill_path(c, &s2, 48, 32, 16, 255);
+    path_free(&mut s2);
+
+    let mut s3 = path_new();
+    path_move_to(&mut s3, 297.0, 75.0);
+    path_cubic_to(&mut s3, 302.0, 95.0, 312.0, 130.0, 317.0, 160.0);
+    path_cubic_to(&mut s3, 320.0, 175.0, 324.0, 185.0, 317.0, 165.0);
+    path_cubic_to(&mut s3, 310.0, 135.0, 300.0, 100.0, 294.0, 73.0);
+    path_close(&mut s3);
+    fill_path(c, &s3, 48, 32, 16, 255);
+    path_free(&mut s3);
+
+    let mut s4 = path_new();
+    path_move_to(&mut s4, 332.0, 90.0);
+    path_cubic_to(&mut s4, 337.0, 110.0, 357.0, 140.0, 372.0, 170.0);
+    path_cubic_to(&mut s4, 382.0, 190.0, 392.0, 200.0, 387.0, 180.0);
+    path_cubic_to(&mut s4, 377.0, 150.0, 352.0, 115.0, 327.0, 88.0);
+    path_close(&mut s4);
+    fill_path(c, &s4, 48, 32, 16, 255);
+    path_free(&mut s4);
+}
+
+fn draw_step_stripes_cheeks(c: &mut Canvas) {
+    let mut s5 = path_new();
+    path_move_to(&mut s5, 100.0, 220.0);
+    path_cubic_to(&mut s5, 85.0, 250.0, 80.0, 290.0, 90.0, 320.0);
+    path_cubic_to(&mut s5, 95.0, 335.0, 100.0, 325.0, 95.0, 295.0);
+    path_cubic_to(&mut s5, 90.0, 265.0, 95.0, 240.0, 105.0, 218.0);
+    path_close(&mut s5);
+    fill_path(c, &s5, 48, 32, 16, 255);
+    path_free(&mut s5);
+
+    let mut s6 = path_new();
+    path_move_to(&mut s6, 412.0, 220.0);
+    path_cubic_to(&mut s6, 427.0, 250.0, 432.0, 290.0, 422.0, 320.0);
+    path_cubic_to(&mut s6, 417.0, 335.0, 412.0, 325.0, 417.0, 295.0);
+    path_cubic_to(&mut s6, 422.0, 265.0, 417.0, 240.0, 407.0, 218.0);
+    path_close(&mut s6);
+    fill_path(c, &s6, 48, 32, 16, 255);
+    path_free(&mut s6);
+}
+
+fn draw_step_stripes_temple(c: &mut Canvas) {
+    let mut s7 = path_new();
+    path_move_to(&mut s7, 145.0, 100.0);
+    path_cubic_to(&mut s7, 130.0, 120.0, 110.0, 160.0, 100.0, 200.0);
+    path_cubic_to(&mut s7, 96.0, 215.0, 105.0, 210.0, 108.0, 195.0);
+    path_cubic_to(&mut s7, 118.0, 155.0, 135.0, 118.0, 150.0, 98.0);
+    path_close(&mut s7);
+    fill_path(c, &s7, 48, 32, 16, 255);
+    path_free(&mut s7);
+
+    let mut s8 = path_new();
+    path_move_to(&mut s8, 367.0, 100.0);
+    path_cubic_to(&mut s8, 382.0, 120.0, 402.0, 160.0, 412.0, 200.0);
+    path_cubic_to(&mut s8, 416.0, 215.0, 407.0, 210.0, 404.0, 195.0);
+    path_cubic_to(&mut s8, 394.0, 155.0, 377.0, 118.0, 362.0, 98.0);
+    path_close(&mut s8);
+    fill_path(c, &s8, 48, 32, 16, 255);
+    path_free(&mut s8);
+}
+
+fn draw_step_muzzle(c: &mut Canvas) {
+    let mut muz = path_new();
+    let mcx: f32 = 256.0;
+    let mcy: f32 = 340.0;
+    let mrx: f32 = 90.0;
+    let mry: f32 = 70.0;
+    let mkx = 0.5523 * mrx;
+    let mky = 0.5523 * mry;
+    path_move_to(&mut muz, mcx + mrx, mcy);
+    path_cubic_to(&mut muz, mcx + mrx, mcy + mky, mcx + mkx, mcy + mry, mcx, mcy + mry);
+    path_cubic_to(&mut muz, mcx - mkx, mcy + mry, mcx - mrx, mcy + mky, mcx - mrx, mcy);
+    path_cubic_to(&mut muz, mcx - mrx, mcy - mky, mcx - mkx, mcy - mry, mcx, mcy - mry);
+    path_cubic_to(&mut muz, mcx + mkx, mcy - mry, mcx + mrx, mcy - mky, mcx + mrx, mcy);
+    path_close(&mut muz);
+    fill_path(c, &muz, 255, 240, 208, 255);
+    path_free(&mut muz);
+}
+
+fn draw_step_eyes(c: &mut Canvas) {
+    let mut le = path_new();
+    let lecx: f32 = 190.0; let lecy: f32 = 220.0;
+    let lerx: f32 = 45.0;  let lery: f32 = 35.0;
+    let lekx = 0.5523 * lerx; let leky = 0.5523 * lery;
+    path_move_to(&mut le, lecx + lerx, lecy);
+    path_cubic_to(&mut le, lecx + lerx, lecy + leky, lecx + lekx, lecy + lery, lecx, lecy + lery);
+    path_cubic_to(&mut le, lecx - lekx, lecy + lery, lecx - lerx, lecy + leky, lecx - lerx, lecy);
+    path_cubic_to(&mut le, lecx - lerx, lecy - leky, lecx - lekx, lecy - lery, lecx, lecy - lery);
+    path_cubic_to(&mut le, lecx + lekx, lecy - lery, lecx + lerx, lecy - leky, lecx + lerx, lecy);
+    path_close(&mut le);
+    fill_path(c, &le, 255, 255, 255, 255);
+    path_free(&mut le);
+
+    let mut re = path_new();
+    let recx: f32 = 322.0; let recy: f32 = 220.0;
+    let rerx: f32 = 45.0;  let rery: f32 = 35.0;
+    let rekx = 0.5523 * rerx; let reky = 0.5523 * rery;
+    path_move_to(&mut re, recx + rerx, recy);
+    path_cubic_to(&mut re, recx + rerx, recy + reky, recx + rekx, recy + rery, recx, recy + rery);
+    path_cubic_to(&mut re, recx - rekx, recy + rery, recx - rerx, recy + reky, recx - rerx, recy);
+    path_cubic_to(&mut re, recx - rerx, recy - reky, recx - rekx, recy - rery, recx, recy - rery);
+    path_cubic_to(&mut re, recx + rekx, recy - rery, recx + rerx, recy - reky, recx + rerx, recy);
+    path_close(&mut re);
+    fill_path(c, &re, 255, 255, 255, 255);
+    path_free(&mut re);
+}
+
+fn draw_step_pupils(c: &mut Canvas) {
+    let mut lp = path_new();
+    let lpcx: f32 = 195.0; let lpcy: f32 = 222.0; let lpr: f32 = 18.0;
+    let lpk = 0.5523 * lpr;
+    path_move_to(&mut lp, lpcx + lpr, lpcy);
+    path_cubic_to(&mut lp, lpcx + lpr, lpcy + lpk, lpcx + lpk, lpcy + lpr, lpcx, lpcy + lpr);
+    path_cubic_to(&mut lp, lpcx - lpk, lpcy + lpr, lpcx - lpr, lpcy + lpk, lpcx - lpr, lpcy);
+    path_cubic_to(&mut lp, lpcx - lpr, lpcy - lpk, lpcx - lpk, lpcy - lpr, lpcx, lpcy - lpr);
+    path_cubic_to(&mut lp, lpcx + lpk, lpcy - lpr, lpcx + lpr, lpcy - lpk, lpcx + lpr, lpcy);
+    path_close(&mut lp);
+    fill_path(c, &lp, 16, 16, 16, 255);
+    path_free(&mut lp);
+
+    let mut rp = path_new();
+    let rpcx: f32 = 317.0; let rpcy: f32 = 222.0; let rpr: f32 = 18.0;
+    let rpk = 0.5523 * rpr;
+    path_move_to(&mut rp, rpcx + rpr, rpcy);
+    path_cubic_to(&mut rp, rpcx + rpr, rpcy + rpk, rpcx + rpk, rpcy + rpr, rpcx, rpcy + rpr);
+    path_cubic_to(&mut rp, rpcx - rpk, rpcy + rpr, rpcx - rpr, rpcy + rpk, rpcx - rpr, rpcy);
+    path_cubic_to(&mut rp, rpcx - rpr, rpcy - rpk, rpcx - rpk, rpcy - lpr, rpcx, rpcy - rpr);
+    path_cubic_to(&mut rp, rpcx + rpk, rpcy - rpr, rpcx + rpr, rpcy - rpk, rpcx + rpr, rpcy);
+    path_close(&mut rp);
+    fill_path(c, &rp, 16, 16, 16, 255);
+    path_free(&mut rp);
+}
+
+fn draw_step_nose(c: &mut Canvas) {
+    let mut nose = path_new();
+    path_move_to(&mut nose, 256.0, 290.0);
+    path_cubic_to(&mut nose, 268.0, 290.0, 280.0, 300.0, 280.0, 310.0);
+    path_cubic_to(&mut nose, 280.0, 320.0, 268.0, 330.0, 256.0, 330.0);
+    path_cubic_to(&mut nose, 244.0, 330.0, 232.0, 320.0, 232.0, 310.0);
+    path_cubic_to(&mut nose, 232.0, 300.0, 244.0, 290.0, 256.0, 290.0);
+    path_close(&mut nose);
+    fill_path(c, &nose, 48, 24, 24, 255);
+    path_free(&mut nose);
+}
+
+fn draw_step_mouth(c: &mut Canvas) {
+    let mut ml = path_new();
+    path_move_to(&mut ml, 256.0, 330.0);
+    path_line_to(&mut ml, 256.0, 355.0);
+    path_cubic_to(&mut ml, 256.0, 358.0, 254.0, 358.0, 254.0, 355.0);
+    path_line_to(&mut ml, 254.0, 330.0);
+    path_close(&mut ml);
+    fill_path(c, &ml, 48, 24, 24, 255);
+    path_free(&mut ml);
+
+    let mut mc1 = path_new();
+    path_move_to(&mut mc1, 254.0, 355.0);
+    path_cubic_to(&mut mc1, 240.0, 370.0, 210.0, 380.0, 200.0, 370.0);
+    path_cubic_to(&mut mc1, 198.0, 368.0, 208.0, 378.0, 222.0, 373.0);
+    path_cubic_to(&mut mc1, 238.0, 367.0, 252.0, 357.0, 254.0, 353.0);
+    path_close(&mut mc1);
+    fill_path(c, &mc1, 48, 24, 24, 255);
+    path_free(&mut mc1);
+
+    let mut mc2 = path_new();
+    path_move_to(&mut mc2, 258.0, 355.0);
+    path_cubic_to(&mut mc2, 272.0, 370.0, 302.0, 380.0, 312.0, 370.0);
+    path_cubic_to(&mut mc2, 314.0, 368.0, 304.0, 378.0, 290.0, 373.0);
+    path_cubic_to(&mut mc2, 274.0, 367.0, 260.0, 357.0, 258.0, 353.0);
+    path_close(&mut mc2);
+    fill_path(c, &mc2, 48, 24, 24, 255);
+    path_free(&mut mc2);
+}
+
+fn draw_step_whiskers(c: &mut Canvas) {
+    let mut w1 = path_new();
+    path_move_to(&mut w1, 170.0, 335.0);
+    path_quad_to(&mut w1, 100.0, 320.0, 30.0, 310.0);
+    path_quad_to(&mut w1, 100.0, 325.0, 170.0, 338.0);
+    path_close(&mut w1);
+    fill_path(c, &w1, 32, 32, 32, 255);
+    path_free(&mut w1);
+
+    let mut w2 = path_new();
+    path_move_to(&mut w2, 170.0, 350.0);
+    path_quad_to(&mut w2, 95.0, 350.0, 25.0, 355.0);
+    path_quad_to(&mut w2, 95.0, 354.0, 170.0, 353.0);
+    path_close(&mut w2);
+    fill_path(c, &w2, 32, 32, 32, 255);
+    path_free(&mut w2);
+
+    let mut w3 = path_new();
+    path_move_to(&mut w3, 172.0, 365.0);
+    path_quad_to(&mut w3, 105.0, 380.0, 35.0, 400.0);
+    path_quad_to(&mut w3, 105.0, 384.0, 172.0, 368.0);
+    path_close(&mut w3);
+    fill_path(c, &w3, 32, 32, 32, 255);
+    path_free(&mut w3);
+
+    let mut w4 = path_new();
+    path_move_to(&mut w4, 342.0, 335.0);
+    path_quad_to(&mut w4, 412.0, 320.0, 482.0, 310.0);
+    path_quad_to(&mut w4, 412.0, 325.0, 342.0, 338.0);
+    path_close(&mut w4);
+    fill_path(c, &w4, 32, 32, 32, 255);
+    path_free(&mut w4);
+
+    let mut w5 = path_new();
+    path_move_to(&mut w5, 342.0, 350.0);
+    path_quad_to(&mut w5, 417.0, 350.0, 487.0, 355.0);
+    path_quad_to(&mut w5, 417.0, 354.0, 342.0, 353.0);
+    path_close(&mut w5);
+    fill_path(c, &w5, 32, 32, 32, 255);
+    path_free(&mut w5);
+
+    let mut w6 = path_new();
+    path_move_to(&mut w6, 340.0, 365.0);
+    path_quad_to(&mut w6, 407.0, 380.0, 477.0, 400.0);
+    path_quad_to(&mut w6, 407.0, 384.0, 340.0, 368.0);
+    path_close(&mut w6);
+    fill_path(c, &w6, 32, 32, 32, 255);
+    path_free(&mut w6);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main — Headless Frame Recorder
+// ═══════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    println("=== Facet Tiger — Headless Frame Recorder ===");
+    println("  Writing frames to /tmp/facet_frames/");
+
+    // Create output directory
+    mkdir("/tmp/facet_frames", 0o755);
+
+    let mut c = canvas_new(512, 512);
+    let mut frame: i32 = 0;
+
+    // Frame 0: Dark background
+    canvas_clear(&mut c, 0x18182AFF);
+    save_frame(&c, frame);
+    frame = frame + 1;
+
+    // Frame 1: Head outline
+    println("  [1/12] Head outline");
+    draw_step_head(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 2: Ears
+    println("  [2/12] Ears");
+    draw_step_ears(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 3: Inner ears
+    println("  [3/12] Inner ears");
+    draw_step_inner_ears(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 4: Forehead stripes
+    println("  [4/12] Forehead stripes");
+    draw_step_stripes_forehead(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 5: Cheek stripes
+    println("  [5/12] Cheek stripes");
+    draw_step_stripes_cheeks(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 6: Temple stripes
+    println("  [6/12] Temple stripes");
+    draw_step_stripes_temple(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 7: Muzzle
+    println("  [7/12] Muzzle");
+    draw_step_muzzle(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 8: Eyes
+    println("  [8/12] Eyes");
+    draw_step_eyes(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 9: Pupils
+    println("  [9/12] Pupils");
+    draw_step_pupils(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 10: Nose
+    println("  [10/12] Nose");
+    draw_step_nose(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 11: Mouth
+    println("  [11/12] Mouth");
+    draw_step_mouth(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Frame 12: Whiskers (final)
+    println("  [12/12] Whiskers");
+    draw_step_whiskers(&mut c);
+    save_frame(&c, frame); frame = frame + 1;
+
+    // Hold final frame for 3 extra seconds at 5fps = 15 duplicate frames
+    let mut hold: i32 = 0;
+    while hold < 15 {
+        save_frame(&c, frame);
+        frame = frame + 1;
+        hold = hold + 1;
+    }
+
+    canvas_free(&mut c);
+
+    println("  Done! 28 frames written.");
+    println("  Encode with:");
+    println("    ffmpeg -framerate 5 -i /tmp/facet_frames/frame_%03d.ppm \\");
+    println("           -c:v libvpx-vp9 -b:v 0 -crf 30 site/video/facet_tiger.webm");
+    println("    ffmpeg -framerate 5 -i /tmp/facet_frames/frame_%03d.ppm \\");
+    println("           -c:v libx264 -pix_fmt yuv420p -crf 20 site/video/facet_tiger.mp4");
+    return 0;
+}

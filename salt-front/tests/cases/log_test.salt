@@ -1,0 +1,26 @@
+// Test: Logging module
+// Verifies structured logging output with level prefixes
+//
+// OUTPUT: === Logging Tests ===
+// OUTPUT: [DEBUG] debugging
+// OUTPUT: [INFO] hello info
+// OUTPUT: [WARN] be careful
+// OUTPUT: [ERROR] something broke
+// OUTPUT: ALL TESTS PASSED
+
+use std.log.log_debug
+use std.log.log_info
+use std.log.log_warn
+use std.log.log_error
+
+fn main() -> i32 {
+    println("=== Logging Tests ===");
+
+    log_debug("debugging");
+    log_info("hello info");
+    log_warn("be careful");
+    log_error("something broke");
+
+    println("ALL TESTS PASSED");
+    return 0;
+}

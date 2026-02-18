@@ -1,0 +1,21 @@
+package kernel.core.syscall
+
+use kernel.core.scheduler
+
+extern fn sched_yield();
+
+@no_mangle
+pub fn handle_syscall(num: u32) {
+    region("syscall_dispatch") {
+        if num == 0 {
+            // Null syscall — benchmark-only, measures pure trap overhead
+            return;
+        } else if num == 119 {
+            sched_yield();
+        } else if num == 128 {
+            return
+        } else if num == 129 {
+            return
+        }
+    }
+}

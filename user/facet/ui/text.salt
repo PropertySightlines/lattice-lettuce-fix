@@ -1,0 +1,89 @@
+// ═══════════════════════════════════════════════════════════════
+// UI Text Rendering (Bitmap Font -> Vector Path)
+// ═══════════════════════════════════════════════════════════════
+
+// 5x7 Font Data (Subset for Demo)
+// Each char is 5 bytes (columns). Bit 0 is top row? No, usually LSB=Top or Bottom.
+// Let's adopt LSB=Top (y=0). 7 bits used.
+// Example '0': 
+// .xx.  3E (00111110)
+// x..x  51 (01010001) - wait, this encoding is vertical stripes
+// x..x  49 (01001001)
+// x..x  45 (01000101)
+// .xx.  3E
+// Yes, standard 5-byte column vertical encoding.
+
+fn font_get_glyph(c: u8) -> Ptr<u8> {
+    // Digits
+    if c == '0' { return "\x3E\x51\x49\x45\x3E"; }
+    if c == '1' { return "\x00\x42\x7F\x40\x00"; }
+    if c == '2' { return "\x42\x61\x51\x49\x46"; }
+    if c == '3' { return "\x21\x41\x45\x4B\x31"; }
+    if c == '4' { return "\x18\x14\x12\x7F\x10"; }
+    if c == '5' { return "\x27\x45\x45\x45\x39"; }
+    if c == '6' { return "\x3C\x4A\x49\x49\x30"; }
+    if c == '7' { return "\x01\x71\x09\x05\x03"; }
+    if c == '8' { return "\x36\x49\x49\x49\x36"; }
+    if c == '9' { return "\x06\x49\x49\x29\x1E"; }
+    
+    // Letters (Counter App)
+    if c == 'C' { return "\x3E\x41\x41\x41\x22"; }
+    if c == 'o' { return "\x38\x44\x44\x44\x38"; }
+    if c == 'u' { return "\x3F\x40\x40\x20\x3F"; }
+    if c == 'n' { return "\x7F\x08\x04\x04\x78"; }
+    if c == 't' { return "\x04\x3F\x44\x40\x20"; }
+    if c == 'e' { return "\x38\x54\x54\x54\x18"; }
+    if c == 'r' { return "\x7C\x08\x04\x04\x08"; }
+    if c == 'A' { return "\x7C\x12\x11\x12\x7C"; }
+    if c == 'p' { return "\x7F\x14\x14\x14\x08"; }
+    if c == ':' { return "\x00\x36\x36\x00\x00"; }
+    if c == 'I' { return "\x00\x41\x7F\x41\x00"; } // Serif I
+    if c == 'c' { return "\x38\x44\x44\x44\x20"; }
+    if c == 'm' { return "\x7C\x04\x18\x04\x78"; }
+    if c == ' ' { return "\x00\x00\x00\x00\x00"; }
+    
+    // Default block for unknown
+    return "\x7F\x7F\x7F\x7F\x7F";
+}
+
+// Measure text dimensions (1 char = 6px width (5 + 1 space), 7px height)
+fn text_layout(s: Ptr<u8>) -> Rect {
+    let mut w: f32 = 0.0;
+    let mut i: i64 = 0;
+    while s.offset(i).read() != 0 {
+        w = w + 6.0;
+        i = i + 1;
+    }
+    return Rect { x: 0.0, y: 0.0, w: w, h: 7.0 };
+}
+
+// Build path for text
+fn text_build_path(s: Ptr<u8>, x: f32, y: f32) -> Ptr<Path> {
+    let p = path_new();
+    let mut cursor_x = x;
+    let mut i: i64 = 0;
+    
+    while s.offset(i).read() != 0 {
+        let c = s.offset(i).read();
+        let glyph = font_get_glyph(c);
+        
+        let mut col: i64 = 0;
+        while col < 5 {
+            let bits = glyph.offset(col).read();
+            let mut row: i64 = 0;
+            while row < 7 {
+                // If bit set, add rect
+                if (bits & (1 << row)) != 0 {
+                    let rx = cursor_x + (col as f32);
+                    let ry = y + (row as f32);
+                    path_rect(p, rx, ry, 1.0, 1.0);
+                }
+                row = row + 1;
+            }
+            col = col + 1;
+        }
+        cursor_x = cursor_x + 6.0; // 5 + 1 spacing
+        i = i + 1;
+    }
+    return p;
+}

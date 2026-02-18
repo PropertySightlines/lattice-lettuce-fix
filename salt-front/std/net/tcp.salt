@@ -1,0 +1,75 @@
+// =============================================================================
+// std.net.tcp — TcpListener and TcpStream abstractions
+// =============================================================================
+// Layer 3 of the 3-layer network architecture.
+// Safe socket types with RAII-style resource management.
+
+package std.net.tcp
+
+use std.os.syscall
+use std.core.ptr.Ptr
+use std.status.Status
+use std.core.result.Result
+
+/// A listening TCP socket that accepts incoming connections.
+pub struct TcpListener {
+    fd: i32
+}
+
+impl TcpListener {
+    /// Bind to the given port and start listening.
+    pub fn bind(port: i32) -> Result<TcpListener> {
+        let fd = syscall::http_tcp_listen(port);
+        if fd < 0 {
+            return Result::Err(Status::internal("tcp bind failed"));
+        }
+        return Result::Ok(TcpListener { fd: fd });
+    }
+
+    /// Accept a new connection.
+    /// Returns Err(Status::unavailable) when no connection is available (EAGAIN).
+    pub fn accept(&self) -> Result<TcpStream> {
+        let client_fd = syscall::http_accept(self.fd);
+        if client_fd < 0 {
+            return Result::Err(Status::unavailable("no connection available"));
+        }
+        return Result::Ok(TcpStream { fd: client_fd });
+    }
+
+    /// Get the raw file descriptor (for registering with Poller).
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    /// Close the listener.
+    pub fn close(&self) {
+        syscall::http_close(self.fd);
+    }
+}
+
+/// A connected TCP stream for reading and writing data.
+pub struct TcpStream {
+    fd: i32
+}
+
+impl TcpStream {
+    /// Read data into a buffer. Returns bytes read (0 = EOF).
+    pub fn recv(&self, buf: Ptr<u8>, len: i64) -> i64 {
+        return syscall::http_recv(self.fd, buf, len);
+    }
+
+    /// Write data from a buffer. Returns bytes written.
+    pub fn send(&self, buf: Ptr<u8>, len: i64) -> i64 {
+        return syscall::http_send(self.fd, buf, len);
+    }
+
+    /// Get the raw file descriptor.
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    /// Close the stream.
+    pub fn close(&self) {
+        syscall::http_close(self.fd);
+    }
+}

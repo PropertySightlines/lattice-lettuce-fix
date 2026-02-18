@@ -1,0 +1,407 @@
+// std/collections/hash_map - Sovereign Swiss-Table HashMap V6.0 (Generic)
+// Featuring: Hash Trait, Group Abstraction, Prefetch, Branch Hints
+// 
+// This is the fully generic HashMap<K: Hash, V> implementation.
+// The Graydon Fix enables deep generic substitution for Entry<K, V>.
+
+package std.collections.hash_map
+
+use std.core.ptr.Ptr
+use std.core.mem.size_of
+use std.core.option.Option
+use std.hash.Hash
+use std.math.ctz_u64
+use std.simd.Group
+use std.simd.prefetch_read
+use std.simd.unlikely
+use std.eq.Eq
+
+// Memory allocation (userspace — fast-path bump pointer, not kernel mmap)
+extern fn malloc(size: i64) -> u64;
+extern fn free(ptr: u64);
+
+// =============================================================================
+// Module-Level Constants (Sovereign Pattern)
+// =============================================================================
+
+@inline
+pub fn EMPTY() -> i8 { return -128; }
+
+@inline
+pub fn DELETED() -> i8 { return -2; }
+
+// Sovereign Word: 8 EMPTY bytes broadcasted into u64
+@inline
+fn EMPTY_WORD() -> u64 { return 0x8080808080808080; }
+
+// =============================================================================
+// Entry Storage (Generic)
+// =============================================================================
+
+pub struct Entry<K, V> {
+    pub key: K,
+    pub val: V
+}
+
+// The Sovereign HashMap V6.0 (Generic)
+pub struct HashMap<K, V> {
+    ctrl: Ptr<i8>,
+    entries: Ptr<Entry<K, V>>,
+    len: i64,
+    cap: i64,
+    cap_mask: i64,
+    growth_left: i64  // Slots until next grow (for cold-path optimization)
+}
+
+impl<K: Hash, V> HashMap<K, V> {
+    pub fn new() -> HashMap<K, V> {
+        return HashMap::<K, V> {
+            ctrl: 1 as Ptr<i8>,
+            entries: 1 as Ptr<Entry<K, V>>,
+            len: 0,
+            cap: 0,
+            cap_mask: 0,
+            growth_left: 0
+        };
+    }
+    
+    pub fn with_capacity(min_cap: i64) -> HashMap<K, V> {
+        if min_cap <= 0 {
+            return HashMap::<K, V>::new();
+        }
+        
+        let mut cap: i64 = 8;
+        while cap < min_cap {
+            cap = cap * 2;
+        }
+        
+        // [SWISS TABLE] Allocate cap + Group::WIDTH extra bytes for ctrl mirror.
+        // Group::load reads 8 bytes; slots near the end need to wrap around.
+        // The mirror region (ctrl[cap..cap+7]) holds copies of ctrl[0..7].
+        let ctrl_addr = malloc(cap + Group::width());
+        let ctrl = ctrl_addr as Ptr<i8>;
+        intrin::memset(ctrl, EMPTY(), cap + Group::width());
+        
+        let entry_size = size_of::<Entry<K, V>>();
+        let entries_addr = malloc(cap * entry_size);
+        let entries = entries_addr as Ptr<Entry<K, V>>;
+        
+        // growth_left = 7/8 capacity (87.5% load factor)
+        let growth_left = (cap * 7) >> 3;
+        
+        return HashMap::<K, V> {
+            ctrl: ctrl,
+            entries: entries,
+            len: 0,
+            cap: cap,
+            cap_mask: cap - 1,
+            growth_left: growth_left
+        };
+    }
+    
+    // =============================================================================
+    // get() - V6.0 with Group, Prefetch, Generic K
+    // =============================================================================
+    pub fn get(&self, key: &K) -> i64 {
+        if self.cap == 0 {
+            return 0;
+        }
+        
+        // [V6.0] Zero-Cost Trait Dispatch - monomorphizer inlines K::hash
+        let hash = key.hash();
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        
+        // [V5.0] Start at home position with modulo erasure
+        let mut idx = h1 & mask;
+        let num_groups = (self.cap + 7) >> 3;
+        
+        for _ in 0..num_groups {
+            // [V5.0] Load control bytes via Group abstraction
+            let group = Group::load(self.ctrl.offset(idx));
+            
+            // [V5.0] PREFETCH: Start loading entries while we compute bitmask
+            prefetch_read((self.entries.offset(idx) as Ptr<i8>));
+            
+            // Get match bitmask (8 bytes checked in parallel)
+            let match_bits = group.match_tag(tag);
+            
+            if match_bits != 0 {
+                // Found potential match(es)
+                let mut bits = match_bits;
+                while bits != 0 {
+                    let tz = ctz_u64(bits);
+                    let byte_offset = tz / 8;
+                    let slot_idx = (idx + byte_offset as i64) & mask;
+                    
+                    let entry = self.entries.offset(slot_idx).read();
+                    // [V6.0] Value equality check
+                    if entry.key == *key {
+                        return entry.val;
+                    }
+                    
+                    bits = bits & (bits - 1);
+                }
+            }
+            
+            // [SWISS TABLE] Early termination on EMPTY.
+            // EMPTY (0x80) means "never used" — no key could have probed past it.
+            // DELETED tombstones are skipped (probing continues past them).
+            // This is safe because growth_left tracks tombstones, triggering
+            // rehash/compaction before the table fills with DELETED markers.
+            if group.has_empty() {
+                return 0;
+            }
+            
+            // Advance to next group
+            idx = (idx + Group::width()) & mask;
+        }
+        
+        return 0;
+    }
+    
+    // =============================================================================
+    // insert() - V6.0 with unlikely() cold-path hint, Generic K/V
+    // =============================================================================
+    pub fn insert(&mut self, key: K, val: V) {
+        // [V5.0] Cold-path hint: grow() is rare, move it out of hot loop
+        if unlikely(self.growth_left == 0) {
+            self.grow();
+        }
+        
+        // [V6.0] Zero-Cost Trait Dispatch
+        let hash = (&key).hash();
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        let mut idx = h1 & mask;
+        let mut first_deleted: i64 = -1;
+        
+        for _ in 0..self.cap {
+            let ctrl_byte = self.ctrl.offset(idx).read();
+            
+            if ctrl_byte == tag {
+                let entry = self.entries.offset(idx).read();
+                // [V6.0] Value equality check
+                if entry.key == key {
+                    // Update existing - doesn't change length
+                    let update_dest = self.entries.offset(idx);
+                    update_dest.write(Entry::<K, V> { key: key, val: val });
+                    // Ctrl tag unchanged, no mirror update needed
+                    return;
+                }
+            }
+            
+            if ctrl_byte == DELETED() {
+                if first_deleted == -1 {
+                    first_deleted = idx;
+                }
+            }
+            
+            if ctrl_byte == EMPTY() {
+                let mut insert_idx = idx;
+                if first_deleted >= 0 { insert_idx = first_deleted; }
+                let ins_ctrl = self.ctrl.offset(insert_idx);
+                ins_ctrl.write(tag);
+                // [SWISS TABLE] Mirror ctrl byte for slots in first Group::WIDTH positions
+                if insert_idx < Group::width() {
+                    let ins_mirror = self.ctrl.offset(self.cap + insert_idx);
+                    ins_mirror.write(tag);
+                }
+                let ins_entry = self.entries.offset(insert_idx);
+                ins_entry.write(Entry::<K, V> { key: key, val: val });
+                self.len = self.len + 1;
+                // Only consume growth_left when using a fresh EMPTY slot.
+                // Reusing a DELETED tombstone doesn't change bucket occupancy.
+                if first_deleted < 0 {
+                    self.growth_left = self.growth_left - 1;
+                }
+                return;
+            }
+            
+            idx = (idx + 1) & mask;
+        }
+        
+        if first_deleted >= 0 {
+            let del_ctrl = self.ctrl.offset(first_deleted);
+            del_ctrl.write(tag);
+            // [SWISS TABLE] Mirror ctrl byte
+            if first_deleted < Group::width() {
+                let del_mirror = self.ctrl.offset(self.cap + first_deleted);
+                del_mirror.write(tag);
+            }
+            let del_entry = self.entries.offset(first_deleted);
+            del_entry.write(Entry::<K, V> { key: key, val: val });
+            self.len = self.len + 1;
+            // Reusing deleted slot doesn't consume growth_left
+        }
+    }
+    
+    pub fn remove(&mut self, key: &K) -> bool {
+        if self.cap == 0 {
+            return false;
+        }
+        
+        let hash = key.hash();
+        let tag = (hash & 0x7F) as i8;
+        let h1 = (hash >> 7) as i64;
+        let mask = self.cap_mask;
+        let mut idx = h1 & mask;
+        
+        for _ in 0..self.cap {
+            let ctrl_byte = self.ctrl.offset(idx).read();
+            
+            if ctrl_byte == tag {
+                let entry = self.entries.offset(idx).read();
+                if entry.key == *key {
+                    let rm_ctrl = self.ctrl.offset(idx);
+                    rm_ctrl.write(DELETED());
+                    // [SWISS TABLE] Mirror deletion in ctrl mirror
+                    if idx < Group::width() {
+                        let rm_mirror = self.ctrl.offset(self.cap + idx);
+                        rm_mirror.write(DELETED());
+                    }
+                    self.len = self.len - 1;
+                    // [TOMBSTONE COMPACTION] Tombstones consume growth budget.
+                    // When growth_left hits 0, grow() rehashes and clears
+                    // all tombstones, restoring O(1) probe performance.
+                    self.growth_left = self.growth_left - 1;
+                    return true;
+                }
+            }
+            
+            if ctrl_byte == EMPTY() {
+                return false;
+            }
+            
+            idx = (idx + 1) & mask;
+        }
+        
+        return false;
+    }
+    
+    // [V5.0] @cold annotation tells compiler this is rare path
+    // [TOMBSTONE COMPACTION] If the table is < 50% full by items, rehash
+    // in-place at the same capacity to clear tombstones without wasting memory.
+    // Otherwise, double capacity as usual.
+    fn grow(&mut self) {
+        let old_cap = self.cap;
+        let mut new_cap: i64 = 16;
+        if old_cap > 0 {
+            // Rehash-in-place if items < capacity/2 (high tombstone ratio)
+            // Otherwise double capacity
+            if self.len * 2 < old_cap {
+                new_cap = old_cap;  // Same capacity — just clear tombstones
+            } else {
+                new_cap = old_cap * 2;
+            }
+        }
+        let new_mask = new_cap - 1;
+        
+        // [SWISS TABLE] Allocate with mirror region
+        let new_ctrl_addr = malloc(new_cap + Group::width());
+        let new_ctrl = new_ctrl_addr as Ptr<i8>;
+        intrin::memset(new_ctrl, EMPTY(), new_cap + Group::width());
+        
+        let entry_size = size_of::<Entry<K, V>>();
+        let new_entries_addr = malloc(new_cap * entry_size);
+        let new_entries = new_entries_addr as Ptr<Entry<K, V>>;
+        
+        if old_cap > 0 {
+            for i in 0..old_cap {
+                let ctrl_byte = self.ctrl.offset(i).read();
+                if ctrl_byte >= 0 {
+                    let entry = self.entries.offset(i).read();
+                    // [V6.0] Use trait method for rehash
+                    let hash = (&entry.key).hash();
+                    let tag = (hash & 0x7F) as i8;
+                    let h1 = (hash >> 7) as i64;
+                    let mut new_idx = h1 & new_mask;
+                    
+                    while new_ctrl.offset(new_idx).read() != EMPTY() {
+                        new_idx = (new_idx + 1) & new_mask;
+                    }
+                    
+                    let ctrl_dest = new_ctrl.offset(new_idx);
+                    ctrl_dest.write(tag);
+                    // [SWISS TABLE] Mirror ctrl for rehashed entries
+                    if new_idx < Group::width() {
+                        let mirror_dest = new_ctrl.offset(new_cap + new_idx);
+                        mirror_dest.write(tag);
+                    }
+                    let entry_dest = new_entries.offset(new_idx);
+                    entry_dest.write(entry);
+                }
+            }
+            
+            free(self.ctrl as u64);
+            free(self.entries as u64);
+        }
+        
+        self.ctrl = new_ctrl;
+        self.entries = new_entries;
+        self.cap = new_cap;
+        self.cap_mask = new_mask;
+        // Fresh growth budget: all tombstones cleared
+        self.growth_left = ((new_cap * 7) >> 3) - self.len;
+    }
+    
+    pub fn len(&self) -> i64 {
+        return self.len;
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        return self.len == 0;
+    }
+    
+    pub fn drop(&mut self) {
+        if self.cap > 0 {
+            free(self.ctrl as u64);
+            free(self.entries as u64);
+            self.cap = 0;
+            self.len = 0;
+        }
+    }
+}
+
+// =============================================================================
+// HashMapIter — Linear Scan Iterator
+// =============================================================================
+// Scans the ctrl array for occupied slots (tag >= 0).
+// EMPTY = -128, DELETED = -2 — both are negative, so ctrl >= 0 means occupied.
+
+pub struct HashMapIter<K, V> {
+    ctrl: Ptr<i8>,
+    entries: Ptr<Entry<K, V>>,
+    index: i64,
+    cap: i64
+}
+
+impl<K, V> HashMapIter<K, V> {
+    pub fn next(&mut self) -> Option<Entry<K, V>> {
+        while self.index < self.cap {
+            let ctrl_byte = self.ctrl.offset(self.index).read();
+            if ctrl_byte >= 0 {
+                // Occupied slot — read entry and advance
+                let entry = self.entries.offset(self.index).read();
+                self.index = self.index + 1;
+                return Option::Some(entry);
+            }
+            self.index = self.index + 1;
+        }
+        return Option::None;
+    }
+}
+
+// Extend HashMap with iter()
+impl<K: Hash, V> HashMap<K, V> {
+    pub fn iter(&self) -> HashMapIter<K, V> {
+        return HashMapIter::<K, V> {
+            ctrl: self.ctrl,
+            entries: self.entries,
+            index: 0,
+            cap: self.cap
+        };
+    }
+}

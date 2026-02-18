@@ -1,0 +1,150 @@
+// =============================================================================
+// Basalt Sampler — Token Selection for Text Generation
+// =============================================================================
+//
+// Decoupled from the transformer state for testability. Three strategies:
+//   1. Argmax    — Deterministic greedy decoding (temperature = 0)
+//   2. Token     — Temperature-scaled random sampling via CDF
+//   3. Top-P     — Nucleus sampling with cumulative probability cutoff
+//
+// All functions operate on flat Ptr<f32> probability arrays.
+// No allocation on the hot path (top-p uses a scratch buffer).
+//
+// =============================================================================
+
+package basalt.sampler
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+
+// -----------------------------------------------------------------------------
+// sample_argmax — Greedy Decoding
+// -----------------------------------------------------------------------------
+// Returns the index of the maximum probability. Deterministic.
+// Used when temperature = 0 for reproducible output.
+// -----------------------------------------------------------------------------
+pub fn sample_argmax(probabilities: Ptr<f32>, n: i64) -> i64
+    requires n > 0
+{
+    let mut best_idx: i64 = 0;
+    let mut best_val: f32 = probabilities[0];
+    for i in 1..n {
+        let v: f32 = probabilities[i];
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+// -----------------------------------------------------------------------------
+// sample_token — CDF-Based Random Sampling
+// -----------------------------------------------------------------------------
+// Given a probability distribution and a random coin ∈ [0, 1), walks the
+// cumulative distribution and returns the first index where CDF > coin.
+//
+// The caller is responsible for applying temperature scaling to the logits
+// and running softmax BEFORE calling this function.
+// -----------------------------------------------------------------------------
+pub fn sample_token(probabilities: Ptr<f32>, n: i64, coin: f32) -> i64
+    requires n > 0
+{
+    let mut cdf: f32 = 0.0f32;
+    for i in 0..n {
+        cdf = cdf + probabilities[i];
+        if coin < cdf {
+            return i;
+        }
+    }
+    return n - 1;
+}
+
+// -----------------------------------------------------------------------------
+// Helpers for top-p sorting
+// -----------------------------------------------------------------------------
+fn alloc_f32(count: i64) -> Ptr<f32> {
+    let ptr: Ptr<u8> = malloc(count * 4);
+    return ptr as Ptr<f32>;
+}
+
+fn alloc_i64(count: i64) -> Ptr<i64> {
+    let ptr: Ptr<u8> = malloc(count * 8);
+    return ptr as Ptr<i64>;
+}
+
+// -----------------------------------------------------------------------------
+// sample_topp — Nucleus (Top-P) Sampling
+// -----------------------------------------------------------------------------
+// Filters the distribution to only the smallest set of tokens whose
+// cumulative probability exceeds `topp`, then samples from that set.
+//
+// Algorithm:
+//   1. Filter out tokens below a probability cutoff
+//   2. Sort remaining tokens by probability (descending)
+//   3. Truncate to the smallest set with cumulative P ≥ topp
+//   4. Sample from the truncated set using CDF + coin
+//
+// Note: Allocates scratch buffers for the sorted candidates.
+// For the hot path, pre-allocate these in RunState.
+// -----------------------------------------------------------------------------
+pub fn sample_topp(probabilities: Ptr<f32>, n: i64, topp: f32, coin: f32) -> i64
+    requires n > 0
+{
+    // Cutoff: skip tokens with negligible probability
+    let cutoff: f32 = (1.0f32 - topp) / ((n - 1) as f32);
+
+    // Build filtered list of (probability, original_index) pairs
+    let prob_buf = alloc_f32(n);
+    let idx_buf = alloc_i64(n);
+    let mut n0: i64 = 0;
+    for i in 0..n {
+        let p: f32 = probabilities[i];
+        if p >= cutoff {
+            prob_buf[n0] = p;
+            idx_buf[n0] = i;
+            n0 = n0 + 1;
+        }
+    }
+
+    // Insertion sort by probability descending
+    for i in 1..n0 {
+        let key_p: f32 = prob_buf[i];
+        let key_i: i64 = idx_buf[i];
+        let mut j: i64 = i - 1;
+        for step in 0..i {
+            if j >= 0 {
+                let pj: f32 = prob_buf[j];
+                if pj < key_p {
+                    prob_buf[j + 1] = pj;
+                    idx_buf[j + 1] = idx_buf[j];
+                    j = j - 1;
+                }
+            }
+        }
+        prob_buf[j + 1] = key_p;
+        idx_buf[j + 1] = key_i;
+    }
+
+    // Truncate to top-p cumulative mass
+    let mut cumulative: f32 = 0.0f32;
+    let mut last_idx: i64 = n0 - 1;
+    for i in 0..n0 {
+        cumulative = cumulative + prob_buf[i];
+        if cumulative > topp {
+            last_idx = i;
+            // Break simulation: remaining iterations are no-ops
+            for skip in 0..0 {}
+        }
+    }
+
+    // Sample from the truncated distribution
+    let r: f32 = coin * cumulative;
+    let mut cdf: f32 = 0.0f32;
+    for i in 0..last_idx + 1 {
+        cdf = cdf + prob_buf[i];
+        if r < cdf {
+            return idx_buf[i];
+        }
+    }
+    return idx_buf[last_idx];
+}

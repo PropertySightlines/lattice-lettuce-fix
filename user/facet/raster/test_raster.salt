@@ -1,0 +1,778 @@
+// Facet Raster — Salt Test Suite
+//
+// Validates path construction, Bézier flattening, fill correctness,
+// winding rules, and bounds safety. All tests run as a single binary.
+//
+// Run:  ./scripts/run_test.sh user/facet/raster/test_raster.salt
+//
+// Expected output ends with:
+// === All 14 tests passed ===
+
+package main
+
+use std.core.ptr.Ptr
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn exit(code: i32);
+extern fn fabsf(x: f32) -> f32;
+extern fn floorf(x: f32) -> f32;
+extern fn ceilf(x: f32) -> f32;
+
+// ═══════════════════════════════════════════════════════════════
+// Core Types
+// ═══════════════════════════════════════════════════════════════
+
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+const CMD_MOVE_TO: i32  = 0;
+const CMD_LINE_TO: i32  = 1;
+const CMD_QUAD_TO: i32  = 2;
+const CMD_CUBIC_TO: i32 = 3;
+const CMD_CLOSE: i32    = 4;
+
+struct PathCmd {
+    tag: i32,
+    _pad: i32,
+    p0: Point,
+    p1: Point,
+    p2: Point,
+}
+
+struct Path {
+    cmds: Ptr<PathCmd>,
+    count: i64,
+    capacity: i64,
+}
+
+struct Canvas {
+    pixels: Ptr<u8>,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+struct Edge {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dir: f32,
+}
+
+struct EdgeTable {
+    edges: Ptr<Edge>,
+    count: i64,
+    capacity: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Point helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn pt(x: f32, y: f32) -> Point {
+    return Point { x: x, y: y };
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    return Point { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Path builder
+// ═══════════════════════════════════════════════════════════════
+
+fn path_new() -> Path {
+    let cap: i64 = 64;
+    let bytes = cap * 32;
+    let mem = malloc(bytes);
+    return Path { cmds: mem as Ptr<PathCmd>, count: 0, capacity: cap };
+}
+
+fn path_grow(p: &mut Path) {
+    if p.count >= p.capacity {
+        let new_cap = p.capacity * 2;
+        let new_mem = malloc(new_cap * 32);
+        let src = p.cmds;
+        let dst = new_mem as Ptr<PathCmd>;
+        let mut i: i64 = 0;
+        while i < p.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(p.cmds as Ptr<u8>);
+        p.cmds = dst;
+        p.capacity = new_cap;
+    }
+}
+
+fn path_push(p: &mut Path, cmd: PathCmd) {
+    path_grow(p);
+    p.cmds.offset(p.count).write(cmd);
+    p.count = p.count + 1;
+}
+
+fn path_move_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_MOVE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_line_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_LINE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_quad_to(p: &mut Path, cx: f32, cy: f32, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_QUAD_TO, _pad: 0,
+        p0: pt(cx, cy), p1: pt(x, y), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_cubic_to(p: &mut Path, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_CUBIC_TO, _pad: 0,
+        p0: pt(c1x, c1y), p1: pt(c2x, c2y), p2: pt(x, y),
+    });
+}
+
+fn path_close(p: &mut Path) {
+    path_push(p, PathCmd {
+        tag: CMD_CLOSE, _pad: 0,
+        p0: pt(0.0, 0.0), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_free(p: &mut Path) {
+    free(p.cmds as Ptr<u8>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Canvas
+// ═══════════════════════════════════════════════════════════════
+
+fn canvas_new(width: i32, height: i32) -> Canvas {
+    let stride = width * 4;
+    let bytes = (stride as i64) * (height as i64);
+    let mem = malloc(bytes);
+    let mut i: i64 = 0;
+    while i < bytes {
+        mem.offset(i).write(0 as u8);
+        i = i + 1;
+    }
+    return Canvas { pixels: mem, width: width, height: height, stride: stride };
+}
+
+fn canvas_clear(c: &mut Canvas, r: u8, g: u8, b: u8, a: u8) {
+    let mut y: i32 = 0;
+    while y < c.height {
+        let mut x: i32 = 0;
+        while x < c.width {
+            let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+            c.pixels.offset(off).write(r);
+            c.pixels.offset(off + 1).write(g);
+            c.pixels.offset(off + 2).write(b);
+            c.pixels.offset(off + 3).write(a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn canvas_get_alpha(c: &Canvas, x: i32, y: i32) -> u8 {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height {
+        return 0;
+    }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4) + 3;
+    return c.pixels.offset(off).read();
+}
+
+fn canvas_get_pixel(c: &Canvas, x: i32, y: i32) -> u32 {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height {
+        return 0;
+    }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+    let r = c.pixels.offset(off).read() as u32;
+    let g = c.pixels.offset(off + 1).read() as u32;
+    let b = c.pixels.offset(off + 2).read() as u32;
+    let a = c.pixels.offset(off + 3).read() as u32;
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+fn canvas_blend(c: &mut Canvas, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height {
+        return;
+    }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+    if a == 255 {
+        c.pixels.offset(off).write(r);
+        c.pixels.offset(off + 1).write(g);
+        c.pixels.offset(off + 2).write(b);
+        c.pixels.offset(off + 3).write(a);
+    } else if a > 0 {
+        let dst_r = c.pixels.offset(off).read() as i32;
+        let dst_g = c.pixels.offset(off + 1).read() as i32;
+        let dst_b = c.pixels.offset(off + 2).read() as i32;
+        let dst_a = c.pixels.offset(off + 3).read() as i32;
+        let src_a = a as i32;
+        let inv_a = 255 - src_a;
+        let out_r = ((r as i32) + (dst_r * inv_a) / 255) as u8;
+        let out_g = ((g as i32) + (dst_g * inv_a) / 255) as u8;
+        let out_b = ((b as i32) + (dst_b * inv_a) / 255) as u8;
+        let out_a = (src_a + (dst_a * inv_a) / 255) as u8;
+        c.pixels.offset(off).write(out_r);
+        c.pixels.offset(off + 1).write(out_g);
+        c.pixels.offset(off + 2).write(out_b);
+        c.pixels.offset(off + 3).write(out_a);
+    }
+}
+
+fn canvas_free(c: &mut Canvas) {
+    free(c.pixels);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EdgeTable
+// ═══════════════════════════════════════════════════════════════
+
+fn et_new() -> EdgeTable {
+    let cap: i64 = 256;
+    let mem = malloc(cap * 24);
+    return EdgeTable { edges: mem as Ptr<Edge>, count: 0, capacity: cap };
+}
+
+fn et_push(et: &mut EdgeTable, e: Edge) {
+    if et.count >= et.capacity {
+        let new_cap = et.capacity * 2;
+        let new_mem = malloc(new_cap * 24);
+        let src = et.edges;
+        let dst = new_mem as Ptr<Edge>;
+        let mut i: i64 = 0;
+        while i < et.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(et.edges as Ptr<u8>);
+        et.edges = dst;
+        et.capacity = new_cap;
+    }
+    et.edges.offset(et.count).write(e);
+    et.count = et.count + 1;
+}
+
+fn et_free(et: &mut EdgeTable) {
+    free(et.edges as Ptr<u8>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rasterizer core
+// ═══════════════════════════════════════════════════════════════
+
+fn add_line_edge(et: &mut EdgeTable, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if fabsf(y1 - y0) < 0.001 {
+        return;
+    }
+    if y0 < y1 {
+        et_push(et, Edge { x0: x0, y0: y0, x1: x1, y1: y1, dir: 1.0 });
+    } else {
+        et_push(et, Edge { x0: x1, y0: y1, x1: x0, y1: y0, dir: -1.0 });
+    }
+}
+
+fn flatten_quad(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point,
+                tol: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(et, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+    let mx = (p0.x + p2.x) * 0.5;
+    let my = (p0.y + p2.y) * 0.5;
+    let dx = p1.x - mx;
+    let dy = p1.y - my;
+    let dist_sq = dx * dx + dy * dy;
+    if dist_sq <= tol * tol {
+        add_line_edge(et, p0.x, p0.y, p2.x, p2.y);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let mid = midpoint(p01, p12);
+    flatten_quad(et, p0, p01, mid, tol, depth + 1);
+    flatten_quad(et, mid, p12, p2, tol, depth + 1);
+}
+
+fn flatten_cubic(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point, p3: Point,
+                 tol: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let ux = 3.0 * p1.x - 2.0 * p0.x - p3.x;
+    let uy = 3.0 * p1.y - 2.0 * p0.y - p3.y;
+    let vx = 3.0 * p2.x - p0.x - 2.0 * p3.x;
+    let vy = 3.0 * p2.y - p0.y - 2.0 * p3.y;
+    let ux2 = ux * ux;
+    let uy2 = uy * uy;
+    let vx2 = vx * vx;
+    let vy2 = vy * vy;
+    let max_x = if ux2 > vx2 { ux2 } else { vx2 };
+    let max_y = if uy2 > vy2 { uy2 } else { vy2 };
+    let flat_sq = max_x + max_y;
+    if flat_sq <= 16.0 * tol * tol {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let mid = midpoint(p012, p123);
+    flatten_cubic(et, p0, p01, p012, mid, tol, depth + 1);
+    flatten_cubic(et, mid, p123, p23, p3, tol, depth + 1);
+}
+
+fn f32_to_i32(v: f32) -> i32 {
+    let result: i32 = v as i32;
+    return result;
+}
+
+fn fill_path(c: &mut Canvas, p: &Path, r: u8, g: u8, b: u8, a: u8, rule: i32) {
+    let mut et = et_new();
+    let tol: f32 = 0.25;
+    let mut cur = pt(0.0, 0.0);
+    let mut sub_start = pt(0.0, 0.0);
+
+    let mut i: i64 = 0;
+    while i < p.count {
+        let cmd = p.cmds.offset(i).read();
+        if cmd.tag == CMD_MOVE_TO {
+            cur = cmd.p0;
+            sub_start = cmd.p0;
+        } else if cmd.tag == CMD_LINE_TO {
+            add_line_edge(&mut et, cur.x, cur.y, cmd.p0.x, cmd.p0.y);
+            cur = cmd.p0;
+        } else if cmd.tag == CMD_QUAD_TO {
+            flatten_quad(&mut et, cur, cmd.p0, cmd.p1, tol, 0);
+            cur = cmd.p1;
+        } else if cmd.tag == CMD_CUBIC_TO {
+            flatten_cubic(&mut et, cur, cmd.p0, cmd.p1, cmd.p2, tol, 0);
+            cur = cmd.p2;
+        } else if cmd.tag == CMD_CLOSE {
+            add_line_edge(&mut et, cur.x, cur.y, sub_start.x, sub_start.y);
+            cur = sub_start;
+        }
+        i = i + 1;
+    }
+
+    if et.count == 0 {
+        et_free(&mut et);
+        return;
+    }
+
+    let mut min_y: f32 = et.edges.offset(0).read().y0;
+    let mut max_y: f32 = et.edges.offset(0).read().y1;
+    let mut j: i64 = 1;
+    while j < et.count {
+        let e = et.edges.offset(j).read();
+        if e.y0 < min_y { min_y = e.y0; }
+        if e.y1 > max_y { max_y = e.y1; }
+        j = j + 1;
+    }
+
+    let y_start = f32_to_i32(floorf(min_y));
+    let y_end = f32_to_i32(ceilf(max_y));
+    let y_start_c = if y_start < 0 { 0 } else { y_start };
+    let y_end_c = if y_end > c.height { c.height } else { y_end };
+
+    let cov_bytes = (c.width as i64) * 4;
+    let cov_raw = malloc(cov_bytes);
+    let coverage = cov_raw as Ptr<f32>;
+
+    let mut scanline: i32 = y_start_c;
+    while scanline < y_end_c {
+        let scan_y = (scanline as f32) + 0.5;
+
+        let mut cx: i64 = 0;
+        while cx < (c.width as i64) {
+            coverage.offset(cx).write(0.0);
+            cx = cx + 1;
+        }
+
+        let mut ei: i64 = 0;
+        while ei < et.count {
+            let e = et.edges.offset(ei).read();
+            if scan_y >= e.y0 && scan_y < e.y1 {
+                let t = (scan_y - e.y0) / (e.y1 - e.y0);
+                let x_int = e.x0 + t * (e.x1 - e.x0);
+                let mut col = f32_to_i32(floorf(x_int));
+                // Clamp left-of-canvas edges to col 0 so winding propagates
+                if col < 0 {
+                    col = 0;
+                }
+                if col < c.width {
+                    let old = coverage.offset(col as i64).read();
+                    coverage.offset(col as i64).write(old + e.dir);
+                }
+            }
+            ei = ei + 1;
+        }
+
+        let mut winding: f32 = 0.0;
+        let mut px: i32 = 0;
+        while px < c.width {
+            let delta = coverage.offset(px as i64).read();
+            winding = winding + delta;
+
+            let abs_w = fabsf(winding);
+            let mut fill_amt: f32 = 0.0;
+            if rule == 0 {
+                if abs_w > 0.001 {
+                    fill_amt = 1.0;
+                }
+            } else {
+                // Even-odd rule: check if floor(abs_w) is odd
+                let w_floor = floorf(abs_w);
+                let w_frac = abs_w - w_floor;
+                // w_floor is integer-valued f32; check odd via floor(w_floor/2)*2 != w_floor
+                let half = floorf(w_floor * 0.5);
+                let is_odd = (w_floor - half * 2.0) > 0.5;
+                if is_odd {
+                    fill_amt = 1.0;
+                } else if w_frac > 0.5 {
+                    fill_amt = 1.0;
+                }
+            }
+
+            if fill_amt > 0.001 {
+                let alpha_f = fill_amt * (a as f32);
+                let alpha = f32_to_i32(alpha_f) as u8;
+                canvas_blend(c, px, scanline, r, g, b, alpha);
+            }
+            px = px + 1;
+        }
+
+        scanline = scanline + 1;
+    }
+
+    free(cov_raw);
+    et_free(&mut et);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn count_visible(c: &Canvas) -> i32 {
+    let mut count: i32 = 0;
+    let mut y: i32 = 0;
+    while y < c.height {
+        let mut x: i32 = 0;
+        while x < c.width {
+            if canvas_get_alpha(c, x, y) > 0 {
+                count = count + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return count;
+}
+
+fn check(cond: bool, msg: i64) {
+    if !cond {
+        println(f"  FAIL test {msg}");
+        exit(1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════
+
+fn test_path_create() {
+    let mut p = path_new();
+    check(p.count == 0, 1);
+    path_free(&mut p);
+    println("  [PASS] test_path_create");
+}
+
+fn test_path_commands() {
+    let mut p = path_new();
+    path_move_to(&mut p, 10.0, 20.0);
+    path_line_to(&mut p, 30.0, 40.0);
+    path_quad_to(&mut p, 50.0, 60.0, 70.0, 80.0);
+    path_cubic_to(&mut p, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+    path_close(&mut p);
+    check(p.count == 5, 2);
+    check(p.cmds.offset(0).read().tag == CMD_MOVE_TO, 2);
+    check(p.cmds.offset(1).read().tag == CMD_LINE_TO, 2);
+    check(p.cmds.offset(2).read().tag == CMD_QUAD_TO, 2);
+    check(p.cmds.offset(3).read().tag == CMD_CUBIC_TO, 2);
+    check(p.cmds.offset(4).read().tag == CMD_CLOSE, 2);
+    path_free(&mut p);
+    println("  [PASS] test_path_commands");
+}
+
+fn test_path_growth() {
+    let mut p = path_new();
+    path_move_to(&mut p, 0.0, 0.0);
+    let mut i: i32 = 0;
+    while i < 500 {
+        path_line_to(&mut p, (i as f32), (i as f32) * 2.0);
+        i = i + 1;
+    }
+    check(p.count == 501, 3);
+    path_free(&mut p);
+    println("  [PASS] test_path_growth");
+}
+
+fn test_canvas_create() {
+    let mut c = canvas_new(100, 100);
+    check(c.width == 100, 4);
+    check(c.height == 100, 4);
+    check(c.stride == 400, 4);
+    let vis = count_visible(&c);
+    check(vis == 0, 4);
+    canvas_free(&mut c);
+    println("  [PASS] test_canvas_create");
+}
+
+fn test_canvas_clear() {
+    let mut c = canvas_new(10, 10);
+    canvas_clear(&mut c, 255, 0, 0, 255);
+    let px = canvas_get_pixel(&c, 0, 0);
+    check(px == 0xFF0000FF, 5);
+    let px2 = canvas_get_pixel(&c, 9, 9);
+    check(px2 == 0xFF0000FF, 5);
+    canvas_free(&mut c);
+    println("  [PASS] test_canvas_clear");
+}
+
+fn test_fill_rectangle() {
+    let mut c = canvas_new(50, 50);
+    let mut p = path_new();
+    path_move_to(&mut p, 10.0, 10.0);
+    path_line_to(&mut p, 30.0, 10.0);
+    path_line_to(&mut p, 30.0, 30.0);
+    path_line_to(&mut p, 10.0, 30.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 0, 255, 0, 255, 0);
+
+    let vis = count_visible(&c);
+    // 20x20 = 400 px, allow AA tolerance
+    check(vis >= 380 && vis <= 440, 6);
+    // Interior is green
+    let px = canvas_get_pixel(&c, 20, 20);
+    check(px == 0x00FF00FF, 6);
+    // Exterior transparent
+    check(canvas_get_alpha(&c, 5, 5) == 0, 6);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_fill_rectangle");
+}
+
+fn test_fill_triangle() {
+    let mut c = canvas_new(100, 100);
+    let mut p = path_new();
+    path_move_to(&mut p, 50.0, 10.0);
+    path_line_to(&mut p, 90.0, 90.0);
+    path_line_to(&mut p, 10.0, 90.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 0, 0, 255, 0);
+
+    let vis = count_visible(&c);
+    check(vis >= 2800 && vis <= 3600, 7);
+    check(canvas_get_alpha(&c, 50, 50) > 0, 7);
+    check(canvas_get_alpha(&c, 0, 0) == 0, 7);
+    check(canvas_get_alpha(&c, 99, 0) == 0, 7);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_fill_triangle");
+}
+
+fn test_fill_circle() {
+    let r: f32 = 40.0;
+    let cx: f32 = 50.0;
+    let cy: f32 = 50.0;
+    let k: f32 = 0.5523 * r;
+
+    let mut c = canvas_new(100, 100);
+    let mut p = path_new();
+    path_move_to(&mut p, cx + r, cy);
+    path_cubic_to(&mut p, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    path_cubic_to(&mut p, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    path_cubic_to(&mut p, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    path_cubic_to(&mut p, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 0, 0, 255, 255, 0);
+
+    let vis = count_visible(&c);
+    check(vis >= 4775 && vis <= 5280, 8);
+    check(canvas_get_alpha(&c, 50, 50) > 0, 8);
+    check(canvas_get_alpha(&c, 0, 0) == 0, 8);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_fill_circle");
+}
+
+fn test_fill_empty() {
+    let mut c = canvas_new(50, 50);
+    let p = path_new();
+    fill_path(&mut c, &p, 255, 0, 0, 255, 0);
+    let vis = count_visible(&c);
+    check(vis == 0, 9);
+    canvas_free(&mut c);
+    println("  [PASS] test_fill_empty");
+}
+
+fn test_fill_bounds() {
+    let mut c = canvas_new(50, 50);
+    let mut p = path_new();
+    path_move_to(&mut p, -100.0, -100.0);
+    path_line_to(&mut p, 200.0, -100.0);
+    path_line_to(&mut p, 200.0, 200.0);
+    path_line_to(&mut p, -100.0, 200.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 0, 0, 255, 0);
+
+    let vis = count_visible(&c);
+    check(vis == 2500, 10);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_fill_bounds");
+}
+
+fn test_winding_nonzero() {
+    let mut c = canvas_new(100, 100);
+    let mut p = path_new();
+    // Outer
+    path_move_to(&mut p, 10.0, 10.0);
+    path_line_to(&mut p, 90.0, 10.0);
+    path_line_to(&mut p, 90.0, 90.0);
+    path_line_to(&mut p, 10.0, 90.0);
+    path_close(&mut p);
+    // Inner (same direction)
+    path_move_to(&mut p, 30.0, 30.0);
+    path_line_to(&mut p, 70.0, 30.0);
+    path_line_to(&mut p, 70.0, 70.0);
+    path_line_to(&mut p, 30.0, 70.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 255, 255, 255, 0);
+    check(canvas_get_alpha(&c, 50, 50) > 0, 11);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_winding_nonzero");
+}
+
+fn test_winding_evenodd() {
+    let mut c = canvas_new(100, 100);
+    let mut p = path_new();
+    // Outer
+    path_move_to(&mut p, 10.0, 10.0);
+    path_line_to(&mut p, 90.0, 10.0);
+    path_line_to(&mut p, 90.0, 90.0);
+    path_line_to(&mut p, 10.0, 90.0);
+    path_close(&mut p);
+    // Inner (same direction)
+    path_move_to(&mut p, 30.0, 30.0);
+    path_line_to(&mut p, 70.0, 30.0);
+    path_line_to(&mut p, 70.0, 70.0);
+    path_line_to(&mut p, 30.0, 70.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 255, 255, 255, 1);
+    check(canvas_get_alpha(&c, 50, 50) == 0, 12);
+    check(canvas_get_alpha(&c, 15, 15) > 0, 12);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_winding_evenodd");
+}
+
+fn test_two_subpaths() {
+    let mut c = canvas_new(100, 50);
+    let mut p = path_new();
+    // Left triangle
+    path_move_to(&mut p, 10.0, 10.0);
+    path_line_to(&mut p, 40.0, 10.0);
+    path_line_to(&mut p, 25.0, 40.0);
+    path_close(&mut p);
+    // Right triangle
+    path_move_to(&mut p, 60.0, 10.0);
+    path_line_to(&mut p, 90.0, 10.0);
+    path_line_to(&mut p, 75.0, 40.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 255, 0, 255, 0);
+
+    check(canvas_get_alpha(&c, 25, 25) > 0, 13);
+    check(canvas_get_alpha(&c, 75, 25) > 0, 13);
+    check(canvas_get_alpha(&c, 50, 25) == 0, 13);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_two_subpaths");
+}
+
+fn test_quad_curve() {
+    let mut c = canvas_new(100, 100);
+    let mut p = path_new();
+    path_move_to(&mut p, 10.0, 50.0);
+    path_quad_to(&mut p, 50.0, 10.0, 90.0, 50.0);
+    path_line_to(&mut p, 90.0, 90.0);
+    path_line_to(&mut p, 10.0, 90.0);
+    path_close(&mut p);
+
+    fill_path(&mut c, &p, 255, 0, 255, 255, 0);
+
+    check(canvas_get_alpha(&c, 50, 80) > 0, 14);
+    check(canvas_get_alpha(&c, 50, 5) == 0, 14);
+
+    path_free(&mut p);
+    canvas_free(&mut c);
+    println("  [PASS] test_quad_curve");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    println("=== Facet Raster Tests ===");
+
+    test_path_create();
+    test_path_commands();
+    test_path_growth();
+    test_canvas_create();
+    test_canvas_clear();
+    test_fill_rectangle();
+    test_fill_triangle();
+    test_fill_circle();
+    test_fill_empty();
+    test_fill_bounds();
+    test_winding_nonzero();
+    test_winding_evenodd();
+    test_two_subpaths();
+    test_quad_curve();
+
+    println("=== All 14 tests passed ===");
+    return 0;
+}

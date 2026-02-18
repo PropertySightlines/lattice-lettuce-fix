@@ -1,0 +1,641 @@
+// Facet Window — Salt Test Suite
+//
+// Validates the macOS framebuffer bridge: window creation, pixel buffer
+// presentation, event polling, rasterizer integration, and animation.
+//
+// Run:  cd user/facet && make window
+//
+// Expected output ends with:
+// === All 6 window tests passed ===
+
+package main
+
+use std.core.ptr.Ptr
+
+// ═══════════════════════════════════════════════════════════════
+// FFI — libc + libm
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn exit(code: i32);
+extern fn fabsf(x: f32) -> f32;
+extern fn floorf(x: f32) -> f32;
+extern fn ceilf(x: f32) -> f32;
+
+// ═══════════════════════════════════════════════════════════════
+// FFI — Facet Window Bridge (facet_window.m)
+// ═══════════════════════════════════════════════════════════════
+
+// Open a native macOS window. Returns an opaque handle (i64).
+// title_ptr is a C string.
+extern fn facet_window_open(width: i32, height: i32, title_ptr: Ptr<u8>) -> i64;
+
+// Blit an RGBA pixel buffer to the window.
+extern fn facet_window_present(handle: i64, pixels: Ptr<u8>, width: i32, height: i32);
+
+// Poll events. Returns 1 if window should close, 0 otherwise.
+extern fn facet_window_poll_events(handle: i64) -> i32;
+
+// Close and destroy the window.
+extern fn facet_window_close(handle: i64);
+
+// Sleep for the given number of milliseconds.
+extern fn facet_window_sleep_ms(ms: i32);
+
+// ═══════════════════════════════════════════════════════════════
+// Core Types (copied from rasterizer for integration test)
+// ═══════════════════════════════════════════════════════════════
+
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+const CMD_MOVE_TO: i32  = 0;
+const CMD_LINE_TO: i32  = 1;
+const CMD_QUAD_TO: i32  = 2;
+const CMD_CUBIC_TO: i32 = 3;
+const CMD_CLOSE: i32    = 4;
+
+struct PathCmd {
+    tag: i32,
+    _pad: i32,
+    p0: Point,
+    p1: Point,
+    p2: Point,
+}
+
+struct Path {
+    cmds: Ptr<PathCmd>,
+    count: i64,
+    capacity: i64,
+}
+
+struct Canvas {
+    pixels: Ptr<u8>,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+struct Edge {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dir: f32,
+}
+
+struct EdgeTable {
+    edges: Ptr<Edge>,
+    count: i64,
+    capacity: i64,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rasterizer core (self-contained for the test binary)
+// ═══════════════════════════════════════════════════════════════
+
+fn pt(x: f32, y: f32) -> Point {
+    return Point { x: x, y: y };
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    return Point { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 };
+}
+
+fn path_new() -> Path {
+    let cap: i64 = 64;
+    let mem = malloc(cap * 32);
+    return Path { cmds: mem as Ptr<PathCmd>, count: 0, capacity: cap };
+}
+
+fn path_grow(p: &mut Path) {
+    if p.count >= p.capacity {
+        let new_cap = p.capacity * 2;
+        let new_mem = malloc(new_cap * 32);
+        let src = p.cmds;
+        let dst = new_mem as Ptr<PathCmd>;
+        let mut i: i64 = 0;
+        while i < p.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(p.cmds as Ptr<u8>);
+        p.cmds = dst;
+        p.capacity = new_cap;
+    }
+}
+
+fn path_push(p: &mut Path, cmd: PathCmd) {
+    path_grow(p);
+    p.cmds.offset(p.count).write(cmd);
+    p.count = p.count + 1;
+}
+
+fn path_move_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_MOVE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_line_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_LINE_TO, _pad: 0,
+        p0: pt(x, y), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_cubic_to(p: &mut Path, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+    path_push(p, PathCmd {
+        tag: CMD_CUBIC_TO, _pad: 0,
+        p0: pt(c1x, c1y), p1: pt(c2x, c2y), p2: pt(x, y),
+    });
+}
+
+fn path_close(p: &mut Path) {
+    path_push(p, PathCmd {
+        tag: CMD_CLOSE, _pad: 0,
+        p0: pt(0.0, 0.0), p1: pt(0.0, 0.0), p2: pt(0.0, 0.0),
+    });
+}
+
+fn path_free(p: &mut Path) {
+    free(p.cmds as Ptr<u8>);
+}
+
+fn canvas_new(width: i32, height: i32) -> Canvas {
+    let stride = width * 4;
+    let bytes = (stride as i64) * (height as i64);
+    let mem = malloc(bytes);
+    let mut i: i64 = 0;
+    while i < bytes {
+        mem.offset(i).write(0 as u8);
+        i = i + 1;
+    }
+    return Canvas { pixels: mem, width: width, height: height, stride: stride };
+}
+
+fn canvas_clear(c: &mut Canvas, r: u8, g: u8, b: u8, a: u8) {
+    let mut y: i32 = 0;
+    while y < c.height {
+        let mut x: i32 = 0;
+        while x < c.width {
+            let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+            c.pixels.offset(off).write(r);
+            c.pixels.offset(off + 1).write(g);
+            c.pixels.offset(off + 2).write(b);
+            c.pixels.offset(off + 3).write(a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+fn canvas_blend(c: &mut Canvas, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height {
+        return;
+    }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+    if a == 255 {
+        c.pixels.offset(off).write(r);
+        c.pixels.offset(off + 1).write(g);
+        c.pixels.offset(off + 2).write(b);
+        c.pixels.offset(off + 3).write(a);
+    } else if a > 0 {
+        let dst_r = c.pixels.offset(off).read() as i32;
+        let dst_g = c.pixels.offset(off + 1).read() as i32;
+        let dst_b = c.pixels.offset(off + 2).read() as i32;
+        let dst_a = c.pixels.offset(off + 3).read() as i32;
+        let src_a = a as i32;
+        let inv_a = 255 - src_a;
+        let out_r = ((r as i32) + (dst_r * inv_a) / 255) as u8;
+        let out_g = ((g as i32) + (dst_g * inv_a) / 255) as u8;
+        let out_b = ((b as i32) + (dst_b * inv_a) / 255) as u8;
+        let out_a = (src_a + (dst_a * inv_a) / 255) as u8;
+        c.pixels.offset(off).write(out_r);
+        c.pixels.offset(off + 1).write(out_g);
+        c.pixels.offset(off + 2).write(out_b);
+        c.pixels.offset(off + 3).write(out_a);
+    }
+}
+
+fn canvas_free(c: &mut Canvas) {
+    free(c.pixels);
+}
+
+// Edge table
+
+fn et_new() -> EdgeTable {
+    let cap: i64 = 256;
+    let mem = malloc(cap * 24);
+    return EdgeTable { edges: mem as Ptr<Edge>, count: 0, capacity: cap };
+}
+
+fn et_push(et: &mut EdgeTable, e: Edge) {
+    if et.count >= et.capacity {
+        let new_cap = et.capacity * 2;
+        let new_mem = malloc(new_cap * 24);
+        let src = et.edges;
+        let dst = new_mem as Ptr<Edge>;
+        let mut i: i64 = 0;
+        while i < et.count {
+            dst.offset(i).write(src.offset(i).read());
+            i = i + 1;
+        }
+        free(et.edges as Ptr<u8>);
+        et.edges = dst;
+        et.capacity = new_cap;
+    }
+    et.edges.offset(et.count).write(e);
+    et.count = et.count + 1;
+}
+
+fn et_free(et: &mut EdgeTable) {
+    free(et.edges as Ptr<u8>);
+}
+
+fn add_line_edge(et: &mut EdgeTable, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if fabsf(y1 - y0) < 0.001 {
+        return;
+    }
+    if y0 < y1 {
+        et_push(et, Edge { x0: x0, y0: y0, x1: x1, y1: y1, dir: 1.0 });
+    } else {
+        et_push(et, Edge { x0: x1, y0: y1, x1: x0, y1: y0, dir: -1.0 });
+    }
+}
+
+fn flatten_cubic(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point, p3: Point,
+                 tol: f32, depth: i32) {
+    if depth > 16 {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let ux = 3.0 * p1.x - 2.0 * p0.x - p3.x;
+    let uy = 3.0 * p1.y - 2.0 * p0.y - p3.y;
+    let vx = 3.0 * p2.x - p0.x - 2.0 * p3.x;
+    let vy = 3.0 * p2.y - p0.y - 2.0 * p3.y;
+    let ux2 = ux * ux;
+    let uy2 = uy * uy;
+    let vx2 = vx * vx;
+    let vy2 = vy * vy;
+    let max_x = if ux2 > vx2 { ux2 } else { vx2 };
+    let max_y = if uy2 > vy2 { uy2 } else { vy2 };
+    let flat_sq = max_x + max_y;
+    if flat_sq <= 16.0 * tol * tol {
+        add_line_edge(et, p0.x, p0.y, p3.x, p3.y);
+        return;
+    }
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let mid = midpoint(p012, p123);
+    flatten_cubic(et, p0, p01, p012, mid, tol, depth + 1);
+    flatten_cubic(et, mid, p123, p23, p3, tol, depth + 1);
+}
+
+fn f32_to_i32(v: f32) -> i32 {
+    let result: i32 = v as i32;
+    return result;
+}
+
+fn fill_path(c: &mut Canvas, p: &Path, r: u8, g: u8, b: u8, a: u8) {
+    let mut et = et_new();
+    let tol: f32 = 0.25;
+    let mut cur = pt(0.0, 0.0);
+    let mut sub_start = pt(0.0, 0.0);
+
+    let mut i: i64 = 0;
+    while i < p.count {
+        let cmd = p.cmds.offset(i).read();
+        if cmd.tag == CMD_MOVE_TO {
+            cur = cmd.p0;
+            sub_start = cmd.p0;
+        } else if cmd.tag == CMD_LINE_TO {
+            add_line_edge(&mut et, cur.x, cur.y, cmd.p0.x, cmd.p0.y);
+            cur = cmd.p0;
+        } else if cmd.tag == CMD_CUBIC_TO {
+            flatten_cubic(&mut et, cur, cmd.p0, cmd.p1, cmd.p2, tol, 0);
+            cur = cmd.p2;
+        } else if cmd.tag == CMD_CLOSE {
+            add_line_edge(&mut et, cur.x, cur.y, sub_start.x, sub_start.y);
+            cur = sub_start;
+        }
+        i = i + 1;
+    }
+
+    if et.count == 0 {
+        et_free(&mut et);
+        return;
+    }
+
+    let mut min_y: f32 = et.edges.offset(0).read().y0;
+    let mut max_y: f32 = et.edges.offset(0).read().y1;
+    let mut j: i64 = 1;
+    while j < et.count {
+        let e = et.edges.offset(j).read();
+        if e.y0 < min_y { min_y = e.y0; }
+        if e.y1 > max_y { max_y = e.y1; }
+        j = j + 1;
+    }
+
+    let y_start = f32_to_i32(floorf(min_y));
+    let y_end = f32_to_i32(ceilf(max_y));
+    let y_start_c = if y_start < 0 { 0 } else { y_start };
+    let y_end_c = if y_end > c.height { c.height } else { y_end };
+
+    let cov_bytes = (c.width as i64) * 4;
+    let cov_raw = malloc(cov_bytes);
+    let coverage = cov_raw as Ptr<f32>;
+
+    let mut scanline: i32 = y_start_c;
+    while scanline < y_end_c {
+        let scan_y = (scanline as f32) + 0.5;
+
+        let mut cx: i64 = 0;
+        while cx < (c.width as i64) {
+            coverage.offset(cx).write(0.0);
+            cx = cx + 1;
+        }
+
+        let mut ei: i64 = 0;
+        while ei < et.count {
+            let e = et.edges.offset(ei).read();
+            if scan_y >= e.y0 && scan_y < e.y1 {
+                let t = (scan_y - e.y0) / (e.y1 - e.y0);
+                let x_int = e.x0 + t * (e.x1 - e.x0);
+                let mut col = f32_to_i32(floorf(x_int));
+                if col < 0 {
+                    col = 0;
+                }
+                if col < c.width {
+                    let old = coverage.offset(col as i64).read();
+                    coverage.offset(col as i64).write(old + e.dir);
+                }
+            }
+            ei = ei + 1;
+        }
+
+        let mut winding: f32 = 0.0;
+        let mut px: i32 = 0;
+        while px < c.width {
+            let delta = coverage.offset(px as i64).read();
+            winding = winding + delta;
+
+            let abs_w = fabsf(winding);
+            if abs_w > 0.001 {
+                canvas_blend(c, px, scanline, r, g, b, a);
+            }
+            px = px + 1;
+        }
+
+        scanline = scanline + 1;
+    }
+
+    free(cov_raw);
+    et_free(&mut et);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn check(cond: bool, msg: i64) {
+    if !cond {
+        println(f"  FAIL test {msg}");
+        exit(1);
+    }
+}
+
+// Build a null-terminated string inline. Salt string literals are
+// already null-terminated when passed to extern fn, so we use a
+// helper that returns a Ptr<u8> from a known-safe string.
+// For now, we'll use a fixed title.
+fn title_ptr() -> Ptr<u8> {
+    // "Facet" = [70, 97, 99, 101, 116, 0]
+    let mem = malloc(6);
+    mem.offset(0).write(70 as u8);   // F
+    mem.offset(1).write(97 as u8);   // a
+    mem.offset(2).write(99 as u8);   // c
+    mem.offset(3).write(101 as u8);  // e
+    mem.offset(4).write(116 as u8);  // t
+    mem.offset(5).write(0 as u8);    // \0
+    return mem;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 1: Window open + close
+// ═══════════════════════════════════════════════════════════════
+
+fn test_window_open_close() {
+    let title = title_ptr();
+    let handle = facet_window_open(400, 300, title);
+    check(handle != 0, 1);
+    facet_window_close(handle);
+    free(title);
+    println("  [PASS] test_window_open_close");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 2: Present solid red
+// ═══════════════════════════════════════════════════════════════
+
+fn test_present_solid_color() {
+    let title = title_ptr();
+    let handle = facet_window_open(200, 200, title);
+    check(handle != 0, 2);
+
+    let mut c = canvas_new(200, 200);
+    canvas_clear(&mut c, 255, 0, 0, 255);  // solid red
+    facet_window_present(handle, c.pixels, c.width, c.height);
+    facet_window_sleep_ms(200);  // brief display
+
+    facet_window_close(handle);
+    canvas_free(&mut c);
+    free(title);
+    println("  [PASS] test_present_solid_color");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 3: Present gradient
+// ═══════════════════════════════════════════════════════════════
+
+fn test_present_gradient() {
+    let title = title_ptr();
+    let handle = facet_window_open(256, 256, title);
+    check(handle != 0, 3);
+
+    let mut c = canvas_new(256, 256);
+
+    // Horizontal blue→purple gradient
+    let mut y: i32 = 0;
+    while y < 256 {
+        let mut x: i32 = 0;
+        while x < 256 {
+            let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+            c.pixels.offset(off).write(x as u8);       // R: 0→255
+            c.pixels.offset(off + 1).write(0 as u8);   // G: 0
+            c.pixels.offset(off + 2).write(y as u8);   // B: 0→255
+            c.pixels.offset(off + 3).write(255 as u8);  // A: opaque
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    facet_window_present(handle, c.pixels, c.width, c.height);
+    facet_window_sleep_ms(300);
+
+    facet_window_close(handle);
+    canvas_free(&mut c);
+    free(title);
+    println("  [PASS] test_present_gradient");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 4: Poll events (non-blocking)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_poll_events() {
+    let title = title_ptr();
+    let handle = facet_window_open(200, 200, title);
+    check(handle != 0, 4);
+
+    // Poll should return 0 immediately (no close event)
+    let should_close = facet_window_poll_events(handle);
+    check(should_close == 0, 4);
+
+    facet_window_close(handle);
+    free(title);
+    println("  [PASS] test_poll_events");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 5: Rasterizer integration — filled triangle on screen
+// ═══════════════════════════════════════════════════════════════
+
+fn test_raster_to_window() {
+    let title = title_ptr();
+    let handle = facet_window_open(400, 400, title);
+    check(handle != 0, 5);
+
+    let mut c = canvas_new(400, 400);
+
+    // Dark background
+    canvas_clear(&mut c, 24, 24, 32, 255);
+
+    // Draw a filled triangle
+    let mut p = path_new();
+    path_move_to(&mut p, 200.0, 50.0);
+    path_line_to(&mut p, 350.0, 350.0);
+    path_line_to(&mut p, 50.0, 350.0);
+    path_close(&mut p);
+    fill_path(&mut c, &p, 0, 200, 255, 255);   // cyan
+
+    // Draw a filled circle (Bézier approximation)
+    let mut p2 = path_new();
+    let cx: f32 = 200.0;
+    let cy: f32 = 220.0;
+    let r: f32 = 60.0;
+    let k: f32 = 0.5523 * r;
+    path_move_to(&mut p2, cx + r, cy);
+    path_cubic_to(&mut p2, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    path_cubic_to(&mut p2, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    path_cubic_to(&mut p2, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    path_cubic_to(&mut p2, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    path_close(&mut p2);
+    fill_path(&mut c, &p2, 255, 100, 50, 200);  // orange, semi-transparent
+
+    facet_window_present(handle, c.pixels, c.width, c.height);
+    facet_window_sleep_ms(500);  // show the result
+
+    facet_window_close(handle);
+    path_free(&mut p);
+    path_free(&mut p2);
+    canvas_free(&mut c);
+    free(title);
+    println("  [PASS] test_raster_to_window");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test 6: Animation loop — moving circle, 30 frames
+// ═══════════════════════════════════════════════════════════════
+
+fn test_animation_loop() {
+    let title = title_ptr();
+    let handle = facet_window_open(400, 300, title);
+    check(handle != 0, 6);
+
+    let mut c = canvas_new(400, 300);
+    let mut frame: i32 = 0;
+    let total_frames: i32 = 30;
+
+    while frame < total_frames {
+        // Clear to dark blue
+        canvas_clear(&mut c, 10, 10, 40, 255);
+
+        // Animate circle horizontally
+        let cx: f32 = 40.0 + (frame as f32) * 10.0;  // 40 → 330
+        let cy: f32 = 150.0;
+        let r: f32 = 30.0;
+        let k: f32 = 0.5523 * r;
+
+        let mut p = path_new();
+        path_move_to(&mut p, cx + r, cy);
+        path_cubic_to(&mut p, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+        path_cubic_to(&mut p, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+        path_cubic_to(&mut p, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+        path_cubic_to(&mut p, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+        path_close(&mut p);
+
+        // Color shifts with frame
+        let red = (frame * 8) as u8;
+        let green = (255 - frame * 4) as u8;
+        fill_path(&mut c, &p, red, green, 255, 255);
+
+        facet_window_present(handle, c.pixels, c.width, c.height);
+
+        // Check if user closed window
+        let should_close = facet_window_poll_events(handle);
+        if should_close == 1 {
+            path_free(&mut p);
+            // early exit is fine
+            canvas_free(&mut c);
+            facet_window_close(handle);
+            free(title);
+            println("  [PASS] test_animation_loop (closed early)");
+            return;
+        }
+
+        facet_window_sleep_ms(33);  // ~30 fps
+        path_free(&mut p);
+        frame = frame + 1;
+    }
+
+    facet_window_close(handle);
+    canvas_free(&mut c);
+    free(title);
+    println("  [PASS] test_animation_loop");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() -> i32 {
+    println("=== Facet Window Tests ===");
+
+    test_window_open_close();
+    test_present_solid_color();
+    test_present_gradient();
+    test_poll_events();
+    test_raster_to_window();
+    test_animation_loop();
+
+    println("=== All 6 window tests passed ===");
+    return 0;
+}

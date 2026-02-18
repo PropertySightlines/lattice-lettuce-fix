@@ -1,0 +1,190 @@
+// =============================================================================
+// LETTUCE — High-Performance Event Reactor
+// =============================================================================
+// Pure TCP network layer using stdlib Slab<T> for per-fd connection state.
+// Handles TCP pipelining, packet fragmentation, and I/O multiplexing.
+// All RESP parsing and command execution is delegated to lettuce.store.
+// =============================================================================
+
+package main
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+use std.core.result.Result
+use std.net.tcp.{TcpListener, TcpStream}
+use std.net.poller.{Poller, Filter}
+use std.collections.string_map.StringMap
+use std.collections.slab.Slab
+use lettuce.store.{execute, ExecResult}
+
+extern fn puts(s: Ptr<u8>) -> i32;
+extern fn memcpy(dst: Ptr<u8>, src: Ptr<u8>, n: i64) -> Ptr<u8>;
+
+const PORT: i32 = 6379;
+const MAX_EVENTS: i32 = 64;
+const MAX_FDS: i32 = 10000;
+const SESSION_BUF_SIZE: i64 = 16384;
+
+// ============================================================================
+// Per-Connection State — Slab-allocated, zero heap on hot path
+// ============================================================================
+
+struct ClientSession {
+    read_cursor: i64,
+    parse_cursor: i64,
+    buffer: [u8; 16384],
+}
+
+// ============================================================================
+// Event Loop
+// ============================================================================
+
+fn main() -> i32 {
+    puts("LETTUCE starting on port 6379..." as Ptr<u8>);
+
+    let listener_result = TcpListener::bind(PORT);
+    if listener_result.is_err() {
+        puts("ERROR: Failed to bind" as Ptr<u8>);
+        return 1;
+    }
+    let listener = listener_result.unwrap();
+    let listen_fd = listener.fd();
+
+    let poll_result = Poller::new();
+    if poll_result.is_err() {
+        puts("ERROR: Failed to create poller" as Ptr<u8>);
+        return 1;
+    }
+    let poll = poll_result.unwrap();
+    poll.register(listen_fd, Filter::Read);
+
+    let mut smap = StringMap::new();
+    let mut slab = Slab::<ClientSession>::new(MAX_FDS);
+
+    puts("LETTUCE (Slab<T> Reactor) listening on :6379" as Ptr<u8>);
+
+    let mut events: [i64; 128] = [0; 128];
+
+    while true {
+        let nev = poll.wait(&events[0] as Ptr<i64>, MAX_EVENTS, -1);
+        let mut i: i32 = 0;
+        while i < nev {
+            let idx = (i * 2) as i64;
+            let event_fd = events[idx] as i32;
+
+            if event_fd == listen_fd {
+                let client_result = listener.accept();
+                if client_result.is_ok() {
+                    let client = client_result.unwrap();
+                    let client_fd = client.fd();
+                    if client_fd < MAX_FDS {
+                        slab.reset(client_fd);
+                        poll.register(client_fd, Filter::Read);
+                    } else {
+                        client.close();
+                    }
+                }
+            } else {
+                handle_client(event_fd, &poll, &mut smap, &mut slab);
+            }
+
+            i = i + 1;
+        }
+    }
+
+    smap.drop();
+    slab.drop();
+    listener.close();
+    return 0;
+}
+
+// ============================================================================
+// Connection Handler — Sliding Window on Slab<ClientSession>
+// ============================================================================
+
+fn handle_client(fd: i32, poll: &Poller, smap: &mut StringMap, slab: &mut Slab<ClientSession>) {
+    let stream = TcpStream { fd: fd };
+    let session = slab.get(fd);
+
+    // 1. Read into sliding window at read_cursor
+    let read_cur = session.read_cursor;
+    let buf = &session.buffer[0] as Ptr<u8>;
+    let read_ptr = buf.offset(read_cur);
+    let space_left = SESSION_BUF_SIZE - read_cur;
+
+    if space_left <= 0 {
+        poll.deregister(fd);
+        stream.close();
+        slab.reset(fd);
+        return;
+    }
+
+    let n = stream.recv(read_ptr, space_left);
+    if n <= 0 {
+        poll.deregister(fd);
+        stream.close();
+        slab.reset(fd);
+        return;
+    }
+
+    let new_read_cur = read_cur + n;
+    session.read_cursor = new_read_cur;
+
+    // 2. Parse loop (pipelining + fragmentation)
+    let mut parse_cur = session.parse_cursor;
+    let mut send_buf: [u8; 4096] = [0; 4096];
+    let send_ptr = &send_buf[0] as Ptr<u8>;
+    let mut total_resp: i64 = 0;
+    let send_buf_cap: i64 = 4096;
+
+    while parse_cur < new_read_cur {
+        let unparsed_len = new_read_cur - parse_cur;
+        let remaining = StringView::from_raw(buf.offset(parse_cur), unparsed_len);
+
+        let result = execute(smap, remaining, send_ptr.offset(total_resp));
+
+        if result.input_consumed <= 0 {
+            break;
+        }
+
+        // Deterministic capacity check BEFORE committing the append.
+        if result.resp_len > send_buf_cap {
+            // EDGE CASE: Single response exceeds buffer capacity.
+            // Flush anything accumulated, then send the oversized response
+            // directly from its current position (it was written at send_ptr + total_resp).
+            if total_resp > 0 {
+                stream.send(send_ptr, total_resp);
+                total_resp = 0;
+            }
+            // Re-execute into the start of the buffer and send directly
+            let oversized_result = execute(smap, remaining, send_ptr);
+            stream.send(send_ptr, oversized_result.resp_len);
+        } else if total_resp + result.resp_len > send_buf_cap {
+            // Would overflow — flush first, then append
+            stream.send(send_ptr, total_resp);
+            total_resp = 0;
+            // Re-execute into the now-empty buffer
+            let retry_result = execute(smap, remaining, send_ptr);
+            total_resp = retry_result.resp_len;
+        } else {
+            // Normal case — safe to append
+            total_resp = total_resp + result.resp_len;
+        }
+
+        parse_cur = parse_cur + result.input_consumed;
+    }
+
+    // 3. Flush remaining
+    if total_resp > 0 {
+        stream.send(send_ptr, total_resp);
+    }
+
+    // 4. Slide window
+    let unparsed_len = new_read_cur - parse_cur;
+    if unparsed_len > 0 && parse_cur > 0 {
+        memcpy(buf, buf.offset(parse_cur), unparsed_len);
+    }
+
+    session.read_cursor = unparsed_len;
+    session.parse_cursor = 0;
+}

@@ -1,0 +1,178 @@
+// =============================================================================
+// Basalt Tokenizer — BPE Encode/Decode
+// =============================================================================
+//
+// Handles tokenization for Llama 2 inference:
+//   - load_tokenizer: parse llama2.c tokenizer.bin format
+//   - decode_token: token ID → text
+//   - bpe_encode: text → token IDs via Byte-Pair Encoding
+//
+// Format (tokenizer.bin):
+//   [max_token_length: i32]
+//   For each vocab entry:
+//     [score: f32] [len: i32] [bytes: u8[len]]
+//
+// =============================================================================
+
+package basalt.tokenizer
+
+use std.core.ptr.Ptr
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+
+// -----------------------------------------------------------------------------
+// Structs
+// -----------------------------------------------------------------------------
+
+pub struct TokenizerEntry {
+    pub text: Ptr<u8>,
+    pub len: i32,
+    pub score: f32,
+}
+
+pub struct Tokenizer {
+    pub vocab: Ptr<TokenizerEntry>,
+    pub vocab_size: i64,
+    pub max_token_length: i32,
+}
+
+// -----------------------------------------------------------------------------
+// Loading
+// -----------------------------------------------------------------------------
+
+pub fn load_tokenizer(data: Ptr<u8>, vocab_size: i64) -> Tokenizer {
+    let max_len = (data as Ptr<i32>)[0];
+    let mut offset: i64 = 4;
+    
+    // Allocate vocab array
+    let entry_size: i64 = 24; // sizeof(TokenizerEntry) padded
+    let vocab_buf = malloc(vocab_size * entry_size);
+    let vocab = vocab_buf as Ptr<TokenizerEntry>;
+    
+    for i in 0..vocab_size {
+        let score = (data.offset(offset) as Ptr<f32>)[0];
+        offset = offset + 4;
+        
+        let len = (data.offset(offset) as Ptr<i32>)[0];
+        offset = offset + 4;
+        
+        // Copy text bytes + null terminator
+        let text_buf = malloc(len as i64 + 1);
+        for j in 0..(len as i64) {
+            text_buf[j] = data[offset + j];
+        }
+        text_buf[len as i64] = 0;
+        offset = offset + len as i64;
+        
+        vocab[i] = TokenizerEntry { text: text_buf, len: len, score: score };
+    }
+    
+    return Tokenizer { vocab: vocab, vocab_size: vocab_size, max_token_length: max_len };
+}
+
+// -----------------------------------------------------------------------------
+// Decoding
+// -----------------------------------------------------------------------------
+
+pub fn decode_token(tok: Tokenizer, token_id: i64) -> Ptr<u8> {
+    if token_id < 0 { return 0 as Ptr<u8>; }
+    if token_id >= tok.vocab_size { return 0 as Ptr<u8>; }
+    return tok.vocab[token_id].text;
+}
+
+pub fn decode_token_len(tok: Tokenizer, token_id: i64) -> i32 {
+    if token_id < 0 { return 0; }
+    if token_id >= tok.vocab_size { return 0; }
+    return tok.vocab[token_id].len;
+}
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+
+fn str_eq(a: Ptr<u8>, a_len: i64, b: Ptr<u8>, b_len: i64) -> bool {
+    if a_len != b_len { return false; }
+    for i in 0..a_len {
+        if a[i] != b[i] { return false; }
+    }
+    return true;
+}
+
+pub fn find_token(tok: Tokenizer, text: Ptr<u8>, text_len: i64) -> i64 {
+    for i in 0..tok.vocab_size {
+        let entry = tok.vocab[i];
+        if str_eq(entry.text, entry.len as i64, text, text_len) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+pub fn bpe_encode(tok: Tokenizer, text: Ptr<u8>, text_len: i64, out_tokens: Ptr<i64>) -> i64 {
+    // Step 1: Initialize — each byte becomes a single-byte token
+    let mut n_tokens: i64 = 0;
+    for i in 0..text_len {
+        let byte_buf = malloc(1);
+        byte_buf[0] = text[i];
+        let tid = find_token(tok, byte_buf, 1);
+        if tid >= 0 {
+            out_tokens[n_tokens] = tid;
+            n_tokens = n_tokens + 1;
+        }
+        free(byte_buf);
+    }
+    
+    // Step 2: BPE merge — repeatedly merge best adjacent pair
+    let merge_buf = malloc(tok.max_token_length as i64 + 1);
+    
+    let mut changed: i32 = 1;
+    for iter in 0..1000 {
+        if changed != 0 {
+            changed = 0;
+            let mut best_score: f32 = -1000000.0f32;
+            let mut best_idx: i64 = -1;
+            let mut best_tid: i64 = -1;
+            
+            for i in 0..(n_tokens - 1) {
+                let t1 = out_tokens[i];
+                let t2 = out_tokens[i + 1];
+                let len1 = tok.vocab[t1].len as i64;
+                let len2 = tok.vocab[t2].len as i64;
+                let merged_len = len1 + len2;
+                
+                let t1_text = tok.vocab[t1].text;
+                for j in 0..len1 {
+                    merge_buf[j] = t1_text[j];
+                }
+                let t2_text = tok.vocab[t2].text;
+                for j in 0..len2 {
+                    merge_buf[len1 + j] = t2_text[j];
+                }
+                
+                let mid = find_token(tok, merge_buf, merged_len);
+                if mid >= 0 {
+                    let score = tok.vocab[mid].score;
+                    if score > best_score {
+                        best_score = score;
+                        best_idx = i;
+                        best_tid = mid;
+                    }
+                }
+            }
+            
+            if best_idx >= 0 {
+                out_tokens[best_idx] = best_tid;
+                let shift_from = best_idx + 2;
+                for j in shift_from..n_tokens {
+                    out_tokens[j - 1] = out_tokens[j];
+                }
+                n_tokens = n_tokens - 1;
+                changed = 1;
+            }
+        }
+    }
+    
+    free(merge_buf);
+    return n_tokens;
+}

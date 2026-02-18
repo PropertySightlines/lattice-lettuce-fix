@@ -1,0 +1,23 @@
+package kernel.arch.x86.gdt
+// Global Descriptor Table - Required for 64-bit Long Mode.
+
+struct GDTEntry {
+    limit_low: u16,
+    base_low: u16,
+    base_middle: u8,
+    access: u8,
+    granularity: u8,
+    base_high: u8,
+}
+
+struct GDT {
+    entries: [GDTEntry; 3], // Null, Code, Data
+}
+
+pub fn init() {
+    // In a bare-metal environment, we would use LGDT assembly here.
+    // For now, we define the structure for the compiler to verify.
+    region("gdt_region") {
+        // GDT setup logic...
+    }
+}

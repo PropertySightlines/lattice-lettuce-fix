@@ -1,0 +1,151 @@
+// =============================================================================
+// LETTUCE — Data Store Tests (TDD)
+// =============================================================================
+// Tests the StringMap SwissTable from stdlib: SET, GET, DEL, overwrite,
+// multiple keys, compacting rehash.
+//
+// Run: ./scripts/run_test.sh lettuce/tests/test_store.salt
+// =============================================================================
+
+package main
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+use std.collections.string_map.StringMap
+use std.collections.string_map.fnv1a
+
+extern fn exit(code: i32);
+extern fn memcpy(dst: Ptr<u8>, src: Ptr<u8>, n: i64) -> Ptr<u8>;
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+fn assert_true(cond: bool, test_id: i32) {
+    if !cond {
+        println(f"FAIL test {test_id}");
+        exit(test_id);
+    }
+}
+
+fn assert_eq(got: i64, expected: i64, test_id: i32) {
+    if got != expected {
+        println(f"FAIL test {test_id}: got {got}, expected {expected}");
+        exit(test_id);
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+fn main() -> i32 {
+    println("=== LETTUCE StringMap Tests ===");
+
+    // --- Test 1: FNV-1a hash consistency ---
+    let h1 = fnv1a("foo" as StringView);
+    let h2 = fnv1a("foo" as StringView);
+    assert_eq(h1 as i64, h2 as i64, 1);
+    let h3 = fnv1a("bar" as StringView);
+    assert_true(h1 != h3, 1);
+    println("PASS test_fnv_hash");
+
+    // --- Test 2: SET + GET roundtrip ---
+    let mut smap = StringMap::new();
+
+    smap.set("foo" as StringView, "bar" as StringView);
+    let slot = smap.get("foo" as StringView);
+    assert_true(slot >= 0, 2);
+    let val = smap.value_at(slot);
+    assert_eq(val.length(), 3, 2);
+    assert_eq(val.byte_at(0) as i64, 98, 2);   // 'b'
+    assert_eq(val.byte_at(1) as i64, 97, 2);   // 'a'
+    assert_eq(val.byte_at(2) as i64, 114, 2);  // 'r'
+    println("PASS test_set_get");
+
+    // --- Test 3: GET nonexistent → -1 ---
+    let slot3 = smap.get("nonexistent" as StringView);
+    assert_eq(slot3, -1, 3);
+    println("PASS test_get_unknown");
+
+    // --- Test 4: DEL existing → true, GET → -1 ---
+    let deleted = smap.del("foo" as StringView);
+    assert_true(deleted, 4);
+    let slot4 = smap.get("foo" as StringView);
+    assert_eq(slot4, -1, 4);
+    println("PASS test_del_existing");
+
+    // --- Test 5: DEL nonexistent → false ---
+    let del5 = smap.del("ghost" as StringView);
+    assert_true(!del5, 5);
+    println("PASS test_del_unknown");
+
+    // --- Test 6: SET overwrite → new value ---
+    smap.set("mykey" as StringView, "oldval" as StringView);
+    smap.set("mykey" as StringView, "newval" as StringView);
+    let slot6 = smap.get("mykey" as StringView);
+    assert_true(slot6 >= 0, 6);
+    let val6 = smap.value_at(slot6);
+    assert_eq(val6.length(), 6, 6);
+    assert_eq(val6.byte_at(0) as i64, 110, 6);  // 'n'
+    assert_eq(val6.byte_at(3) as i64, 118, 6);  // 'v'
+    println("PASS test_set_overwrite");
+
+    // --- Test 7: Multiple distinct keys ---
+    smap.set("alpha" as StringView, "AAA" as StringView);
+    smap.set("beta" as StringView, "BBB" as StringView);
+    smap.set("gamma" as StringView, "CCC" as StringView);
+
+    let sa = smap.get("alpha" as StringView);
+    assert_true(sa >= 0, 7);
+    assert_eq(smap.value_at(sa).length(), 3, 7);
+
+    let sb = smap.get("beta" as StringView);
+    assert_true(sb >= 0, 7);
+
+    let sg = smap.get("gamma" as StringView);
+    assert_true(sg >= 0, 7);
+    println("PASS test_multiple_keys");
+
+    // --- Test 8: Compacting rehash ---
+    smap.drop();
+    smap = StringMap::with_capacity(16);
+
+    // Insert 15 keys to trigger rehash (growth_left = 14 for cap=16)
+    let mut i: i64 = 0;
+    while i < 15 {
+        let mut kb: [u8; 4] = [0; 4];
+        kb[0] = 107;  // 'k'
+        kb[1] = ((i / 10) + 48) as u8;
+        kb[2] = ((i % 10) + 48) as u8;
+        let key = StringView::from_raw(&kb[0] as Ptr<u8>, 3);
+
+        let mut vb: [u8; 4] = [0; 4];
+        vb[0] = 118;  // 'v'
+        vb[1] = ((i / 10) + 48) as u8;
+        vb[2] = ((i % 10) + 48) as u8;
+        let val = StringView::from_raw(&vb[0] as Ptr<u8>, 3);
+
+        smap.set(key, val);
+        i = i + 1;
+    }
+
+    // Verify data survived rehash
+    let mut kb0: [u8; 4] = [0; 4];
+    kb0[0] = 107; kb0[1] = 48; kb0[2] = 48;
+    let s8a = smap.get(StringView::from_raw(&kb0[0] as Ptr<u8>, 3));
+    assert_true(s8a >= 0, 8);
+    assert_eq(smap.value_at(s8a).length(), 3, 8);
+
+    let mut kb14: [u8; 4] = [0; 4];
+    kb14[0] = 107; kb14[1] = 49; kb14[2] = 52;
+    let s8b = smap.get(StringView::from_raw(&kb14[0] as Ptr<u8>, 3));
+    assert_true(s8b >= 0, 8);
+
+    assert_eq(smap.length(), 15, 8);
+    assert_true(smap.is_empty() == false, 8);
+    println("PASS test_compacting_rehash");
+
+    smap.drop();
+
+    println("=== All StringMap tests passed ===");
+    return 0;
+}

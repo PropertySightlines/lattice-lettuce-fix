@@ -1,0 +1,123 @@
+// Facet Compositor Math — Affine Transforms & Rectangles
+
+use std.core.ptr.Ptr
+
+// ═══════════════════════════════════════════════════════════════
+// Affine Transform
+// ═══════════════════════════════════════════════════════════════
+
+// Represents a 2D affine transform matrix:
+// [ a  c  tx ]
+// [ b  d  ty ]
+// [ 0  0  1  ]
+struct Affine {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    tx: f32,
+    ty: f32,
+}
+
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+// Identity matrix
+fn affine_identity() -> Affine {
+    return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+}
+
+// Translation matrix (dx, dy)
+fn affine_translate(dx: f32, dy: f32) -> Affine {
+    return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: dx, ty: dy };
+}
+
+// Scaling matrix (sx, sy)
+fn affine_scale(sx: f32, sy: f32) -> Affine {
+    return Affine { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 };
+}
+
+extern fn sinf(x: f32) -> f32;
+extern fn cosf(x: f32) -> f32;
+
+// Rotation matrix (angle in radians)
+fn affine_rotate(angle: f32) -> Affine {
+    let c = cosf(angle);
+    let s = sinf(angle);
+    return Affine { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 };
+}
+
+// Multiply two matrices: A * B (apply B then A? Or usually multiply order).
+// (A * B) * v = A * (B * v).
+// So B is applied first (closest to vector).
+// If we want "transform m by next", we normally do (m * next).
+// Let's implement standard matrix multiplication.
+//
+// [ a1 c1 tx1 ]   [ a2 c2 tx2 ]
+// [ b1 d1 ty1 ] * [ b2 d2 ty2 ]
+// [ 0  0  1   ]   [ 0  0  1   ]
+//
+// result_a  = a1*a2 + c1*b2
+// result_c  = a1*c2 + c1*d2
+// result_tx = a1*tx2 + c1*ty2 + tx1
+//
+// result_b  = b1*a2 + d1*b2
+// result_d  = b1*c2 + d1*d2
+// result_ty = b1*tx2 + d1*ty2 + ty1
+fn affine_multiply(m1: Affine, m2: Affine) -> Affine {
+    return Affine {
+        a:  m1.a * m2.a  + m1.c * m2.b,
+        b:  m1.b * m2.a  + m1.d * m2.b,
+        c:  m1.a * m2.c  + m1.c * m2.d,
+        d:  m1.b * m2.c  + m1.d * m2.d,
+        tx: m1.a * m2.tx + m1.c * m2.ty + m1.tx,
+        ty: m1.b * m2.tx + m1.d * m2.ty + m1.ty,
+    };
+}
+
+// Transform a point
+fn affine_transform_point(m: Affine, p: Point) -> Point {
+    return Point {
+        x: m.a * p.x + m.c * p.y + m.tx,
+        y: m.b * p.x + m.d * p.y + m.ty,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rect
+// ═══════════════════════════════════════════════════════════════
+
+struct Rect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+fn rect_contains(r: Rect, p: Point) -> bool {
+    return p.x >= r.x && p.x < r.x + r.w &&
+           p.y >= r.y && p.y < r.y + r.h;
+}
+
+fn rect_union(r1: Rect, r2: Rect) -> Rect {
+    // If one is empty (w <= 0 or h <= 0), return the other?
+    // Simplified: bounding box of both.
+    let min_x1 = r1.x;
+    let min_y1 = r1.y;
+    let max_x1 = r1.x + r1.w;
+    let max_y1 = r1.y + r1.h;
+
+    let min_x2 = r2.x;
+    let min_y2 = r2.y;
+    let max_x2 = r2.x + r2.w;
+    let max_y2 = r2.y + r2.h;
+
+    let min_x = if min_x1 < min_x2 { min_x1 } else { min_x2 };
+    let min_y = if min_y1 < min_y2 { min_y1 } else { min_y2 };
+    let max_x = if max_x1 > max_x2 { max_x1 } else { max_x2 };
+    let max_y = if max_y1 > max_y2 { max_y1 } else { max_y2 };
+
+    return Rect { x: min_x, y: min_y, w: max_x - min_x, h: max_y - min_y };
+}

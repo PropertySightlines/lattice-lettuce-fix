@@ -1,0 +1,478 @@
+// =============================================================================
+// Test: basalt.tokenizer — BPE Tokenizer Tests (TDD)
+// =============================================================================
+// Tests token decoding and BPE encoding with a hand-built vocabulary.
+// Uses exit codes for assertion (0 = PASS, non-zero = specific failure).
+//
+// Tests are written FIRST. Implementation follows in tokenizer.salt.
+// =============================================================================
+
+package main
+
+use std.io.println
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+
+// ---- Utility ----
+
+fn alloc_u8(count: i64) -> Ptr<u8> {
+    return malloc(count);
+}
+
+fn alloc_f32(count: i64) -> Ptr<f32> {
+    let ptr: Ptr<u8> = malloc(count * 4);
+    return ptr as Ptr<f32>;
+}
+
+fn alloc_i64(count: i64) -> Ptr<i64> {
+    let ptr: Ptr<u8> = malloc(count * 8);
+    return ptr as Ptr<i64>;
+}
+
+fn alloc_i32(count: i64) -> Ptr<i32> {
+    let ptr: Ptr<u8> = malloc(count * 4);
+    return ptr as Ptr<i32>;
+}
+
+fn str_eq(a: Ptr<u8>, a_len: i64, b: Ptr<u8>, b_len: i64) -> bool {
+    if a_len != b_len { return false; }
+    for i in 0..a_len {
+        if a[i] != b[i] { return false; }
+    }
+    return true;
+}
+
+// ---- Tokenizer Structs (must match tokenizer.salt) ----
+
+struct TokenizerEntry {
+    text: Ptr<u8>,
+    len: i32,
+    score: f32,
+}
+
+struct Tokenizer {
+    vocab: Ptr<TokenizerEntry>,
+    vocab_size: i64,
+    max_token_length: i32,
+}
+
+// ---- Tokenizer Functions Under Test ----
+
+// Build a tokenizer.bin-format buffer in memory, then parse it.
+// Format: [max_token_length: i32] then per vocab entry: [score: f32][len: i32][bytes: u8[len]]
+
+fn write_i32(buf: Ptr<u8>, offset: i64, val: i32) -> i64 {
+    let p = buf.offset(offset) as Ptr<i32>;
+    p[0] = val;
+    return offset + 4;
+}
+
+fn write_f32(buf: Ptr<u8>, offset: i64, val: f32) -> i64 {
+    let p = buf.offset(offset) as Ptr<f32>;
+    p[0] = val;
+    return offset + 4;
+}
+
+fn write_bytes(buf: Ptr<u8>, offset: i64, src: Ptr<u8>, len: i64) -> i64 {
+    for i in 0..len {
+        buf[offset + i] = src[i];
+    }
+    return offset + len;
+}
+
+// Helper to write a single byte
+fn write_u8(buf: Ptr<u8>, offset: i64, val: u8) -> i64 {
+    buf[offset] = val;
+    return offset + 1;
+}
+
+// ---- load_tokenizer: Parse the binary format ----
+// (Implementation under test — will be moved to tokenizer.salt)
+
+fn load_tokenizer(data: Ptr<u8>, vocab_size: i64) -> Tokenizer {
+    // Read max_token_length
+    let max_len = (data as Ptr<i32>)[0];
+    let mut offset: i64 = 4;
+    
+    // Allocate vocab array
+    // Each TokenizerEntry is {Ptr<u8>, i32, f32} = 16 bytes (with alignment)
+    // We use raw memory and index manually
+    let entry_size: i64 = 24; // sizeof(TokenizerEntry) - padded to 8-byte alignment
+    let vocab_buf = malloc(vocab_size * entry_size);
+    let vocab = vocab_buf as Ptr<TokenizerEntry>;
+    
+    for i in 0..vocab_size {
+        // Read score (f32)
+        let score = (data.offset(offset) as Ptr<f32>)[0];
+        offset = offset + 4;
+        
+        // Read len (i32)
+        let len = (data.offset(offset) as Ptr<i32>)[0];
+        offset = offset + 4;
+        
+        // Copy text bytes (allocate small buffer)
+        let text_buf = malloc(len as i64 + 1);
+        for j in 0..(len as i64) {
+            text_buf[j] = data[offset + j];
+        }
+        text_buf[len as i64] = 0; // null-terminate
+        offset = offset + len as i64;
+        
+        // Store entry
+        // Since we can't easily index structs in a Ptr, let's use a flat layout:
+        // Actually, Salt should support Ptr<TokenizerEntry> indexing if the struct
+        // layout is known. Let's assume it works.
+        vocab[i] = TokenizerEntry { text: text_buf, len: len, score: score };
+    }
+    
+    return Tokenizer { vocab: vocab, vocab_size: vocab_size, max_token_length: max_len };
+}
+
+fn decode_token(tok: Tokenizer, token_id: i64) -> Ptr<u8> {
+    if token_id < 0 { return 0 as Ptr<u8>; }
+    if token_id >= tok.vocab_size { return 0 as Ptr<u8>; }
+    return tok.vocab[token_id].text;
+}
+
+fn decode_token_len(tok: Tokenizer, token_id: i64) -> i32 {
+    if token_id < 0 { return 0; }
+    if token_id >= tok.vocab_size { return 0; }
+    return tok.vocab[token_id].len;
+}
+
+// Find token ID for a given string (linear scan)
+fn find_token(tok: Tokenizer, text: Ptr<u8>, text_len: i64) -> i64 {
+    for i in 0..tok.vocab_size {
+        let entry = tok.vocab[i];
+        if str_eq(entry.text, entry.len as i64, text, text_len) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// BPE encode: convert text to token IDs
+// Returns number of tokens written to out_tokens
+fn bpe_encode(tok: Tokenizer, text: Ptr<u8>, text_len: i64, out_tokens: Ptr<i64>) -> i64 {
+    // Step 1: Initialize each byte as a single-byte token
+    let mut n_tokens: i64 = 0;
+    for i in 0..text_len {
+        // Find single-byte token
+        let byte_buf = malloc(1);
+        byte_buf[0] = text[i];
+        let tid = find_token(tok, byte_buf, 1);
+        if tid >= 0 {
+            out_tokens[n_tokens] = tid;
+            n_tokens = n_tokens + 1;
+        }
+        free(byte_buf);
+    }
+    
+    // Step 2: BPE merge loop
+    // Repeatedly find the best adjacent pair to merge
+    let merge_buf = malloc(tok.max_token_length as i64 + 1);
+    
+    let mut changed: i32 = 1;
+    // Loop until no more merges
+    for iter in 0..1000 {
+        if changed == 0 {
+            // No more merges — done
+            // Can't break, so we'll just skip iterations
+        }
+        if changed != 0 {
+            changed = 0;
+            let mut best_score: f32 = -1000000.0f32;
+            let mut best_idx: i64 = -1;
+            let mut best_tid: i64 = -1;
+            
+            // Check each adjacent pair
+            for i in 0..(n_tokens - 1) {
+                // Build merged string from tokens[i] + tokens[i+1]
+                let t1 = out_tokens[i];
+                let t2 = out_tokens[i + 1];
+                let len1 = tok.vocab[t1].len as i64;
+                let len2 = tok.vocab[t2].len as i64;
+                let merged_len = len1 + len2;
+                
+                // Copy t1 text
+                let t1_text = tok.vocab[t1].text;
+                for j in 0..len1 {
+                    merge_buf[j] = t1_text[j];
+                }
+                // Copy t2 text
+                let t2_text = tok.vocab[t2].text;
+                for j in 0..len2 {
+                    merge_buf[len1 + j] = t2_text[j];
+                }
+                
+                // Look up merged token
+                let mid = find_token(tok, merge_buf, merged_len);
+                if mid >= 0 {
+                    let score = tok.vocab[mid].score;
+                    if score > best_score {
+                        best_score = score;
+                        best_idx = i;
+                        best_tid = mid;
+                    }
+                }
+            }
+            
+            if best_idx >= 0 {
+                // Merge: replace tokens[best_idx] with best_tid, shift rest left
+                out_tokens[best_idx] = best_tid;
+                // Shift tokens[best_idx+2..] left by 1
+                let shift_from = best_idx + 2;
+                for j in shift_from..n_tokens {
+                    out_tokens[j - 1] = out_tokens[j];
+                }
+                n_tokens = n_tokens - 1;
+                changed = 1;
+            }
+        }
+    }
+    
+    free(merge_buf);
+    return n_tokens;
+}
+
+// ---- Build Test Vocabulary ----
+// Vocab:
+//   0: "a"   score=0.0
+//   1: "b"   score=0.0
+//   2: "c"   score=0.0
+//   3: "d"   score=0.0
+//   4: "ab"  score=10.0  (highest merge priority)
+//   5: "cd"  score=5.0
+//   6: "abc" score=20.0  (merges "ab" + "c")
+
+fn build_test_vocab() -> Ptr<u8> {
+    // Allocate generous buffer
+    let buf = alloc_u8(4096);
+    let vocab_size: i64 = 7;
+    let max_token_length: i32 = 3;
+    
+    let mut off: i64 = 0;
+    
+    // Header: max_token_length
+    off = write_i32(buf, off, max_token_length);
+    
+    // Entry 0: "a", score=0.0
+    off = write_f32(buf, off, 0.0f32);
+    off = write_i32(buf, off, 1);
+    off = write_u8(buf, off, 97); // 'a'
+    
+    // Entry 1: "b", score=0.0
+    off = write_f32(buf, off, 0.0f32);
+    off = write_i32(buf, off, 1);
+    off = write_u8(buf, off, 98); // 'b'
+    
+    // Entry 2: "c", score=0.0
+    off = write_f32(buf, off, 0.0f32);
+    off = write_i32(buf, off, 1);
+    off = write_u8(buf, off, 99); // 'c'
+    
+    // Entry 3: "d", score=0.0
+    off = write_f32(buf, off, 0.0f32);
+    off = write_i32(buf, off, 1);
+    off = write_u8(buf, off, 100); // 'd'
+    
+    // Entry 4: "ab", score=10.0
+    off = write_f32(buf, off, 10.0f32);
+    off = write_i32(buf, off, 2);
+    off = write_u8(buf, off, 97); // 'a'
+    off = write_u8(buf, off, 98); // 'b'
+    
+    // Entry 5: "cd", score=5.0
+    off = write_f32(buf, off, 5.0f32);
+    off = write_i32(buf, off, 2);
+    off = write_u8(buf, off, 99); // 'c'
+    off = write_u8(buf, off, 100); // 'd'
+    
+    // Entry 6: "abc", score=20.0
+    off = write_f32(buf, off, 20.0f32);
+    off = write_i32(buf, off, 3);
+    off = write_u8(buf, off, 97); // 'a'
+    off = write_u8(buf, off, 98); // 'b'
+    off = write_u8(buf, off, 99); // 'c'
+    
+    return buf;
+}
+
+// ---- Test Cases ----
+
+fn test_load_tokenizer() -> i32 {
+    let buf = build_test_vocab();
+    let tok = load_tokenizer(buf, 7);
+    
+    // Check max_token_length
+    if tok.max_token_length != 3 { return 101; }
+    
+    // Check vocab_size
+    if tok.vocab_size != 7 { return 102; }
+    
+    // Check entry 0: "a"
+    let e0 = tok.vocab[0];
+    if e0.len != 1 { return 103; }
+    if e0.text[0] != 97 { return 104; } // 'a'
+    
+    // Check entry 4: "ab"
+    let e4 = tok.vocab[4];
+    if e4.len != 2 { return 105; }
+    if e4.text[0] != 97 { return 106; } // 'a'
+    if e4.text[1] != 98 { return 107; } // 'b'
+    
+    return 0;
+}
+
+fn test_decode_token() -> i32 {
+    let buf = build_test_vocab();
+    let tok = load_tokenizer(buf, 7);
+    
+    // Decode token 0 -> "a"
+    let t0 = decode_token(tok, 0);
+    if t0[0] != 97 { return 201; }
+    
+    // Decode token 4 -> "ab"
+    let t4 = decode_token(tok, 4);
+    if t4[0] != 97 { return 202; }
+    if t4[1] != 98 { return 203; }
+    
+    // Decode token 6 -> "abc"
+    let t6 = decode_token(tok, 6);
+    if t6[0] != 97 { return 204; }
+    if t6[1] != 98 { return 205; }
+    if t6[2] != 99 { return 206; }
+    
+    // Decode out-of-range -> null
+    let bad = decode_token(tok, 100);
+    let bad_addr = bad as i64;
+    if bad_addr != 0 { return 207; }
+    
+    return 0;
+}
+
+fn test_find_token() -> i32 {
+    let buf = build_test_vocab();
+    let tok = load_tokenizer(buf, 7);
+    
+    // Find "a" -> 0
+    let a_buf = alloc_u8(1);
+    a_buf[0] = 97;
+    let r1 = find_token(tok, a_buf, 1);
+    if r1 != 0 { return 301; }
+    
+    // Find "ab" -> 4
+    let ab_buf = alloc_u8(2);
+    ab_buf[0] = 97;
+    ab_buf[1] = 98;
+    let r2 = find_token(tok, ab_buf, 2);
+    if r2 != 4 { return 302; }
+    
+    // Find "xyz" -> -1
+    let xyz_buf = alloc_u8(3);
+    xyz_buf[0] = 120;
+    xyz_buf[1] = 121;
+    xyz_buf[2] = 122;
+    let r3 = find_token(tok, xyz_buf, 3);
+    if r3 != -1 { return 303; }
+    
+    return 0;
+}
+
+fn test_bpe_encode() -> i32 {
+    let buf = build_test_vocab();
+    let tok = load_tokenizer(buf, 7);
+    
+    // Encode "abcd"
+    // Initial tokens: [a=0, b=1, c=2, d=3]
+    // Best merge: "ab" (score 10) → [ab=4, c=2, d=3]
+    // Next best: "abc" (score 20) merges "ab"+"c" → [abc=6, d=3]
+    // Next: "cd" not adjacent anymore → done
+    // Result: [6, 3]
+    
+    let text = alloc_u8(4);
+    text[0] = 97;  // 'a'
+    text[1] = 98;  // 'b'
+    text[2] = 99;  // 'c'
+    text[3] = 100; // 'd'
+    
+    let out = alloc_i64(16);
+    let n = bpe_encode(tok, text, 4, out);
+    
+    if n != 2 { return 401; }
+    if out[0] != 6 { return 402; } // "abc"
+    if out[1] != 3 { return 403; } // "d"
+    
+    // Encode "ab"
+    // Initial: [a=0, b=1]
+    // Merge: "ab" (score 10) → [ab=4]
+    // Result: [4]
+    let text2 = alloc_u8(2);
+    text2[0] = 97;
+    text2[1] = 98;
+    
+    let out2 = alloc_i64(16);
+    let n2 = bpe_encode(tok, text2, 2, out2);
+    
+    if n2 != 1 { return 404; }
+    if out2[0] != 4 { return 405; } // "ab"
+    
+    // Encode "a" (single byte, no merges)
+    let text3 = alloc_u8(1);
+    text3[0] = 97;
+    
+    let out3 = alloc_i64(16);
+    let n3 = bpe_encode(tok, text3, 1, out3);
+    
+    if n3 != 1 { return 406; }
+    if out3[0] != 0 { return 407; } // "a"
+    
+    // Encode "cd"
+    // Initial: [c=2, d=3]
+    // Merge: "cd" (score 5) → [cd=5]
+    let text4 = alloc_u8(2);
+    text4[0] = 99;
+    text4[1] = 100;
+    
+    let out4 = alloc_i64(16);
+    let n4 = bpe_encode(tok, text4, 2, out4);
+    
+    if n4 != 1 { return 408; }
+    if out4[0] != 5 { return 409; } // "cd"
+    
+    return 0;
+}
+
+fn main() -> i32 {
+    let r1 = test_load_tokenizer();
+    if r1 != 0 {
+        println(f"FAIL: test_load_tokenizer (code {r1})");
+        return r1;
+    }
+    println("  ✓ load_tokenizer");
+    
+    let r2 = test_decode_token();
+    if r2 != 0 {
+        println(f"FAIL: test_decode_token (code {r2})");
+        return r2;
+    }
+    println("  ✓ decode_token");
+    
+    let r3 = test_find_token();
+    if r3 != 0 {
+        println(f"FAIL: test_find_token (code {r3})");
+        return r3;
+    }
+    println("  ✓ find_token");
+    
+    let r4 = test_bpe_encode();
+    if r4 != 0 {
+        println(f"FAIL: test_bpe_encode (code {r4})");
+        return r4;
+    }
+    println("  ✓ bpe_encode");
+    
+    println("basalt tokenizer: PASS");
+    return 0;
+}

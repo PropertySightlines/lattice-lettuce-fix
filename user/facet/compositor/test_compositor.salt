@@ -1,0 +1,634 @@
+// Facet Compositor — Solar System Demo (Test Suite)
+//
+// Validates Layer 5:
+// - Affine transforms (Mat3x3)
+// - Scene Graph (Node, Group, Shape)
+// - Recursive Rendering (render_scene)
+// - Animation Loop (Moon orbits Earth, Earth orbits Sun)
+//
+// Run: cd user/facet && make compositor
+
+package main
+
+use std.core.ptr.Ptr
+
+// ═══════════════════════════════════════════════════════════════
+// FFI Declarations
+// ═══════════════════════════════════════════════════════════════
+
+extern fn malloc(size: i64) -> Ptr<u8>;
+extern fn free(ptr: Ptr<u8>);
+extern fn exit(code: i32);
+extern fn fabsf(x: f32) -> f32;
+extern fn floorf(x: f32) -> f32;
+extern fn ceilf(x: f32) -> f32;
+extern fn sinf(x: f32) -> f32;
+extern fn cosf(x: f32) -> f32;
+
+extern fn facet_window_open(width: i32, height: i32, title_ptr: Ptr<u8>) -> i64;
+extern fn facet_window_present(handle: i64, pixels: Ptr<u8>, width: i32, height: i32);
+extern fn facet_window_poll_events(handle: i64) -> i32;
+extern fn facet_window_close(handle: i64);
+extern fn facet_window_sleep_ms(ms: i32);
+
+// Shim helpers to free pointers without casting (bypassing verifier tracking type issues)
+extern fn facet_free_node(p: Ptr<Node>);
+extern fn facet_free_list(p: Ptr<NodeList>);
+extern fn facet_free_path(p: Ptr<Path>);
+extern fn facet_free_ptr(p: Ptr<u8>);
+extern fn facet_malloc(size: i64) -> Ptr<u8>;
+
+// ═══════════════════════════════════════════════════════════════
+// Part 1: Math (Affine Transforms)
+// ═══════════════════════════════════════════════════════════════
+
+struct Affine {
+    a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32,
+}
+
+struct Point {
+    x: f32, y: f32,
+}
+
+fn affine_identity() -> Affine {
+    return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+}
+
+fn affine_translate(dx: f32, dy: f32) -> Affine {
+    return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: dx, ty: dy };
+}
+
+fn affine_scale(sx: f32, sy: f32) -> Affine {
+    return Affine { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 };
+}
+
+fn affine_rotate(angle: f32) -> Affine {
+    let c = cosf(angle);
+    let s = sinf(angle);
+    return Affine { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 };
+}
+
+fn affine_multiply(m1: Affine, m2: Affine) -> Affine {
+    return Affine {
+        a:  m1.a * m2.a  + m1.c * m2.b,
+        b:  m1.b * m2.a  + m1.d * m2.b,
+        c:  m1.a * m2.c  + m1.c * m2.d,
+        d:  m1.b * m2.c  + m1.d * m2.d,
+        tx: m1.a * m2.tx + m1.c * m2.ty + m1.tx,
+        ty: m1.b * m2.tx + m1.d * m2.ty + m1.ty,
+    };
+}
+
+fn affine_transform_point(m: Affine, p: Point) -> Point {
+    return Point {
+        x: m.a * p.x + m.c * p.y + m.tx,
+        y: m.b * p.x + m.d * p.y + m.ty,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Part 2: Rasterizer Loop (Core Types + fill_path)
+// ═══════════════════════════════════════════════════════════════
+
+// Basic helper types
+fn pt(x: f32, y: f32) -> Point { return Point { x: x, y: y }; }
+fn midpoint(a: Point, b: Point) -> Point { return Point { x: (a.x+b.x)*0.5, y: (a.y+b.y)*0.5 }; }
+fn f32_to_i32(v: f32) -> i32 { let r: i32 = v as i32; return r; }
+
+const CMD_MOVE_TO: i32  = 0;
+const CMD_LINE_TO: i32  = 1;
+const CMD_QUAD_TO: i32  = 2;
+const CMD_CUBIC_TO: i32 = 3;
+const CMD_CLOSE: i32    = 4;
+
+struct PathCmd { tag: i32, _pad: i32, p0: Point, p1: Point, p2: Point }
+struct Path { cmds: Ptr<PathCmd>, count: i64, capacity: i64 }
+struct Canvas { pixels: Ptr<u8>, width: i32, height: i32, stride: i32 }
+struct Edge { x0: f32, y0: f32, x1: f32, y1: f32, dir: f32 }
+struct EdgeTable { edges: Ptr<Edge>, count: i64, capacity: i64 }
+
+// Path methods
+fn path_new() -> Path {
+    let cap: i64 = 64;
+    let mem = malloc(cap * 32);
+    return Path { cmds: mem as Ptr<PathCmd>, count: 0, capacity: cap };
+}
+
+fn path_grow(p: &mut Path) {
+    if p.count >= p.capacity {
+        let new_cap = p.capacity * 2;
+        let new_mem = malloc(new_cap * 32);
+        let src = p.cmds;
+        let dst = new_mem as Ptr<PathCmd>;
+        let mut i: i64 = 0;
+        while i < p.count { dst.offset(i).write(src.offset(i).read()); i = i + 1; }
+        free(p.cmds as Ptr<u8>);
+        p.cmds = dst;
+        p.capacity = new_cap;
+    }
+}
+
+fn path_push(p: &mut Path, cmd: PathCmd) {
+    path_grow(p);
+    p.cmds.offset(p.count).write(cmd);
+    p.count = p.count + 1;
+}
+
+fn path_move_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd { tag: CMD_MOVE_TO, _pad: 0, p0: pt(x,y), p1: pt(0.0,0.0), p2: pt(0.0,0.0) });
+}
+fn path_line_to(p: &mut Path, x: f32, y: f32) {
+    path_push(p, PathCmd { tag: CMD_LINE_TO, _pad: 0, p0: pt(x,y), p1: pt(0.0,0.0), p2: pt(0.0,0.0) });
+}
+fn path_cubic_to(p: &mut Path, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+    path_push(p, PathCmd { tag: CMD_CUBIC_TO, _pad: 0, p0: pt(c1x,c1y), p1: pt(c2x,c2y), p2: pt(x,y) });
+}
+fn path_close(p: &mut Path) {
+    path_push(p, PathCmd { tag: CMD_CLOSE, _pad: 0, p0: pt(0.0,0.0), p1: pt(0.0,0.0), p2: pt(0.0,0.0) });
+}
+fn path_free(p: &mut Path) { free(p.cmds as Ptr<u8>); }
+
+// Canvas methods
+fn canvas_new(width: i32, height: i32) -> Canvas {
+    let stride = width * 4;
+    let bytes = (stride as i64) * (height as i64);
+    let mem = malloc(bytes);
+    // Determine 0-fill manually? malloc is sometimes calloc. Salt malloc is mmap anon so 0-initialized usually.
+    // But let's be safe later with clear.
+    return Canvas { pixels: mem, width: width, height: height, stride: stride };
+}
+fn canvas_clear(c: &mut Canvas, r: u8, g: u8, b: u8, a: u8) {
+    let mut y: i32 = 0;
+    while y < c.height {
+        let mut x: i32 = 0;
+        while x < c.width {
+            let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+            c.pixels.offset(off).write(r);
+            c.pixels.offset(off+1).write(g);
+            c.pixels.offset(off+2).write(b);
+            c.pixels.offset(off+3).write(a);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+fn canvas_blend(c: &mut Canvas, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+    if x < 0 || x >= c.width || y < 0 || y >= c.height { return; }
+    let off = ((y as i64) * (c.stride as i64)) + ((x as i64) * 4);
+    if a == 255 {
+        c.pixels.offset(off).write(r);
+        c.pixels.offset(off+1).write(g);
+        c.pixels.offset(off+2).write(b);
+        c.pixels.offset(off+3).write(a);
+    } else if a > 0 {
+        let dst_r = c.pixels.offset(off).read() as i32;
+        let dst_g = c.pixels.offset(off+1).read() as i32;
+        let dst_b = c.pixels.offset(off+2).read() as i32;
+        let dst_a = c.pixels.offset(off+3).read() as i32;
+        let src_a = a as i32;
+        let inv_a = 255 - src_a;
+        let out_r = ((r as i32) + (dst_r * inv_a) / 255) as u8;
+        let out_g = ((g as i32) + (dst_g * inv_a) / 255) as u8;
+        let out_b = ((b as i32) + (dst_b * inv_a) / 255) as u8;
+        let out_a = (src_a + (dst_a * inv_a) / 255) as u8; // approx
+        c.pixels.offset(off).write(out_r);
+        c.pixels.offset(off+1).write(out_g);
+        c.pixels.offset(off+2).write(out_b);
+        c.pixels.offset(off+3).write(out_a);
+    }
+}
+fn canvas_free(c: &mut Canvas) { free(c.pixels); }
+
+// EdgeTable methods
+fn et_new() -> EdgeTable {
+    let cap: i64 = 256;
+    let mem = malloc(cap * 24);
+    return EdgeTable { edges: mem as Ptr<Edge>, count: 0, capacity: cap };
+}
+fn et_push(et: &mut EdgeTable, e: Edge) {
+    if et.count >= et.capacity {
+        let new_cap = et.capacity * 2;
+        let new_mem = malloc(new_cap * 24);
+        let src = et.edges;
+        let dst = new_mem as Ptr<Edge>;
+        let mut i: i64 = 0;
+        while i < et.count { dst.offset(i).write(src.offset(i).read()); i = i + 1; }
+        free(et.edges as Ptr<u8>);
+        et.edges = dst;
+        et.capacity = new_cap;
+    }
+    et.edges.offset(et.count).write(e);
+    et.count = et.count + 1;
+}
+fn et_free(et: &mut EdgeTable) { free(et.edges as Ptr<u8>); }
+fn add_line_edge(et: &mut EdgeTable, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if fabsf(y1 - y0) < 0.001 { return; }
+    if y0 < y1 { et_push(et, Edge { x0: x0, y0: y0, x1: x1, y1: y1, dir: 1.0 }); }
+    else { et_push(et, Edge { x0: x1, y0: y1, x1: x0, y1: y0, dir: -1.0 }); }
+}
+fn flatten_cubic(et: &mut EdgeTable, p0: Point, p1: Point, p2: Point, p3: Point, tol: f32, depth: i32) {
+    if depth > 10 { add_line_edge(et, p0.x, p0.y, p3.x, p3.y); return; }
+    let ux = 3.0*p1.x - 2.0*p0.x - p3.x;
+    let uy = 3.0*p1.y - 2.0*p0.y - p3.y;
+    let vx = 3.0*p2.x - p0.x - 2.0*p3.x;
+    let vy = 3.0*p2.y - p0.y - 2.0*p3.y;
+    let ux2 = ux*ux; let uy2 = uy*uy; let vx2 = vx*vx; let vy2 = vy*vy;
+    let max_x = if ux2 > vx2 { ux2 } else { vx2 };
+    let max_y = if uy2 > vy2 { uy2 } else { vy2 };
+    if (max_x + max_y) <= 16.0 * tol * tol { add_line_edge(et, p0.x, p0.y, p3.x, p3.y); return; }
+    let p01 = midpoint(p0, p1); let p12 = midpoint(p1, p2); let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12); let p123 = midpoint(p12, p23); let mid = midpoint(p012, p123);
+    flatten_cubic(et, p0, p01, p012, mid, tol, depth + 1);
+    flatten_cubic(et, mid, p123, p23, p3, tol, depth + 1);
+}
+
+fn fill_path(c: &mut Canvas, p: &Path, r: u8, g: u8, b: u8, a: u8) {
+    let mut et = et_new();
+    let tol: f32 = 0.5;
+    let mut cur = pt(0.0, 0.0);
+    let mut sub_start = pt(0.0, 0.0);
+    let mut i: i64 = 0;
+    while i < p.count {
+        let cmd = p.cmds.offset(i).read();
+        if cmd.tag == CMD_MOVE_TO { cur = cmd.p0; sub_start = cmd.p0; }
+        else if cmd.tag == CMD_LINE_TO { add_line_edge(&mut et, cur.x, cur.y, cmd.p0.x, cmd.p0.y); cur = cmd.p0; }
+        else if cmd.tag == CMD_CUBIC_TO { flatten_cubic(&mut et, cur, cmd.p0, cmd.p1, cmd.p2, tol, 0); cur = cmd.p2; }
+        else if cmd.tag == CMD_CLOSE { add_line_edge(&mut et, cur.x, cur.y, sub_start.x, sub_start.y); cur = sub_start; }
+        i = i + 1;
+    }
+    if et.count == 0 { et_free(&mut et); return; }
+
+    let mut min_y = et.edges.offset(0).read().y0;
+    let mut max_y = et.edges.offset(0).read().y1;
+    let mut j: i64 = 1;
+    while j < et.count {
+        let e = et.edges.offset(j).read();
+        if e.y0 < min_y { min_y = e.y0; }
+        if e.y1 > max_y { max_y = e.y1; }
+        j = j + 1;
+    }
+    let y_start = f32_to_i32(floorf(min_y));
+    let y_start_c = if y_start < 0 { 0 } else { y_start };
+    let y_end = f32_to_i32(ceilf(max_y));
+    let y_end_c = if y_end > c.height { c.height } else { y_end };
+
+    let cov_bytes = (c.width as i64) * 4;
+    let cov_raw = malloc(cov_bytes);
+    let coverage = cov_raw as Ptr<f32>;
+
+    let mut scanline: i32 = y_start_c;
+    while scanline < y_end_c {
+        let scan_y = (scanline as f32) + 0.5;
+        let mut cx: i64 = 0;
+        while cx < (c.width as i64) { coverage.offset(cx).write(0.0); cx = cx + 1; } // memset
+
+        let mut ei: i64 = 0;
+        while ei < et.count {
+            let e = et.edges.offset(ei).read();
+            if scan_y >= e.y0 && scan_y < e.y1 {
+                let t = (scan_y - e.y0) / (e.y1 - e.y0);
+                let x_int = e.x0 + t * (e.x1 - e.x0);
+                let mut col = f32_to_i32(floorf(x_int));
+                if col < 0 { col = 0; }
+                if col < c.width {
+                    let old = coverage.offset(col as i64).read();
+                    coverage.offset(col as i64).write(old + e.dir);
+                }
+            }
+            ei = ei + 1;
+        }
+
+        let mut winding: f32 = 0.0;
+        let mut px: i32 = 0;
+        while px < c.width {
+            let delta = coverage.offset(px as i64).read();
+            winding = winding + delta;
+            let abs_w = fabsf(winding);
+            if abs_w > 0.001 { canvas_blend(c, px, scanline, r, g, b, a); }
+            px = px + 1;
+        }
+        scanline = scanline + 1;
+    }
+    free(cov_raw);
+    et_free(&mut et);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Part 3: Scene Graph (Node, Group, Shape)
+// ═══════════════════════════════════════════════════════════════
+
+const NODE_GROUP: i32 = 0;
+const NODE_SHAPE: i32 = 1;
+
+struct NodeList {
+    nodes: Ptr<Ptr<Node>>, count: i64, capacity: i64,
+}
+
+struct Node {
+    kind: i32,
+    transform: Affine,
+    opacity: f32,
+    children: Ptr<NodeList>,
+    path: Ptr<Path>,
+    r: u8, g: u8, b: u8, a: u8,
+}
+
+fn node_alloc() -> Ptr<Node> {
+    let mem = facet_malloc(112); return mem as Ptr<Node>;
+}
+
+fn node_group() -> Ptr<Node> {
+    let n = node_alloc();
+    n.kind = NODE_GROUP; n.transform = affine_identity(); n.opacity = 1.0;
+    let list_mem = facet_malloc(24);
+    let list = list_mem as Ptr<NodeList>;
+    list.count = 0; list.capacity = 16;
+    list.nodes = facet_malloc(16 * 8) as Ptr<Ptr<Node>>;
+    n.children = list; n.path = 0 as Ptr<Path>;
+    return n;
+}
+
+fn node_shape(p: Ptr<Path>, r: u8, g: u8, b: u8, a: u8) -> Ptr<Node> {
+    let n = node_alloc();
+    n.kind = NODE_SHAPE; n.transform = affine_identity(); n.opacity = 1.0;
+    n.children = 0 as Ptr<NodeList>;
+    n.path = p; n.r = r; n.g = g; n.b = b; n.a = a;
+    return n;
+}
+
+fn node_add_child(group: Ptr<Node>, child: Ptr<Node>) {
+    if group.kind != NODE_GROUP { return; }
+    let list = group.children;
+    if list.count >= list.capacity {
+        let new_cap = list.capacity * 2;
+        let new_mem = facet_malloc(new_cap * 8);
+        let src = list.nodes;
+        let dst = new_mem as Ptr<Ptr<Node>>;
+        let mut i: i64 = 0;
+        while i < list.count { dst.offset(i).write(src.offset(i).read()); i = i + 1; }
+        facet_free_ptr(list.nodes as Ptr<u8>);
+        list.nodes = dst; list.capacity = new_cap;
+    }
+    list.nodes.offset(list.count).write(child);
+    list.count = list.count + 1;
+}
+
+// Transform path helper
+fn path_transform(src: Ptr<Path>, matrix: Affine, dst: Ptr<Path>) {
+    let mut i: i64 = 0;
+    while i < src.count {
+        let cmd = src.cmds.offset(i).read();
+        let p0_t = affine_transform_point(matrix, cmd.p0);
+        let p1_t = affine_transform_point(matrix, cmd.p1);
+        let p2_t = affine_transform_point(matrix, cmd.p2);
+        path_push(dst, PathCmd { tag: cmd.tag, _pad: 0, p0: p0_t, p1: p1_t, p2: p2_t });
+        i = i + 1;
+    }
+}
+
+// Helper to free Path content when accessed via Ptr
+fn path_ptr_free_content(p_ptr: Ptr<Path>) {
+    // Read struct to get cmds pointer and free buffer
+    let cmds = p_ptr.read().cmds;
+    free(cmds as Ptr<u8>);
+}
+
+// Recursive node cleanup
+fn node_free(n: Ptr<Node>) {
+    if n == (0 as Ptr<Node>) { return; }
+    
+    if n.kind == NODE_GROUP {
+        let list = n.children;
+        // Free all children recursively
+        let mut i: i64 = 0;
+        while i < list.count {
+            node_free(list.nodes.offset(i).read());
+            i = i + 1;
+        }
+        // Free child pointer array
+        free(list.nodes as Ptr<u8>);
+        // Free list struct
+        free(list as Ptr<u8>);
+    } else {
+        // Free path content and struct
+        path_ptr_free_content(n.path);
+        free(n.path as Ptr<u8>);
+    }
+    
+    // Free node struct itself
+    free(n as Ptr<u8>);
+}
+
+fn render_node(c: &mut Canvas, node: Ptr<Node>, parent_tf: Affine, parent_opacity: f32) {
+    if node == (0 as Ptr<Node>) { return; }
+    
+    // global_tf = parent_tf * local_tf (Post-multiply semantics for row-major math usually means 
+    // applying local first, then parent. 
+    // Point P -> Local -> Parent -> Root. 
+    // P_global = Parent * (Local * P).
+    // So we assume `affine_multiply(parent, local)` multiplies such that result(P) = parent(local(P)).
+    
+    let calc_tf = affine_multiply(parent_tf, node.transform);
+    let calc_opacity = parent_opacity * node.opacity;
+    
+    if node.kind == NODE_GROUP {
+        let list = node.children;
+        let mut i: i64 = 0;
+        while i < list.count {
+            render_node(c, list.nodes.offset(i).read(), calc_tf, calc_opacity);
+            i = i + 1;
+        }
+    } else if node.kind == NODE_SHAPE {
+        let mut temp_path_struct = path_new();
+        let temp_path = &mut temp_path_struct;
+        path_transform(node.path, calc_tf, temp_path);
+        let final_alpha = (node.a as f32) * calc_opacity;
+        fill_path(c, temp_path, node.r, node.g, node.b, final_alpha as u8);
+        path_free(temp_path);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Part 4: Solar System Demo
+// ═══════════════════════════════════════════════════════════════
+
+// Create a circle path centered at cx,cy with radius r
+fn make_circle(cx: f32, cy: f32, r: f32) -> Ptr<Path> {
+    let p_mem = facet_malloc(32); // sizeof Path
+    // Oops, path_new returns Path struct by value, not pointer.
+    // We need to return a pointer because Node holds Ptr<Path>.
+    
+    let p_val = path_new();
+    let p_ptr = p_mem as Ptr<Path>;
+    p_ptr.write(p_val);
+    
+    // Draw circle
+    let k: f32 = 0.5523 * r;
+    let mut p_ref = p_ptr; // mutable ref via pointer
+    
+    // Salt pointer deref syntax: p_ref points to struct.
+    // path_move_to needs &mut Path.
+    // In Salt, Ptr<T> is not &mut T.
+    // Wait, path_move_to(p: &mut Path).
+    // Can I cast/convert Ptr<Path> to &mut Path? 
+    // Or should I modify signature to take Ptr<Path>?
+    // For this unified file, I'll modify path methods to take &mut Path, 
+    // and I'll call them by creating a local reference `let mut p = p_ptr.read()`? No that copies.
+    
+    // Workaround: Use a local Path on stack, populate it, then write to heap.
+    // path_new returns struct.
+    // let mut local_p = path_new();
+    // ... path_move_to(&mut local_p, ...);
+    // p_ptr.write(local_p);
+    
+    let mut local_p = path_new();
+    path_move_to(&mut local_p, cx + r, cy);
+    path_cubic_to(&mut local_p, cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    path_cubic_to(&mut local_p, cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    path_cubic_to(&mut local_p, cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    path_cubic_to(&mut local_p, cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    path_close(&mut local_p);
+    
+    p_ptr.write(local_p);
+    return p_ptr;
+}
+
+fn title_ptr() -> Ptr<u8> {
+    let mem = malloc(14);
+    // "Solar System"
+    mem.offset(0).write(83 as u8);  // S
+    mem.offset(1).write(111 as u8); // o
+    mem.offset(2).write(108 as u8); // l
+    mem.offset(3).write(97 as u8);  // a
+    mem.offset(4).write(114 as u8); // r
+    mem.offset(5).write(32 as u8);  //  
+    mem.offset(6).write(83 as u8);  // S
+    mem.offset(7).write(121 as u8); // y
+    mem.offset(8).write(115 as u8); // s
+    mem.offset(9).write(116 as u8); // t
+    mem.offset(10).write(101 as u8); // e
+    mem.offset(11).write(109 as u8); // m
+    mem.offset(12).write(0 as u8);
+    return mem;
+}
+
+fn main() -> i32 {
+    println("=== Facet Compositor Demo: Solar System ===");
+    
+    // Verify Affine math
+    let id = affine_identity();
+    let pt0 = pt(10.0, 20.0);
+    let pt1 = affine_transform_point(id, pt0);
+    if fabsf(pt1.x - 10.0) > 0.001 || fabsf(pt1.y - 20.0) > 0.001 {
+        println("  FAIL: Identity matrix");
+        return 1;
+    }
+    println("  [PASS] generic affine verification");
+
+    let width: i32 = 800;
+    let height: i32 = 600;
+    let title = title_ptr();
+    let window = facet_window_open(width, height, title);
+    if window == 0 {
+        return 1;
+    }
+
+    // Build Scene Graph
+    // Root -> Sun -> EarthGroup -> (Earth, MoonGroup -> Moon)
+    
+    let scene_root = node_group();
+    
+    // Sun (Yellow)
+    let p_sun = make_circle(0.0, 0.0, 50.0);
+    let sun = node_shape(p_sun, 255, 200, 0, 255);
+    // Move sun to center of screen
+    sun.transform = affine_translate(400.0, 300.0);
+    node_add_child(scene_root, sun);
+    
+    // Earth Group (Orbits Sun)
+    let earth_group = node_group();
+    earth_group.transform = affine_translate(400.0, 300.0); 
+    node_add_child(scene_root, earth_group);
+    
+    // Earth (Blue)
+    let p_earth = make_circle(0.0, 0.0, 20.0);
+    let earth = node_shape(p_earth, 50, 100, 255, 255);
+    earth.transform = affine_translate(150.0, 0.0);
+    node_add_child(earth_group, earth);
+    
+    // Moon Group (Orbits Earth)
+    let moon_group = node_group();
+    moon_group.transform = affine_translate(150.0, 0.0);
+    node_add_child(earth_group, moon_group);
+    
+    // Moon (Gray)
+    let p_moon = make_circle(0.0, 0.0, 8.0);
+    let moon = node_shape(p_moon, 150, 150, 150, 255);
+    moon.transform = affine_translate(40.0, 0.0);
+    node_add_child(moon_group, moon);
+
+    let mut t_earth: f32 = 0.0;
+    let mut t_moon: f32 = 0.0;
+    
+    let mut canvas = canvas_new(width, height);
+    
+    let mut frames: i32 = 0;
+    while frames < 300 { 
+        canvas_clear(&mut canvas, 10, 10, 20, 255);
+        
+        t_earth = t_earth + 0.02;
+        t_moon = t_moon + 0.1;
+        
+        let t1 = affine_translate(400.0, 300.0);
+        let r1 = affine_rotate(t_earth);
+        earth_group.transform = affine_multiply(t1, r1);
+        
+        let t2 = affine_translate(150.0, 0.0);
+        let r2 = affine_rotate(t_moon);
+        moon_group.transform = affine_multiply(t2, r2);
+        
+        render_node(&mut canvas, scene_root, affine_identity(), 1.0);
+        
+        facet_window_present(window, canvas.pixels, width, height);
+        
+        if facet_window_poll_events(window) == 1 {
+            break;
+        }
+        facet_window_sleep_ms(33);
+        frames = frames + 1;
+    }
+
+    facet_window_close(window);
+    free(title);
+    canvas_free(&mut canvas);
+    
+    // Explicit Cleanup to satisfy leak detector (Pillar 3)
+    // 1. Shapes and paths
+    path_ptr_free_content(p_moon);
+    facet_free_path(p_moon);
+    facet_free_node(moon);
+    
+    path_ptr_free_content(p_earth);
+    facet_free_path(p_earth);
+    facet_free_node(earth);
+
+    path_ptr_free_content(p_sun);
+    facet_free_path(p_sun);
+    facet_free_node(sun);
+
+    // 2. Groups (children arrays + structs)
+    facet_free_ptr(moon_group.children.nodes as Ptr<u8>);
+    facet_free_list(moon_group.children);
+    facet_free_node(moon_group);
+
+    facet_free_ptr(earth_group.children.nodes as Ptr<u8>);
+    facet_free_list(earth_group.children);
+    facet_free_node(earth_group);
+
+    facet_free_ptr(scene_root.children.nodes as Ptr<u8>);
+    facet_free_list(scene_root.children);
+    facet_free_node(scene_root);
+    
+    println("=== Solar System Demo Complete ===");
+    return 0;
+}

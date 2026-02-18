@@ -1,0 +1,185 @@
+[
+  {
+    "program": "fib",
+    "lang": "C",
+    "loc": 14,
+    "wall_time": 0.020284108445048334,
+    "cpu_user": 0.01,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1008
+  },
+  {
+    "program": "fib",
+    "lang": "C++",
+    "loc": 12,
+    "wall_time": 0.020637666527181863,
+    "cpu_user": 0.01,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1024
+  },
+  {
+    "program": "fib",
+    "lang": "Rust",
+    "loc": 14,
+    "wall_time": 0.02123234998434782,
+    "cpu_user": 0.01,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1168
+  },
+  {
+    "program": "sieve",
+    "lang": "C",
+    "loc": 41,
+    "wall_time": 0.07804128341376781,
+    "cpu_user": 0.07,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 4080
+  },
+  {
+    "program": "sieve",
+    "lang": "C++",
+    "loc": 30,
+    "wall_time": 0.09652397502213717,
+    "cpu_user": 0.09,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 8176
+  },
+  {
+    "program": "sieve",
+    "lang": "Rust",
+    "loc": 35,
+    "wall_time": 0.1268973578698933,
+    "cpu_user": 0.12,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 5264
+  },
+  {
+    "program": "matmul",
+    "lang": "C",
+    "loc": 33,
+    "wall_time": 0.11719379182904958,
+    "cpu_user": 0.11,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 7184
+  },
+  {
+    "program": "matmul",
+    "lang": "C++",
+    "loc": 27,
+    "wall_time": 0.11795303355902434,
+    "cpu_user": 0.11,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 7184
+  },
+  {
+    "program": "matmul",
+    "lang": "Rust",
+    "loc": 24,
+    "wall_time": 0.11689124181866646,
+    "cpu_user": 0.11,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 7344
+  },
+  {
+    "program": "vector_add",
+    "lang": "C",
+    "loc": 17,
+    "wall_time": 0.003785399813205004,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1008
+  },
+  {
+    "program": "vector_add",
+    "lang": "C++",
+    "loc": 17,
+    "wall_time": 0.003936224989593029,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1024
+  },
+  {
+    "program": "vector_add",
+    "lang": "Rust",
+    "loc": 22,
+    "wall_time": 0.004148949962109327,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1168
+  },
+  {
+    "program": "vector_add",
+    "lang": "Salt",
+    "loc": 22,
+    "wall_time": 0.004549158364534378,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1008
+  },
+  {
+    "program": "window_access",
+    "lang": "C",
+    "loc": 15,
+    "wall_time": 0.0430611751973629,
+    "cpu_user": 0.04,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1008
+  },
+  {
+    "program": "window_access",
+    "lang": "C++",
+    "loc": 14,
+    "wall_time": 0.040883966628462075,
+    "cpu_user": 0.04,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1024
+  },
+  {
+    "program": "window_access",
+    "lang": "Rust",
+    "loc": 20,
+    "wall_time": 0.004106891620904207,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1200
+  },
+  {
+    "program": "bitwise",
+    "lang": "C",
+    "loc": 20,
+    "wall_time": 0.00434781676158309,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1008,
+    "cycles": 19.130393750965595
+  },
+  {
+    "program": "bitwise",
+    "lang": "C++",
+    "loc": 19,
+    "wall_time": 0.004284824803471565,
+    "cpu_user": 0.0,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1024,
+    "cycles": 18.853229135274887
+  },
+  {
+    "program": "bitwise",
+    "lang": "Rust",
+    "loc": 23,
+    "wall_time": 0.021684366464614867,
+    "cpu_user": 0.01,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 1184,
+    "cycles": 95.41121244430542
+  },
+  {
+    "program": "forest",
+    "lang": "C",
+    "loc": 40,
+    "wall_time": 0.04969797478988767,
+    "cpu_user": 0.04,
+    "cpu_sys": 0.0,
+    "peak_memory_kb": 34464
+  }
+]

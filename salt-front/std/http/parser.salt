@@ -1,0 +1,102 @@
+// std.http.parser — Zero-Copy HTTP/1.1 Request Line Parser
+// =============================================================================
+// Extracts method, URI, and version as zero-copy StringView slices via out-parameters.
+//
+// Returns: 1 if parse succeeded, 0 if failed.
+// On success: method_out, uri_out, version_out are set to zero-copy slices.
+// =============================================================================
+
+package std.http.parser
+
+use std.core.str.StringView
+use std.core.ptr.Ptr
+
+// Parse an HTTP/1.1 request line from `buf` (length `len`).
+// On success, writes method/uri/version into the output StringViews.
+// Returns bytes consumed on success, or -1 on failure.
+pub fn parse_request_line(
+    buf: Ptr<u8>, len: i64,
+    method_out: &mut StringView,
+    uri_out: &mut StringView,
+    version_out: &mut StringView
+) -> i64 {
+    let input = StringView::from_raw(buf, len);
+
+    // Find end of request line (\n or \r\n)
+    let line_end = find_newline(buf, len);
+    if line_end < 0 {
+        return -1;
+    }
+
+    let request_line = input.slice(0, line_end);
+
+    // Parse: METHOD SP URI SP VERSION
+    let sp1 = find_byte_raw(buf, line_end, 32);
+    if sp1 < 0 {
+        return -1;
+    }
+    *method_out = request_line.slice(0, sp1);
+
+    let rest_start = sp1 + 1;
+    let rest_ptr = buf.offset(rest_start);
+    let sp2_rel = find_byte_raw(rest_ptr, line_end - rest_start, 32);
+    if sp2_rel < 0 {
+        return -1;
+    }
+    let sp2 = rest_start + sp2_rel;
+    *uri_out = request_line.slice(sp1 + 1, sp2);
+    *version_out = request_line.slice(sp2 + 1, line_end);
+
+    // Skip past CRLF
+    let mut body_offset = line_end + 1;
+    if line_end > 0 {
+        let prev = buf.offset(line_end - 1);
+        if prev.read() == 13 {
+            // Line ended with \r\n
+        }
+    }
+    if line_end + 1 < len {
+        let next = buf.offset(line_end + 1);
+        if next.read() == 10 || next.read() == 13 {
+            body_offset = line_end + 2;
+        }
+    }
+
+    return body_offset;
+}
+
+// Find first \n in the buffer. Returns index or -1.
+fn find_newline(buf: Ptr<u8>, len: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < len {
+        let p = buf.offset(i);
+        let b = p.read();
+        if b == 10 {
+            return i;
+        }
+        if b == 13 {
+            // Check for \r\n
+            if i + 1 < len {
+                let next = buf.offset(i + 1);
+                if next.read() == 10 {
+                    return i;
+                }
+            }
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn find_byte_raw(buf: Ptr<u8>, len: i64, needle: u8) -> i64 {
+    let mut i: i64 = 0;
+    while i < len {
+        let p = buf.offset(i);
+        if p.read() == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}

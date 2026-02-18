@@ -1,0 +1,44 @@
+// Forest Benchmark: Arena-allocated binary tree build + reset
+// Demonstrates Salt's O(1) bump allocation and O(1) mark/reset reclamation.
+// Tree depth 22 requires ~100MB; the 64MB global arena will OOM gracefully.
+
+package main
+
+use std.core.ptr.Ptr
+use std.core.arena.Arena
+use std.time.Instant
+
+struct Node {
+    left: Ptr<Node>,
+    right: Ptr<Node>,
+    val: i32
+}
+
+fn make_tree(arena: Arena, depth: i32) -> Ptr<Node> {
+    if depth == 0 { return Ptr::empty(); }
+    let left = make_tree(arena, depth - 1);
+    let right = make_tree(arena, depth - 1);
+    let p = arena.alloc_bytes(24);
+    if p.is_null() { return Ptr::empty(); }
+    let node = p as Ptr<Node>;
+    node.left = left;
+    node.right = right;
+    node.val = depth;
+    return node;
+}
+
+fn main() -> i32 {
+    println("Forest Benchmark");
+    let arena = Arena::new(64 * 1024 * 1024);
+    let m = arena.mark();
+    let start = Instant::now();
+    let root = make_tree(arena, 22);
+    let build_time = start.elapsed();
+    arena.reset_to(m);
+    let total_time = start.elapsed();
+    let drop_time = total_time.as_nanos() - build_time.as_nanos();
+    println(f"Build Time: {build_time.as_nanos()} ns");
+    println(f"Drop Time:  {drop_time} ns");
+    println(f"Total:      {total_time.as_nanos()} ns");
+    return 0;
+}

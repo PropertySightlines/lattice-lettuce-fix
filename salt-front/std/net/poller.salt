@@ -1,0 +1,64 @@
+// =============================================================================
+// std.net.Poller — Event loop abstraction over kqueue
+// =============================================================================
+// Layer 2 of the 3-layer network architecture.
+// Wraps raw kqueue syscalls into a safe, ergonomic event poller.
+
+package std.net.poller
+
+use std.os.syscall
+use std.core.ptr.Ptr
+use std.status.Status
+use std.core.result.Result
+
+/// Event filter types
+pub enum Filter {
+    Read,
+    Write
+}
+
+
+
+/// Safe abstraction over kqueue (macOS) / epoll (Linux)
+pub struct Poller {
+    kq: i32
+}
+
+impl Poller {
+    /// Create a new Poller.
+    pub fn new() -> Result<Poller> {
+        let kq = syscall::http_kq_create();
+        if kq < 0 {
+            return Result::Err(Status::internal("kqueue operation failed"));
+        }
+        return Result::Ok(Poller { kq: kq });
+    }
+
+    /// Register a file descriptor for read or write events.
+    /// Returns 0 on success, -1 on error.
+    pub fn register(&self, fd: i32, filter: Filter) -> i32 {
+        let f = match filter {
+            Filter::Read => 0,
+            Filter::Write => 1
+        };
+        return syscall::http_kq_register(self.kq, fd, f);
+    }
+
+    /// Deregister a file descriptor from the poller.
+    /// Returns 0 on success, -1 on error.
+    pub fn deregister(&self, fd: i32) -> i32 {
+        return syscall::http_kq_deregister(self.kq, fd);
+    }
+
+    /// Wait for events. Fills the provided buffer and returns count.
+    /// timeout_ms: -1 = block forever, 0 = poll, >0 = timeout in ms.
+    /// Returns number of events, or -1 on error.
+    pub fn wait(&self, event_buf: Ptr<i64>, max_events: i32, timeout_ms: i32) -> i32 {
+        return syscall::http_kq_wait(self.kq, event_buf, max_events, timeout_ms);
+    }
+
+    /// Get the raw kqueue file descriptor (for advanced use).
+    pub fn fd(&self) -> i32 {
+        return self.kq;
+    }
+}

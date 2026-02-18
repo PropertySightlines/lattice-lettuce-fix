@@ -1,0 +1,95 @@
+// =============================================================================
+// HTTP Parser Benchmark — Salt
+// =============================================================================
+// Uses std.http.parser.parse_request_line with out-parameters.
+// Parses request line + counts headers by scanning for \r\n pairs.
+
+package main
+
+use std.core.str.StringView
+use std.core.ptr.Ptr
+use std.http.parser.parse_request_line
+use std.time.Instant
+
+const ITERATIONS: i64 = 1000000;
+
+fn count_headers(buf: Ptr<u8>, start: i64, len: i64) -> i64 {
+    let mut count: i64 = 0;
+    if buf.addr() != 0 {
+        let mut i: i64 = start;
+        while i < len - 1 {
+            let p = buf.offset(i);
+            let b = p.read();
+            if b == 13 {
+                let next = buf.offset(i + 1);
+                if next.read() == 10 {
+                    if i + 3 < len {
+                        let p2 = buf.offset(i + 2);
+                        let p3 = buf.offset(i + 3);
+                        if p2.read() == 13 && p3.read() == 10 {
+                            return count;
+                        }
+                    }
+                    count = count + 1;
+                    i = i + 2;
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    return count;
+}
+
+fn main() -> i32 {
+    let request = "GET /index.html HTTP/1.1\r\nHost: www.example.com\r\nUser-Agent: Salt/1.0\r\nAccept: text/html\r\nConnection: keep-alive\r\n\r\n";
+    let request_len: i64 = 132;
+    let buf = request as Ptr<u8>;
+
+    // Parse with out-parameters
+    let mut method = StringView::empty();
+    let mut uri = StringView::empty();
+    let mut version = StringView::empty();
+
+    let consumed = parse_request_line(buf, request_len, &mut method, &mut uri, &mut version);
+    if consumed < 0 {
+        println("ERROR: parse failed");
+        return 1;
+    }
+
+    let headers = count_headers(buf, consumed, request_len);
+
+    println(f"Method len: {method.length()}");
+    println(f"URI len: {uri.length()}");
+    println(f"Version len: {version.length()}");
+    println(f"Headers: {headers}");
+
+    let start = Instant::now();
+
+    let mut i: i64 = 0;
+    while i < ITERATIONS {
+        let mut m = StringView::empty();
+        let mut u = StringView::empty();
+        let mut v = StringView::empty();
+        let r = parse_request_line(buf, request_len, &mut m, &mut u, &mut v);
+        if r < 0 {
+            println("FAIL");
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    let elapsed = start.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    let elapsed_ns = elapsed.as_nanos();
+    let req_per_sec = (ITERATIONS * 1000000000) / elapsed_ns;
+
+    println("=== Salt HTTP Parser Benchmark ===");
+    println(f"Iterations: {ITERATIONS}");
+    println(f"Time: {elapsed_ms} ms");
+    println(f"Throughput: {req_per_sec} req/s");
+
+    return 0;
+}
