@@ -6,10 +6,12 @@ import time
 import re
 import glob
 import shutil
+import socket
+import threading
 
 # Configuration
 KERNEL_ROOT = "kernel"
-BENCH_ROOT = "benchmarks"
+BENCH_ROOT = "kernel/benchmarks"
 BUILD_DIR = "qemu_build"
 # Try to find salt binaries in the workspace
 WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -145,6 +147,7 @@ def build_kernel():
                  glob.glob(f"{KERNEL_ROOT}/drivers/*.salt") + \
                  glob.glob(f"{KERNEL_ROOT}/mem/*.salt") + \
                  glob.glob(f"{KERNEL_ROOT}/sched/*.salt") + \
+                 glob.glob(f"{KERNEL_ROOT}/net/*.salt") + \
                  glob.glob(f"{KERNEL_ROOT}/arch/x86/*.salt")
                  
     for f in salt_files:
@@ -178,6 +181,8 @@ def build_benchmark(bench_file, kernel_objs):
         "syscall_bench.salt",
         "ipc_bench.salt",
         "alloc_bench.salt",
+        "slab_reclaim_bench.salt",
+        "net_echo_bench.salt",
     ]
     
     bench_objs = []
@@ -205,9 +210,30 @@ def build_benchmark(bench_file, kernel_objs):
     
     return output_elf
 
+QEMU_LOG_MAX_BYTES = 100 * 1024 * 1024  # 100MB safety cap
+
 def run_qemu_test(kernel_path, timeout=600):
     print(f"{GREEN}== Launching QEMU Flight Deck =={RESET}")
-    
+
+    # --- Guard 1: Kill any stale QEMU processes from previous runs ---
+    try:
+        subprocess.run(['pkill', '-f', 'qemu-system'], capture_output=True)
+    except Exception:
+        pass  # pkill may not exist or no processes found — harmless
+
+    # --- Guard 2: Remove oversized qemu.log from previous runs ---
+    #     INC-001: A stale QEMU with -d int produced a 294GB log file,
+    #     filling the disk. See docs/incidents/001_qemu_log_disk_fill.md
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'qemu.log')
+    log_path = os.path.normpath(log_path)
+    if os.path.exists(log_path):
+        log_size = os.path.getsize(log_path)
+        if log_size > QEMU_LOG_MAX_BYTES:
+            print(f"{RED}  ⚠ Stale qemu.log is {log_size // (1024*1024)}MB — deleting (INC-001 guard){RESET}")
+            os.remove(log_path)
+        else:
+            os.remove(log_path)  # Always start fresh
+
     # Detect KVM availability (Linux x86_64 with /dev/kvm)
     # On macOS ARM, HVF can't run x86 guests — always use TCG there
     use_kvm = sys.platform != "darwin" and os.path.exists("/dev/kvm")
@@ -218,16 +244,23 @@ def run_qemu_test(kernel_path, timeout=600):
     else:
         cpu_flag = 'qemu64,+fxsr,+mmx,+sse,+sse2,+xsave'
 
+    # QEMU debug flags: default to guest_errors only.
+    # Set QEMU_DEBUG=int,guest_errors,cpu_reset for full interrupt tracing.
+    # WARNING: '-d int' under sustained IRQ load produces GB/min of log output.
+    qemu_debug = os.environ.get('QEMU_DEBUG', 'guest_errors')
+
     cmd = [
         'qemu-system-x86_64',
         '-kernel', kernel_path,
         '-nographic',
-        '-m', '128M',
+        '-m', '1G',
         '-cpu', cpu_flag,
-        '-d', 'int,guest_errors,cpu_reset',
-        '-D', 'qemu.log',
+        '-d', qemu_debug,
+        '-D', log_path,
         '-no-reboot',
-        '-serial', 'mon:stdio'
+        '-serial', 'mon:stdio',
+        '-device', 'virtio-net-pci,netdev=net0',
+        '-netdev', 'user,id=net0,hostfwd=udp::5555-:7'
     ]
 
     if use_kvm:
@@ -284,12 +317,49 @@ def run_qemu_test(kernel_path, timeout=600):
                     # Depending on verify mode, might exit here or wait
                     pass
 
+                if "BENCH:net_echo:listening" in line:
+                    # Inject UDP test packets from host → QEMU guest port 7.
+                    # Send in multiple bursts: the first burst triggers QEMU's
+                    # ARP request to the guest. After ARP completes, subsequent
+                    # bursts deliver actual UDP payloads.
+                    def inject_udp():
+                        try:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                            for burst in range(5):
+                                for i in range(4):
+                                    sock.sendto(f"echo{burst*4+i}".encode(), ("127.0.0.1", 5555))
+                                time.sleep(0.1)  # 100ms between bursts for ARP to settle
+                            sock.close()
+                            print(f"{GREEN}INJECTED: 20 UDP packets to localhost:5555 (5 bursts){RESET}")
+                        except Exception as e:
+                            print(f"{RED}UDP injection failed: {e}{RESET}")
+                    threading.Thread(target=inject_udp, daemon=True).start()
+
             if process.poll() is not None:
+                # Drain any remaining buffered output before exiting.
+                # Apply the same checks as the main loop — panic detection
+                # matters here too, otherwise a crash in the tail buffer
+                # would be silently swallowed as a false success.
+                for remaining_line in process.stdout:
+                    print(f"QEMU: {remaining_line.strip()}")
+                    output_buffer += remaining_line
+                    if "BENCHMARK SUITE COMPLETE" in remaining_line:
+                        print(f"{GREEN}SUITE COMPLETE — terminating QEMU{RESET}")
+                        return True, output_buffer
+                    if "kernel panic" in remaining_line.lower() or "\x1b[31;1m" in remaining_line:
+                        print(f"{RED}KERNEL PANIC DETECTED{RESET}")
                 break
                 
     except KeyboardInterrupt:
         process.terminate()
-        
+
+    # --- Guard 3: Truncate log after run to prevent accumulation ---
+    if os.path.exists(log_path):
+        log_size = os.path.getsize(log_path)
+        if log_size > QEMU_LOG_MAX_BYTES:
+            print(f"{RED}  ⚠ qemu.log grew to {log_size // (1024*1024)}MB during run — truncating{RESET}")
+            os.remove(log_path)
+
     return True, output_buffer
 
 if __name__ == "__main__":
@@ -334,6 +404,78 @@ if __name__ == "__main__":
         except subprocess.CalledProcessError as e:
             print(f"{RED}BUILD FAILED: {e}{RESET}")
             sys.exit(1)
-    else:
-        print("Usage: tools/runner_qemu.py [build|run]")
+    elif len(sys.argv) > 1 and sys.argv[1] == "test_net":
+        # VirtIO-Net E2E Integration Test
+        # Builds kernel, boots QEMU, injects UDP packets, and asserts:
+        #   1. rx > 0 (packets received by driver)
+        #   2. tx > 0 (packets transmitted by driver)
+        #   3. udp_echo > 0 (UDP echo service handled packets)
+        #   4. ARP handshake completed
+        try:
+            TOOLCHAIN.validate()
+            kernel_objs = build_kernel()
+            bench_file = os.path.join(BENCH_ROOT, "ring_of_fire.salt")
+            elf = build_benchmark(bench_file, kernel_objs)
 
+            print(f"{GREEN}== VirtIO-Net E2E Integration Test =={RESET}")
+            success, log = run_qemu_test(elf)
+
+            # Parse net_echo result line
+            rx_count = 0
+            tx_count = 0
+            udp_count = 0
+            arp_seen = False
+            suite_complete = False
+
+            for line in log.split("\n"):
+                if "ARP: Request for our IP, sending reply" in line:
+                    arp_seen = True
+
+                net_match = re.search(
+                    r"BENCH:net_echo:result rx=(\d+) tx=(\d+) udp_echo=(\d+)",
+                    line,
+                )
+                if net_match:
+                    rx_count = int(net_match.group(1))
+                    tx_count = int(net_match.group(2))
+                    udp_count = int(net_match.group(3))
+
+                if "BENCHMARK SUITE COMPLETE" in line:
+                    suite_complete = True
+
+            # Report
+            print(f"\n{GREEN}== Net Test Results =={RESET}")
+            print(f"  Suite complete : {'YES' if suite_complete else 'NO'}")
+            print(f"  ARP handshake  : {'YES' if arp_seen else 'NO'}")
+            print(f"  RX packets     : {rx_count}")
+            print(f"  TX packets     : {tx_count}")
+            print(f"  UDP echo       : {udp_count}")
+
+            # Assertions
+            failures = []
+            if not suite_complete:
+                failures.append("Benchmark suite did not complete")
+            if rx_count == 0:
+                failures.append("rx=0 — no packets received by driver")
+            if tx_count == 0:
+                failures.append("tx=0 — no packets transmitted by driver")
+            if udp_count == 0:
+                failures.append("udp_echo=0 — no UDP echo packets handled")
+            if not arp_seen:
+                failures.append("No ARP handshake observed")
+
+            if failures:
+                print(f"\n{RED}NET TEST FAIL:{RESET}")
+                for f in failures:
+                    print(f"  ✗ {f}")
+                sys.exit(1)
+            else:
+                print(f"\n{GREEN}NET TEST PASS: rx={rx_count} tx={tx_count} udp_echo={udp_count}{RESET}")
+                sys.exit(0)
+
+        except subprocess.CalledProcessError as e:
+            print(f"{RED}BUILD FAILED: {e}{RESET}")
+            sys.exit(1)
+
+    else:
+        print("Usage: tools/runner_qemu.py [build|run|test_net]")

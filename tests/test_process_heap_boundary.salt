@@ -1,0 +1,83 @@
+// =============================================================================
+// tests/test_process_heap_boundary.salt
+// Regression Test: Late-Zeroing Trap in Process Heap Boundaries
+// =============================================================================
+//
+// This test catches a critical security bug where process.init_slot()
+// unconditionally zeroes brk_base, brk_current, mmap_base, and
+// vma_list_head — meaning any heap boundary set BEFORE init_slot
+// would be silently destroyed, causing mmap to return address 0x0
+// (the null page) and enabling silent null pointer dereferences.
+//
+// The test simulates the exec_user.salt lifecycle:
+//   1. Call init_slot (like Step 9 of spawn_process)
+//   2. Set heap boundaries (like Step 10 of spawn_process)
+//   3. Assert the boundaries survived
+//
+// If init_slot is ever changed to re-zero these fields, or if
+// set_brk_base/set_mmap_base regress, this test catches it.
+// =============================================================================
+
+package tests.test_process_heap_boundary
+
+import kernel.core.process
+
+// =============================================================================
+// Test: init_slot does not clobber post-set heap boundaries
+// =============================================================================
+@no_mangle
+pub fn test_init_slot_preserves_heap_boundaries() -> u64 {
+    let slot: u64 = 15;  // Use last slot to avoid colliding with real processes
+
+    // Simulate spawn_process Step 9: init_slot
+    process.init_slot(slot, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000);
+
+    // Simulate spawn_process Step 10: set heap boundaries AFTER init_slot
+    let expected_brk: u64 = 0x8000002000;
+    let expected_mmap: u64 = 0x400000000000;
+
+    process.set_brk_base(slot, expected_brk);
+    process.set_brk_current(slot, expected_brk);
+    process.set_mmap_base(slot, expected_mmap);
+    process.set_vma_list_head(slot, 0);
+
+    // Verify: fields must survive
+    let got_brk_base = process.get_brk_base(slot);
+    let got_brk_current = process.get_brk_current(slot);
+    let got_mmap = process.get_mmap_base(slot);
+
+    let mut failures: u64 = 0;
+
+    if got_brk_base != expected_brk {
+        failures = failures + 1;
+    }
+    if got_brk_current != expected_brk {
+        failures = failures + 1;
+    }
+    if got_mmap != expected_mmap {
+        failures = failures + 1;
+    }
+
+    // Return 0 = PASS, nonzero = number of failures
+    return failures;
+}
+
+// =============================================================================
+// Test: mmap_base must never be zero after spawn lifecycle
+// =============================================================================
+@no_mangle
+pub fn test_mmap_base_never_zero() -> u64 {
+    let slot: u64 = 14;
+
+    // Full spawn lifecycle simulation
+    process.init_slot(slot, 0xA000, 0xB000, 0xC000, 0xD000, 0xE000);
+    process.set_mmap_base(slot, 0x400000000000);
+
+    let mmap = process.get_mmap_base(slot);
+
+    // The zero page must NEVER be mappable
+    if mmap == 0 {
+        return 1;  // FAIL: zero page would be mapped
+    }
+    return 0;  // PASS
+}

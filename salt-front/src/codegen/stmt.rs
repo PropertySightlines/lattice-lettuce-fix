@@ -5,6 +5,7 @@ use crate::codegen::context::{LoweringContext, LocalKind};
 use crate::codegen::expr::emit_expr;
 use crate::codegen::type_bridge::{resolve_type, promote_numeric};
 use std::collections::{HashMap, HashSet};
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
 /// Try to extract a constant integer from an expression for affine loop bounds.
@@ -1548,7 +1549,8 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                 cond_val
             };
             
-            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}\n", cond_val, label_body, label_exit));
+            let loc = ctx.loc_tag(w.cond.span());
+            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}{}\n", cond_val, label_body, label_exit, loc));
             out.push_str(&format!("  ^{}:\n", label_body));
             
             // Heartbeat Injection (V2.0: simplified, uses @yielding at function level)
@@ -1707,7 +1709,8 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
             
             let cond_i1 = format!("%for_cond_{}", ctx.next_id());
             ctx.emit_cmp(out, &cond_i1, "arith.cmpi", "slt", &current_i, &end_val, &mlir_loop_ty);
-            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}\n", cond_i1, label_body, label_exit));
+            let loc = ctx.loc_tag(f.iter.span());
+            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}{}\n", cond_i1, label_body, label_exit, loc));
             
             out.push_str(&format!("  ^{}:\n", label_body));
             
@@ -1829,8 +1832,9 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                     }
                 }
                 
+                let loc = ctx.loc_tag(e.span());
                 if ty == Type::Unit {
-                    out.push_str("    func.return\n");
+                    out.push_str(&format!("    func.return{}\n", loc));
                 } else {
                     let mut val = val_raw;
                     if let Some(expected) = &expected_ret {
@@ -1843,7 +1847,7 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                     } else {
                         ty.to_mlir_type(ctx)?
                     };
-                    out.push_str(&format!("    func.return {} : {}\n", val, mlir_ty));
+                    out.push_str(&format!("    func.return {} : {}{}\n", val, mlir_ty, loc));
                 }
             } else {
                 out.push_str("    func.return\n");
@@ -1933,8 +1937,20 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
             if !body_diverges {
                 out.push_str(&format!("    cf.br ^{}\n", label_body));
             }
-            out.push_str(&format!("  ^{}:\n", label_exit));
-            Ok(false)
+
+            // [DIVERGENCE TRACKING] Only emit the exit block if a break
+            // actually targets it. An infinite `loop { }` with no break
+            // produces an exit block with zero predecessors, which crashes
+            // MLIR's dominance tree computation in salt-opt.
+            let break_target = format!("cf.br ^{}", label_exit);
+            let break_was_used = out.contains(&break_target);
+            if break_was_used {
+                out.push_str(&format!("  ^{}:\n", label_exit));
+                Ok(false)
+            } else {
+                // Infinite loop — no exit path exists. Signal divergence.
+                Ok(true)
+            }
         }
     }
 }
@@ -2157,11 +2173,12 @@ pub fn emit_salt_if(
         }
     }
 
+    let loc = ctx.loc_tag(cond.span());
     let has_else = else_branch.is_some();
     if has_else {
-         out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}\n", cond_val, label_then, label_else));
+         out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}{}\n", cond_val, label_then, label_else, loc));
     } else {
-         out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}\n", cond_val, label_then, label_merge));
+         out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}{}\n", cond_val, label_then, label_merge, loc));
     }
 
     let state_before = ctx.consumed_vars().clone();
@@ -2366,7 +2383,8 @@ pub fn emit_match(
                 cond
             };
             
-            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}\n", final_cond, arm_label, next_check));
+            let loc = ctx.loc_tag(match_expr.scrutinee.span());
+            out.push_str(&format!("    cf.cond_br {}, ^{}, ^{}{}\n", final_cond, arm_label, next_check, loc));
         }
         
         if i + 1 < match_expr.arms.len() && !is_wildcard {
@@ -2840,7 +2858,7 @@ pub fn emit_cleanup_for_return(ctx: &mut LoweringContext, out: &mut String, loca
                             concrete_tys: vec![],
                             self_ty: Some(ty.clone()),
                             imports: func_imports,
-                            type_map: std::collections::HashMap::new(),
+                            type_map: std::collections::BTreeMap::new(),
                         };
                         ctx.entity_registry_mut().request_specialization(task.clone());
                         ctx.pending_generations_mut().push_back(task);

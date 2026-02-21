@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::codegen::context::CodegenContext;
 use crate::types::{Type, TypeKey};
 use crate::grammar::{SaltFn, ImportDecl};
@@ -14,7 +14,7 @@ pub struct MonomorphizationTask {
     pub concrete_tys: Vec<Type>,
     pub self_ty: Option<Type>,
     pub imports: Vec<ImportDecl>,
-    pub type_map: HashMap<String, Type>, // For RAII guard
+    pub type_map: BTreeMap<String, Type>, // For RAII guard — BTreeMap enforces deterministic iteration
 }
 
 /// A specialized function definition ready for emission.

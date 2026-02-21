@@ -40,6 +40,17 @@ pub fn print(msg: &u8) {
     }
 }
 
+// Print exactly `len` bytes from memory address `ptr` to serial.
+// Used by sys_write to output user-provided buffers.
+pub fn print_buf(ptr: u64, len: u64) {
+    let mut i: u64 = 0;
+    while i < len {
+        let byte = *((ptr + i) as &u8);
+        write_char(byte);
+        i = i + 1;
+    }
+}
+
 pub fn print_u64(n: u64) {
     if n == 0 {
         write_char(0x30); // '0'

@@ -31,11 +31,13 @@ COMPILE_ONLY=false
 VERBOSE=false
 EXTRA_BRIDGES=()
 SALT_FILE=""
+LIB_MODE=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --compile-only) COMPILE_ONLY=true; shift ;;
+        --lib) LIB_MODE=true; shift ;;
         --verbose) VERBOSE=true; shift ;;
         --bridge) EXTRA_BRIDGES+=("$2"); shift 2 ;;
         *) SALT_FILE="$1"; shift ;;
@@ -61,7 +63,7 @@ BIN_OUT="$TMP_DIR/${BASENAME}"
 BRIDGES=("$SALT_FRONT/runtime.c")
 
 # Auto-detect bridges needed based on imports in the salt file
-if grep -q 'std\.net\|std\.http\|TcpListener\|TcpStream\|Poller\|http_tcp_connect\|salt_http_get' "$SALT_FILE" 2>/dev/null; then
+if grep -q 'std\.net\|std\.http\|std\.io\.reactor\|TcpListener\|TcpStream\|Poller\|KqueueReactor\|http_tcp_connect\|salt_http_get' "$SALT_FILE" 2>/dev/null; then
     BRIDGES+=("$PROJECT_ROOT/std/net/http_bridge.c")
 fi
 
@@ -87,7 +89,11 @@ log() { [[ "$VERBOSE" == true ]] && echo "  → $1" || true; }
 
 # Step 1: salt-front → MLIR
 log "salt-front → MLIR"
-"$SALT_FRONT/target/debug/salt-front" "$SALT_FILE" > "$MLIR_OUT"
+if [[ "$LIB_MODE" == true ]]; then
+    "$SALT_FRONT/target/debug/salt-front" "$SALT_FILE" --lib > "$MLIR_OUT"
+else
+    "$SALT_FRONT/target/debug/salt-front" "$SALT_FILE" > "$MLIR_OUT"
+fi
 echo "  ✓ MLIR generated"
 
 # Step 2: mlir-opt (lowering passes)
@@ -97,6 +103,7 @@ mlir-opt "$MLIR_OUT" \
     --convert-scf-to-cf \
     --convert-cf-to-llvm \
     --convert-arith-to-llvm \
+    --convert-math-to-llvm \
     --convert-func-to-llvm \
     --reconcile-unrealized-casts \
     -o "$OPT_OUT"

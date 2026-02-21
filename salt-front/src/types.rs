@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use crate::grammar::SynType;
 use crate::registry::StructInfo;
@@ -117,7 +117,14 @@ impl Type {
              }
              SynType::Path(tp) => {
                  let seg = tp.segments.last()?;
-                 let name = seg.ident.to_string();
+                 // [CROSS-MODULE STRUCT] When there are multiple segments (e.g. [addr, PhysAddr]),
+                 // join them with "::" to create a qualified name. Single-segment paths are bare names.
+                 // The codegen resolve_type_safe and bridge_resolve_package_prefix handle "::" paths.
+                 let name = if tp.segments.len() > 1 {
+                     tp.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
+                 } else {
+                     seg.ident.to_string()
+                 };
                  let params: Vec<Type> = seg.args.iter().filter_map(|arg| Type::from_syn_with_generics(arg, generic_names)).collect();
 
                  match name.as_str() {
@@ -335,7 +342,7 @@ impl Type {
         s.split("__").last().unwrap_or(s).to_string()
     }
 
-    pub fn substitute(&self, mapping: &HashMap<String, Type>) -> Type {
+    pub fn substitute(&self, mapping: &BTreeMap<String, Type>) -> Type {
         match self {
             Type::Generic(name) => mapping.get(name).cloned().unwrap_or(self.clone()),
             Type::SelfType => mapping.get("Self").cloned().unwrap_or(self.clone()),
@@ -630,7 +637,7 @@ impl Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // -------------------------------------------------------------------------
     // Test: has_generics() — Struct is NOT a generic placeholder
@@ -707,7 +714,7 @@ mod tests {
     #[test]
     fn test_substitute_struct_k_to_i64() {
         let ty = Type::Struct("K".to_string());
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("K".to_string(), Type::I64);
         
         let result = ty.substitute(&map);
@@ -721,7 +728,7 @@ mod tests {
             "HashMap".to_string(),
             vec![Type::Struct("K".to_string()), Type::Struct("V".to_string())]
         );
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("K".to_string(), Type::I64);
         map.insert("V".to_string(), Type::I64);
         
@@ -737,7 +744,7 @@ mod tests {
     fn test_substitute_no_infinite_recursion() {
         // When map has K -> Struct("K"), substitution should NOT loop infinitely
         let ty = Type::Struct("K".to_string());
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("K".to_string(), Type::Struct("K".to_string())); // Self-referential
         
         // This should NOT panic or hang - it should return Struct("K") unchanged
@@ -748,7 +755,7 @@ mod tests {
     #[test]
     fn test_substitute_reference_with_placeholder() {
         let ty = Type::Reference(Box::new(Type::Struct("K".to_string())), false);
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("K".to_string(), Type::I64);
         
         let result = ty.substitute(&map);
@@ -880,7 +887,7 @@ mod tests {
     fn test_substitute_generic_f2_to_fn_type() {
         // Type::Generic("F2") should substitute correctly
         let ty = Type::Generic("F2".to_string());
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("F2".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::Bool)));
 
         let result = ty.substitute(&map);
@@ -914,7 +921,7 @@ mod tests {
                 Type::Generic("Item".to_string()),
             ]
         );
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), Type::Struct("Range".to_string()));
         map.insert("F2".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::I64)));
         map.insert("Item".to_string(), Type::I64);
@@ -928,5 +935,130 @@ mod tests {
                 Type::I64,
             ]
         ), "All multi-char generics should be substituted");
+    }
+
+    // -------------------------------------------------------------------------
+    // REGRESSION TEST: Struct-level generics must survive in type_map
+    // Bug: Range::fold<A,F> gets type_map={"A":I64,"F":Fn} but MISSING "T":I64
+    // This causes Range__T to escape into MLIR emission.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_substitute_struct_generic_missing_from_type_map() {
+        // Simulates the bug: Range<T> has a method fold<A,F>.
+        // If the type_map only contains method-level generics (A, F) but not
+        // the struct-level generic (T), then Struct("T") will NOT be substituted
+        // and the emitted type will be Range__T instead of Range__i64.
+        let range_with_t = Type::Concrete(
+            "Range".to_string(),
+            vec![Type::Struct("T".to_string())]  // T is unresolved
+        );
+
+        // BAD type_map: only has method-level generics
+        let mut bad_map = BTreeMap::new();
+        bad_map.insert("A".to_string(), Type::I64);
+        bad_map.insert("F".to_string(), Type::Fn(vec![Type::I64, Type::I64], Box::new(Type::I64)));
+
+        let bad_result = range_with_t.substitute(&bad_map);
+        // T is NOT in the map, so Range<T> stays as Range<Struct("T")> — BUG!
+        assert_eq!(
+            bad_result,
+            Type::Concrete("Range".to_string(), vec![Type::Struct("T".to_string())]),
+            "Without T in type_map, T should remain unsubstituted (this is the bug scenario)"
+        );
+
+        // GOOD type_map: includes both struct-level AND method-level generics
+        let mut good_map = BTreeMap::new();
+        good_map.insert("T".to_string(), Type::I64);  // struct-level
+        good_map.insert("A".to_string(), Type::I64);  // method-level
+        good_map.insert("F".to_string(), Type::Fn(vec![Type::I64, Type::I64], Box::new(Type::I64)));
+
+        let good_result = range_with_t.substitute(&good_map);
+        // T IS in the map, so Range<T> becomes Range<I64> — CORRECT!
+        assert_eq!(
+            good_result,
+            Type::Concrete("Range".to_string(), vec![Type::I64]),
+            "With T in type_map, Range<T> must resolve to Range<I64>"
+        );
+    }
+
+    #[test]
+    fn test_substitute_nested_struct_generic_escape() {
+        // Simulates the chain: Filter<Map<Range<T>, F>, F2>
+        // All generics (T, F, F2) must be in the type_map for full resolution
+        let nested = Type::Concrete(
+            "Filter".to_string(),
+            vec![
+                Type::Concrete("Map".to_string(), vec![
+                    Type::Concrete("Range".to_string(), vec![Type::Struct("T".to_string())]),
+                    Type::Struct("F".to_string()),
+                ]),
+                Type::Struct("F2".to_string()),
+            ]
+        );
+
+        let mut complete_map = BTreeMap::new();
+        complete_map.insert("T".to_string(), Type::I64);
+        complete_map.insert("F".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::I64)));
+        complete_map.insert("F2".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::Bool)));
+
+        let result = nested.substitute(&complete_map);
+        assert_eq!(
+            result,
+            Type::Concrete("Filter".to_string(), vec![
+                Type::Concrete("Map".to_string(), vec![
+                    Type::Concrete("Range".to_string(), vec![Type::I64]),
+                    Type::Fn(vec![Type::I64], Box::new(Type::I64)),
+                ]),
+                Type::Fn(vec![Type::I64], Box::new(Type::Bool)),
+            ]),
+            "All nested generics must be fully resolved in combinator chains"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // REGRESSION TEST: Double-wrapped Reference base type extraction
+    // Bug: Reference(Reference(Concrete("Range", []), true), false) failed to
+    // extract the base type name, causing non-deterministic method resolution.
+    // The fix: recursively peel Reference wrappers in extract_receiver_prefix.
+    // This test validates the Type-level behavior that the fix depends on.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_double_wrapped_reference_base_name() {
+        // This mimics what happens inside a hydrated method body:
+        // `self` is `&mut Range` → Reference(Concrete("Range", []), true)
+        // When referenced again → Reference(Reference(Concrete("Range", []), true), false)
+        let single_ref = Type::Reference(
+            Box::new(Type::Concrete("std__core__iter__Range".to_string(), vec![])),
+            true
+        );
+        let double_ref = Type::Reference(
+            Box::new(single_ref.clone()),
+            false
+        );
+        let triple_ref = Type::Reference(
+            Box::new(double_ref.clone()),
+            false
+        );
+
+        // Helper that mimics extract_receiver_prefix logic
+        fn peel_to_base(ty: &Type) -> Option<String> {
+            match ty {
+                Type::Concrete(name, _) => Some(name.clone()),
+                Type::Struct(name) => Some(name.clone()),
+                Type::Reference(inner, _) => peel_to_base(inner),
+                _ => None,
+            }
+        }
+
+        // All depths must produce the same base name
+        let base = Type::Concrete("std__core__iter__Range".to_string(), vec![]);
+        assert_eq!(peel_to_base(&base), Some("std__core__iter__Range".to_string()),
+            "Bare Concrete must extract base name");
+        assert_eq!(peel_to_base(&single_ref), Some("std__core__iter__Range".to_string()),
+            "Single Reference must extract base name");
+        assert_eq!(peel_to_base(&double_ref), Some("std__core__iter__Range".to_string()),
+            "Double Reference must extract base name (this was the bug)");
+        assert_eq!(peel_to_base(&triple_ref), Some("std__core__iter__Range".to_string()),
+            "Triple Reference must also extract base name");
     }
 }

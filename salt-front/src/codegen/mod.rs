@@ -18,6 +18,7 @@ pub mod interleaved_gen;  // V2.0 FFB: Fused Forward-Backward codegen
 pub mod passes;           // V2.0 Sovereign: Pulse injection, yield injection, sync verification
 pub mod generic_resolver; // Consolidated generic type resolution
 pub mod shader;           // [FACET L1] Metal Shading Language codegen for @shader functions
+pub mod emit_hir;         // [PHASE 11] HIR-to-MLIR emitter for async lowering Items
 #[cfg(test)]
 mod tests_ptr_and_comparison;
 #[cfg(test)]
@@ -54,6 +55,8 @@ mod tests_fast_math_reduction;
 #[cfg(test)]
 mod tests_spill_elimination;
 #[cfg(test)]
+mod tests_cross_module_struct;
+#[cfg(test)]
 mod tests_kernel_halt;
 #[cfg(test)]
 mod tests_datalayout;
@@ -70,7 +73,7 @@ use crate::common::mangling::Mangler;
 use crate::types::Type;
 use crate::registry::Registry;
 use std::collections::{HashMap, HashSet};
-    pub fn emit_mlir(file: &SaltFile, release_mode: bool, _registry: Option<&Registry>, _skip_scan: bool, no_verify: bool, disable_alias_scopes: bool, lib_mode: bool) -> Result<String, String> {
+    pub fn emit_mlir(file: &SaltFile, release_mode: bool, _registry: Option<&Registry>, _skip_scan: bool, no_verify: bool, disable_alias_scopes: bool, lib_mode: bool, debug_info: bool, source_file: &str) -> Result<String, String> {
     // 1. Recursive Module Loading
     let mut loader_registry = Registry::new();
     let mut loader = ModuleLoader::new(vec![
@@ -97,6 +100,8 @@ use std::collections::{HashMap, HashSet};
     ctx.emit_alias_scopes = !disable_alias_scopes;
     ctx.no_verify = no_verify;
     ctx.lib_mode = lib_mode;
+    ctx.debug_info = debug_info;
+    ctx.source_file = source_file.to_string();
     ctx.register_builtins();
     
     // 0. Pre-Scanning & Registration Phase (Multi-module awareness)
@@ -206,6 +211,56 @@ use std::collections::{HashMap, HashSet};
             }
         }
     }
+
+    // =========================================================================
+    // [PHASE 11] State Machine Lowering
+    // Convert @yielding functions into fully expanded state machines via HIR.
+    // =========================================================================
+    {
+        use crate::grammar::Item;
+        use crate::hir::lower::LoweringContext;
+        use crate::hir::async_lower::{lower_async_fn_cfg, VarInfo};
+
+        for item in &file.items {
+            if let Item::Fn(func) = item {
+                let name = func.name.to_string();
+                
+                // Only process functions that need transformation
+                if let Some(liveness) = ctx.get_liveness(&name) {
+                    if liveness.needs_transform {
+                        // 1. Lower AST -> HIR
+                        let mut lctx = LoweringContext::new();
+                        if let Some(crate::hir::items::Item { kind: crate::hir::items::ItemKind::Fn(hir_func), .. }) = lctx.lower_item(item) {
+                            
+                            // 2. Extract crossing variables
+                            let mut crossing_var_infos = Vec::new();
+                            for frame_member in &liveness.frame_members {
+                                if let Some(&var_id) = lctx.var_name_map.get(&frame_member.name) {
+                                    crossing_var_infos.push(VarInfo {
+                                        var_id,
+                                        name: frame_member.name.clone(),
+                                        ty: crate::hir::types::Type::I64, // Matches LivenessResult default
+                                    });
+                                }
+                            }
+
+                            // 3. Lower to state machine
+                            let next_var_id = (lctx.var_name_map.len() + 100) as u32;
+                            let lowered_items = lower_async_fn_cfg(
+                                &name,
+                                &hir_func,
+                                &crossing_var_infos,
+                                next_var_id,
+                            );
+
+                            // 4. Register for bypass gate
+                            ctx.register_hir_async(&name, lowered_items);
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     // =========================================================================
     // UNIFIED DRIVER: DEMAND DRIVEN EXECUTION
@@ -270,6 +325,28 @@ impl<'a> CodegenContext<'a> {
 
         let mut out = String::new();
         out.push_str(&structure_defs);
+
+        // [P1 DWARF] Emit debug info attribute aliases when -g is active
+        if self.debug_info && !self.source_file.is_empty() {
+            let source_path = std::path::Path::new(&self.source_file);
+            let filename = source_path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.source_file.clone());
+            let directory = source_path.parent()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            out.push_str(&format!(
+                "#di_file = #llvm.di_file<\"{}\" in \"{}\">\n",
+                filename, directory
+            ));
+            out.push_str(
+                "#di_compile_unit = #llvm.di_compile_unit<id = distinct[100]<>, sourceLanguage = DW_LANG_C, file = #di_file, producer = \"Salt Compiler\", isOptimized = true, emissionKind = Full>\n"
+            );
+            out.push_str(
+                "#di_subroutine_type = #llvm.di_subroutine_type<>\n"
+            );
+        }
+
         out.push_str("module attributes {llvm.data_layout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\", llvm.target_triple = \"x86_64-unknown-none-elf\"} {\n");
         
         // Standard Declarations (Structs, Enums, Globals - captured in decl_out during scan/emit)
@@ -422,7 +499,7 @@ impl<'a> CodegenContext<'a> {
                         concrete_tys: vec![],
                         self_ty: None,
                         imports: self.file.borrow().imports.clone(),
-                        type_map: HashMap::new(),
+                        type_map: std::collections::BTreeMap::new(),
                     });
                 }
             }
@@ -788,6 +865,13 @@ fn emit_async_fn(
 }
 
 pub fn emit_fn(ctx: &CodegenContext, func: &SaltFn, override_name: Option<String>) -> Result<String, String> {
+    // [PHASE 11] HIR Async Gate: bypass AST codegen for fully lowered state machines.
+    // If lower_async_fn_cfg has already produced HIR items for this function,
+    // delegate directly to emit_hir_items — no AST visitor needed.
+    if let Some(hir_items) = ctx.get_hir_async_items(&func.name.to_string()) {
+        return crate::codegen::emit_hir::emit_hir_items(&hir_items);
+    }
+
     // [SOVEREIGN V2.0] Async Gate: @yielding/@pulse functions emit state machines
     if let Some(liveness) = ctx.get_liveness(&func.name.to_string()) {
         return emit_async_fn(ctx, func, &liveness);
@@ -979,6 +1063,24 @@ pub fn emit_fn(ctx: &CodegenContext, func: &SaltFn, override_name: Option<String
         "".to_string()
     };
     
+    let loc_annotation = if ctx.debug_info && !ctx.source_file.is_empty() {
+        // MLIR fused loc with di_subprogram: gives LLVM the compile_unit -> subprogram
+        // hierarchy needed for DWARF DW_TAG_subprogram entries.
+        let span = func.name.span();
+        let line = span.start().line;
+        let col = span.start().column;
+        let fn_display_name = fn_name.trim_start_matches('"').trim_end_matches('"');
+        format!(
+            " loc(fused<#llvm.di_subprogram<compileUnit = #di_compile_unit, \
+             scope = #di_file, name = \"{}\", file = #di_file, line = {}, \
+             scopeLine = {}, subprogramFlags = \"Definition\", \
+             type = #di_subroutine_type>>[\"{}\": {} : {}])",
+            fn_display_name, line, line, ctx.source_file, line, col
+        )
+    } else {
+        String::new()
+    };
+
     let mut out = format!("  func.func {} @{}({}){}{} {{\n", visibility_keyword, fn_name, args_code.join(", "), ret_part, fn_attrs);
     out.push_str("    %c0 = arith.constant 0 : i32\n");
     out.push_str("    %c1_i64 = arith.constant 1 : i64\n");
@@ -1151,7 +1253,7 @@ pub fn emit_fn(ctx: &CodegenContext, func: &SaltFn, override_name: Option<String
         ctx.emission.borrow_mut().global_lvn.clear_current_function();
     }
     
-    out.push_str("  }\n\n");
+    out.push_str(&format!("  }}{}\n\n", loc_annotation));
     ctx.pop_solver();
     Ok(out)
 }
@@ -1519,7 +1621,10 @@ fn resolve_type_safe(ctx: &CodegenContext, ty: &crate::grammar::SynType) -> Type
                      panic!("Use of 'Self' outside of an implementation block");
                  }
                  
-                 let segments = vec![name.clone()];
+                 // [CROSS-MODULE STRUCT] Split qualified names like "addr::PhysAddr" into
+                 // segments ["addr", "PhysAddr"] so bridge_resolve_package_prefix can match
+                 // the module alias against the import table.
+                 let segments: Vec<String> = name.split("::").map(|s| s.to_string()).collect();
                  // RESOLVE TO FQN
                  let resolved_name = if let Some((pkg, item)) = ctx.bridge_resolve_package_prefix(&segments) {
                      let r = if item.is_empty() { pkg } else if pkg.is_empty() { item } else { Mangler::mangle(&[&pkg, &item]) };
@@ -1563,7 +1668,8 @@ fn resolve_type_safe(ctx: &CodegenContext, ty: &crate::grammar::SynType) -> Type
                 }
             }
             Type::Concrete(base, params) => {
-                 let segments = vec![base.clone()];
+                 // [CROSS-MODULE STRUCT] Split qualified names like "addr::PhysAddr" into segments
+                 let segments: Vec<String> = base.split("::").map(|s| s.to_string()).collect();
                  let resolved_base = if let Some((pkg, item)) = ctx.bridge_resolve_package_prefix(&segments) {
                      if item.is_empty() { pkg } else { format!("{}__{}", pkg, item) }
                  } else {

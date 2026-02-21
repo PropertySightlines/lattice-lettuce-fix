@@ -4,7 +4,8 @@ use crate::types::Type;
 use crate::codegen::context::{LoweringContext, LocalKind};
 use self::utils::*;
 use crate::codegen::type_bridge::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use syn::spanned::Spanned;
 use crate::common::mangling::Mangler;
 pub mod aggregate_eq;
 pub mod while_loop;
@@ -231,6 +232,13 @@ pub fn emit_expr(ctx: &mut LoweringContext, out: &mut String, expr: &syn::Expr, 
                 }
 
                 let mut val = val_raw;
+                if ty == Type::Unit {
+                    // [ESCAPE ANALYSIS V5.1] Still emit cleanup before returning
+                    ctx.transfer_ownership(&val)?;
+                    crate::codegen::stmt::emit_cleanup_for_return(ctx, out, local_vars)?;
+                    out.push_str("    func.return\n");
+                    return Ok(("%unreachable".to_string(), Type::Never));
+                }
                 if let Some(expected) = &expected_ret {
                     val = crate::codegen::type_bridge::promote_numeric(ctx, out, &val, &ty, expected)?;
                 }
@@ -245,12 +253,14 @@ pub fn emit_expr(ctx: &mut LoweringContext, out: &mut String, expr: &syn::Expr, 
                 ctx.transfer_ownership(&val)?;
                 crate::codegen::stmt::emit_cleanup_for_return(ctx, out, local_vars)?;
                 
-                out.push_str(&format!("    func.return {} : {}\n", val, mlir_ty));
+                let loc = ctx.loc_tag(r.span());
+                out.push_str(&format!("    func.return {} : {}{}\n", val, mlir_ty, loc));
             } else {
                 // [V1.1] RAII-Lite: Emit cleanup before void return
                 crate::codegen::stmt::emit_cleanup_for_return(ctx, out, local_vars)?;
                 
-                out.push_str("    func.return\n");
+                let loc = ctx.loc_tag(r.span());
+                out.push_str(&format!("    func.return{}\n", loc));
             }
             Ok(("%unreachable".to_string(), Type::Never))
         }
@@ -290,7 +300,8 @@ pub fn emit_expr(ctx: &mut LoweringContext, out: &mut String, expr: &syn::Expr, 
                 
                 if fn_result_mlir == result_mlir {
                     // Same Result type — return directly (fast path)
-                    out.push_str(&format!("    func.return {} : {}\n", val, result_mlir));
+                    let loc = ctx.loc_tag(t.span());
+                    out.push_str(&format!("    func.return {} : {}{}\n", val, result_mlir, loc));
                 } else {
                     // Different Result types (e.g., Result<File> vs Result<i64>)
                     // Extract Status from callee's Err, re-wrap into function's Result type
@@ -339,7 +350,8 @@ pub fn emit_expr(ctx: &mut LoweringContext, out: &mut String, expr: &syn::Expr, 
                     out.push_str(&format!("    {} = llvm.load {} : !llvm.ptr -> {}\n", wrap_loaded, wrap_buf, fn_raw_ty));
                     let final_result = format!("%try_ewrap_final_{}", ctx.next_id());
                     out.push_str(&format!("    {} = llvm.insertvalue {}, {}[1] : {}\n", final_result, wrap_loaded, with_disc, fn_result_mlir));
-                    out.push_str(&format!("    func.return {} : {}\n", final_result, fn_result_mlir));
+                    let loc = ctx.loc_tag(t.span());
+                    out.push_str(&format!("    func.return {} : {}{}\n", final_result, fn_result_mlir, loc));
                 }
                 
                 // Ok path: extract the Ok payload (index 1) with type-punning
@@ -1466,7 +1478,7 @@ pub fn translate_bool_to_z3<'a, 'ctx>(
 /// Structural unification for bidirectional type inference.
 /// Walks two types in parallel, extracting bindings for generic placeholders.
 /// Handles both Type::Generic("T") and Type::Struct("T") (single-char uppercase names).
-pub(crate) fn unify_types_recursive(template: &Type, concrete: &Type, map: &mut std::collections::HashMap<String, Type>) {
+pub(crate) fn unify_types_recursive(template: &Type, concrete: &Type, map: &mut std::collections::BTreeMap<String, Type>) {
     match (template, concrete) {
         // Type::Generic("T") — explicit generic marker
         (Type::Generic(name), _) => {
@@ -1506,7 +1518,7 @@ pub(crate) fn unify_types_recursive(template: &Type, concrete: &Type, map: &mut 
 /// the output type of a function generic.
 pub fn infer_phantom_generics(
     declared_generics: &[String],
-    map: &mut HashMap<String, Type>,
+    map: &mut BTreeMap<String, Type>,
 ) {
     let unresolved: Vec<String> = declared_generics.iter()
         .filter(|g| !map.contains_key(*g))
@@ -1538,10 +1550,10 @@ pub(crate) fn infer_generics(
     args: &[Type],   
     generics: &crate::grammar::Generics
 ) -> Vec<Type> {
-    let mut mapping: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
+    let mut mapping: std::collections::BTreeMap<String, Type> = std::collections::BTreeMap::new();
     
     // Helper to unify types recursively
-    fn unify(p: &Type, a: &Type, map: &mut std::collections::HashMap<String, Type>) {
+    fn unify(p: &Type, a: &Type, map: &mut std::collections::BTreeMap<String, Type>) {
         match (p, a) {
             (Type::Generic(name), _) => {
                 if !map.contains_key(name) {

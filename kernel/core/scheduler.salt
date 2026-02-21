@@ -4,27 +4,46 @@ import kernel.core.pmm
 import kernel.sched.affinity
 import std.test
 import kernel.drivers.serial
+import kernel.core.pulse
 
 // Cross-module extern declarations (avoids linker error during standalone compilation)
 extern fn ctz_u64(x: u64) -> u64;
 extern fn stack_init(stack_top: u64, entry: u64) -> u64;
 
-// Kernel Scheduler - O(1) Multi-Level Bitmap
+// Slab allocator — lock-free Treiber stack (kernel/mem/slab.salt)
+extern fn pop_stack() -> u64;
+extern fn push_stack(ptr: u64);
+
+// =============================================================================
+// Kernel Scheduler — O(1) Multi-Level Bitmap with Stack Reclamation
+// =============================================================================
 //
 // Uses a 2-level bitmap to find the next runnable fiber in O(1) via hardware
 // TZCNT instruction (llvm.intr.cttz). Supports up to 1024 fibers.
 //
 // L1 summary: 1 bit per group of 64 fibers (16 groups for 1024 fibers)
 // L2 details: 1 bit per fiber within each group
+//
+// Stack Lifecycle:
+//   spawn()      → pop_stack()   (allocate 16KB slab slot)
+//   fiber_exit() → push_stack()  (reclaim 16KB slab slot, deferred)
+//
+// Deferred Reclamation Protocol:
+//   fiber_exit() cannot call push_stack() while still executing on the dying
+//   fiber's stack. Instead, it stores the stack base in PENDING_RECLAIM and
+//   yields. The NEXT fiber to resume from sched_yield() performs the actual
+//   push_stack() call, safely executing on its own stack.
+// =============================================================================
 
 const MAX_FIBERS: u64 = 1024;
-const STACK_SIZE: u64 = 4096;
+const SLAB_SLOT_SIZE: u64 = 16384; // mm_layout.SLAB_SLOT_SIZE
 const L2_GROUPS: u64 = 16;
 const ALL_ONES: u64 = 0xFFFFFFFFFFFFFFFF;
 
 pub struct Fiber {
     pub id: u64,
     pub stack_ptr: u64,
+    pub stack_base: u64,
     pub active: bool,
 }
 
@@ -39,7 +58,7 @@ pub struct SchedulerState {
 }
 
 global GLOBAL_SCHED: SchedulerState = SchedulerState {
-    fibers: [Fiber { id: 0, stack_ptr: 0, active: false }; 1024],
+    fibers: [Fiber { id: 0, stack_ptr: 0, stack_base: 0, active: false }; 1024],
     current: 0,
     count: 0,
     next_id: 1,
@@ -48,12 +67,24 @@ global GLOBAL_SCHED: SchedulerState = SchedulerState {
     l2_details: [0 as u64; 16]
 };
 
+// Deferred reclamation: stack base address of the most recently dead fiber.
+// Zeroed after reclamation. Only one fiber can die per sched_yield cycle
+// in single-core mode, so a single slot suffices.
+global PENDING_RECLAIM: u64 = 0;
+
 
 extern fn switch_stacks(old_sp_ptr: *mut u64, new_sp: u64);
 
 @no_mangle
 pub fn timer_isr() {
     region("sched_tick") {
+        // Increment monotonic tick counter
+        pulse.tick();
+
+        // Enqueue a structured PulseEvent for the dispatcher
+        pulse.push(pulse.PULSE_TIMER, pulse.get_tick());
+
+        // Set yield flag for preemptive scheduling
         GLOBAL_SCHED.yield_pending = true;
     }
 }
@@ -62,6 +93,7 @@ pub fn init() {
     region("sched_init") {
        GLOBAL_SCHED.fibers[0].active = true;
        GLOBAL_SCHED.fibers[0].id = 0;
+       GLOBAL_SCHED.fibers[0].stack_base = 0;
        GLOBAL_SCHED.current = 0;
        GLOBAL_SCHED.yield_pending = false;
 
@@ -147,14 +179,11 @@ pub fn spawn(entry_addr: u64) -> u64 {
             GLOBAL_SCHED.fibers[slot].id = GLOBAL_SCHED.next_id;
             GLOBAL_SCHED.fibers[slot].active = true;
             
-            // Setup Initial Stack for 64-bit Long Mode
-            // Base at 60MB to stay within mapped 64MB region
-            // Each fiber gets 4KB stack, total: 1024 * 4KB = 4MB
-            let base_high: u64 = 0xFFFFFFFF;
-            let base_low: u64 = 0x83C00000;
-            let stack_base = (base_high << 32) | base_low;
-            let stack_top = stack_base - (slot as u64 * 0x1000);
-            
+            // Allocate a 16KB stack from the slab allocator
+            let stack_base = pop_stack();
+            let stack_top = stack_base + SLAB_SLOT_SIZE;
+
+            GLOBAL_SCHED.fibers[slot].stack_base = stack_base;
             GLOBAL_SCHED.fibers[slot].stack_ptr = stack_init(stack_top, entry_addr);
             
             GLOBAL_SCHED.next_id = GLOBAL_SCHED.next_id + 1;
@@ -179,6 +208,106 @@ pub fn start() {
     }
 }
 
+// =============================================================================
+// fiber_exit — Clean Fiber Termination with Deferred Stack Reclamation
+// =============================================================================
+// Called by a fiber when it has completed its work. Must be called explicitly
+// by the fiber (or via a trampoline on the initial stack frame).
+//
+// Protocol:
+//   1. Read the current fiber's slot and slab base address.
+//   2. Store the slab base in PENDING_RECLAIM for deferred push_stack().
+//   3. Mark the fiber inactive, clear the bitmap, decrement count.
+//   4. Yield — the scheduler will never select this fiber again.
+//   5. The NEXT fiber to resume from sched_yield performs the push_stack.
+//
+// This function never returns.
+// =============================================================================
+@no_yield
+@no_mangle
+pub fn fiber_exit() {
+    region("fiber_exit") {
+        let slot = GLOBAL_SCHED.current;
+        let stack_base = GLOBAL_SCHED.fibers[slot].stack_base;
+
+        // Flush any previously-pending reclamation BEFORE overwriting.
+        // This prevents stack leaks when fibers exit back-to-back —
+        // e.g., during ROF-1K drain where 1000 fibers exit consecutively.
+        // Safe: we are still on OUR stack (not the pending one).
+        if PENDING_RECLAIM != 0 {
+            push_stack(PENDING_RECLAIM);
+            PENDING_RECLAIM = 0;
+        }
+
+        // Stage OUR stack for deferred reclamation.
+        // push_stack cannot be called for our own stack — we are still on it.
+        PENDING_RECLAIM = stack_base;
+
+        // Tear down the fiber from the scheduler
+        GLOBAL_SCHED.fibers[slot].active = false;
+        GLOBAL_SCHED.fibers[slot].stack_ptr = 0;
+        GLOBAL_SCHED.fibers[slot].stack_base = 0;
+        bitmap_clear(slot);
+        GLOBAL_SCHED.count = GLOBAL_SCHED.count - 1;
+
+        // Find the next runnable fiber via bitmap (inline, not via sched_yield
+        // to avoid a compiler forward-reference issue in transitive compilation).
+        let current_group = slot / 64;
+        let current_bit = slot % 64;
+        let mut next: u64 = slot;
+
+        let l2_cur = GLOBAL_SCHED.l2_details[current_group];
+        let l1 = GLOBAL_SCHED.l1_summary;
+
+        let above = l2_cur & mask_above_bit(current_bit);
+        if above != 0 {
+            next = current_group * 64 + ctz_u64(above);
+        } else {
+            let l1_above = l1 & mask_above_bit(current_group);
+            if l1_above != 0 {
+                let grp = ctz_u64(l1_above);
+                let l2_grp = GLOBAL_SCHED.l2_details[grp];
+                next = grp * 64 + ctz_u64(l2_grp);
+            } else {
+                let l1_below = l1 & mask_below_bit(current_group);
+                if l1_below != 0 {
+                    let grp = ctz_u64(l1_below);
+                    let l2_grp = GLOBAL_SCHED.l2_details[grp];
+                    next = grp * 64 + ctz_u64(l2_grp);
+                } else {
+                    let below = l2_cur & mask_below_bit(current_bit);
+                    if below != 0 {
+                        next = current_group * 64 + ctz_u64(below);
+                    }
+                }
+            }
+        }
+
+        if next != slot {
+            GLOBAL_SCHED.current = next;
+            let old = &GLOBAL_SCHED.fibers[slot].stack_ptr;
+            let new_sp = GLOBAL_SCHED.fibers[next].stack_ptr;
+            switch_stacks(old, new_sp);
+
+            // Deferred reclamation after resuming on the live fiber's stack
+            if PENDING_RECLAIM != 0 {
+                push_stack(PENDING_RECLAIM);
+                PENDING_RECLAIM = 0;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// fiber_count — Active Fiber Count (diagnostic)
+// =============================================================================
+// Returns the number of live fibers. Used by slab_reclaim_bench to detect
+// when all ephemeral fibers have completed.
+// =============================================================================
+@no_mangle
+pub fn fiber_count() -> u64 {
+    return GLOBAL_SCHED.count;
+}
 
 @no_yield
 @no_mangle
@@ -238,10 +367,36 @@ pub fn sched_yield() {
             let new_sp = GLOBAL_SCHED.fibers[next].stack_ptr;
 
             switch_stacks(old, new_sp);
+
+            // =========================================================
+            // DEFERRED RECLAMATION
+            // =========================================================
+            // We have just resumed on a LIVE fiber's stack (after being
+            // switched TO by another fiber's sched_yield). If a fiber
+            // died before this switch, PENDING_RECLAIM holds its stack
+            // base. We can now safely return it to the slab because we
+            // are executing on OUR stack, not the dead fiber's.
+            // =========================================================
+            if PENDING_RECLAIM != 0 {
+                push_stack(PENDING_RECLAIM);
+                PENDING_RECLAIM = 0;
+            }
         }
     }
 }
 
 pub fn get_id() -> u64 {
     return GLOBAL_SCHED.fibers[GLOBAL_SCHED.current].id;
+}
+
+pub fn yield_now() {
+    sched_yield();
+}
+
+pub fn get_fiber_count() -> u64 {
+    return fiber_count();
+}
+
+pub fn exit_fiber() {
+    fiber_exit();
 }

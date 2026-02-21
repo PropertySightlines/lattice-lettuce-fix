@@ -2,7 +2,7 @@
 // Tests Ptr<T> operations in bounded contexts (loops, requires contracts).
 // Uses Arena for allocation — no raw malloc needed.
 
-package test.ptr_bounds
+package main
 
 use std.io.println
 use std.core.ptr.Ptr
@@ -27,7 +27,7 @@ fn fill_ptr(ptr: Ptr<i64>, len: i64, value: i64)
     }
 }
 
-fn main() {
+fn main() -> i32 {
     let arena = Arena::new(4096);
     let size: i64 = 8;
 
@@ -47,4 +47,6 @@ fn main() {
     fill_ptr(ptr, size, 42);
     let check: i64 = ptr.index(0);
     println(f"fill check = {check}");  // 42
+
+    return 0;
 }

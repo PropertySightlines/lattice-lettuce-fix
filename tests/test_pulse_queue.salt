@@ -1,0 +1,153 @@
+// =============================================================================
+// tests/test_pulse_queue.salt
+// TDD Tests: PulseEvent Ring Buffer Behavioral Contracts
+// =============================================================================
+//
+// These tests define the ideal behavior of the Pulse SPSC ring buffer.
+// They must all pass BEFORE we integrate the queue into the scheduler.
+//
+// Test coverage:
+//   1. Empty queue returns 0 on pop
+//   2. Push-pop round-trip preserves event data
+//   3. Queue overflow drops events (no panic)
+//   4. is_empty reflects state correctly
+//   5. Tick counter increments monotonically
+// =============================================================================
+
+package tests.test_pulse_queue
+
+import kernel.core.pulse
+
+// =============================================================================
+// Test 1: Empty queue pop returns 0
+// =============================================================================
+@no_mangle
+pub fn test_pulse_empty_pop() -> u64 {
+    // A fresh queue should have HEAD == TAIL
+    let mut data: u64 = 0xFFFF;
+    let mut timestamp: u64 = 0xFFFF;
+
+    let event_type = pulse.pop(&data, &timestamp);
+
+    if event_type != 0 {
+        return 1;  // FAIL: should return 0 for empty
+    }
+    return 0;  // PASS
+}
+
+// =============================================================================
+// Test 2: Push-pop round-trip preserves data
+// =============================================================================
+@no_mangle
+pub fn test_pulse_push_pop_roundtrip() -> u64 {
+    // Push a timer event
+    let result = pulse.push(pulse.PULSE_TIMER, 42);
+    if result != 1 {
+        return 1;  // FAIL: push should succeed
+    }
+
+    // Pop and verify
+    let mut data: u64 = 0;
+    let mut timestamp: u64 = 0;
+    let event_type = pulse.pop(&data, &timestamp);
+
+    if event_type != pulse.PULSE_TIMER {
+        return 2;  // FAIL: wrong event type
+    }
+    if data != 42 {
+        return 3;  // FAIL: data not preserved
+    }
+
+    // Queue should now be empty
+    if pulse.is_empty() == false {
+        return 4;  // FAIL: should be empty after pop
+    }
+
+    return 0;  // PASS
+}
+
+// =============================================================================
+// Test 3: Queue overflow drops events gracefully (no panic)
+// =============================================================================
+@no_mangle
+pub fn test_pulse_overflow_drops() -> u64 {
+    // Fill the queue to capacity (255 = RING_SIZE - 1)
+    let mut i: u64 = 0;
+    while i < 255 {
+        let result = pulse.push(pulse.PULSE_TIMER, i);
+        if result != 1 {
+            return 1;  // FAIL: push should succeed for first 255
+        }
+        i = i + 1;
+    }
+
+    // The 256th push should fail (queue full)
+    let overflow_result = pulse.push(pulse.PULSE_TIMER, 999);
+    if overflow_result != 0 {
+        return 2;  // FAIL: should return 0 on overflow
+    }
+
+    // Drop count should have incremented
+    if pulse.get_drop_count() == 0 {
+        return 3;  // FAIL: drop_count should be > 0
+    }
+
+    // Drain the queue to restore clean state
+    let mut data: u64 = 0;
+    let mut ts: u64 = 0;
+    while pulse.pop(&data, &ts) != 0 {
+        // draining
+    }
+
+    return 0;  // PASS
+}
+
+// =============================================================================
+// Test 4: is_empty reflects push/pop state transitions
+// =============================================================================
+@no_mangle
+pub fn test_pulse_is_empty() -> u64 {
+    // Initially empty (after drain in test 3)
+    if pulse.is_empty() == false {
+        return 1;  // FAIL: should be empty
+    }
+
+    // After push, not empty
+    pulse.push(pulse.PULSE_KEYBOARD, 0x1E);
+    if pulse.is_empty() == true {
+        return 2;  // FAIL: should not be empty
+    }
+
+    // After pop, empty again
+    let mut data: u64 = 0;
+    let mut ts: u64 = 0;
+    pulse.pop(&data, &ts);
+    if pulse.is_empty() == false {
+        return 3;  // FAIL: should be empty after pop
+    }
+
+    return 0;  // PASS
+}
+
+// =============================================================================
+// Test 5: Tick counter increments monotonically
+// =============================================================================
+@no_mangle
+pub fn test_pulse_tick_monotonic() -> u64 {
+    let before = pulse.get_tick();
+    pulse.tick();
+    let after = pulse.get_tick();
+
+    if after != before + 1 {
+        return 1;  // FAIL: tick should increment by 1
+    }
+
+    pulse.tick();
+    pulse.tick();
+    let after3 = pulse.get_tick();
+    if after3 != before + 3 {
+        return 2;  // FAIL: should be +3 from original
+    }
+
+    return 0;  // PASS
+}

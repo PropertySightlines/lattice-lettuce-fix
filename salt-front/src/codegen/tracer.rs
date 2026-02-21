@@ -1,19 +1,19 @@
 use crate::codegen::context::CodegenContext;
 use crate::types::{Type};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use syn::{Expr};
 
 pub trait TypeTracer {
-    fn trace_expr_type(&self, expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, String>;
+    fn trace_expr_type(&self, expr: &Expr, locals: &BTreeMap<String, Type>) -> Result<Type, String>;
     fn resolve_field_type(&self, receiver_ty: &Type, field_name: &str) -> Result<Type, String>;
     fn resolve_method_info(&self, receiver_ty: &Type, method_name: &str) -> Result<(crate::grammar::SaltFn, Option<Type>), String>;
-    fn substitute_generics(&self, ty: &Type, type_map: &HashMap<String, Type>) -> Type;
+    fn substitute_generics(&self, ty: &Type, type_map: &BTreeMap<String, Type>) -> Type;
     /// Canonicalize raw struct names within a Type to their FQN equivalents.
     fn canonicalize_type(&self, ty: &Type) -> Type;
 }
 
 impl<'a> TypeTracer for CodegenContext<'a> {
-    fn trace_expr_type(&self, expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, String> {
+    fn trace_expr_type(&self, expr: &Expr, locals: &BTreeMap<String, Type>) -> Result<Type, String> {
         match expr {
             Expr::Path(path) if path.path.segments.len() == 1 => {
                 let name = &path.path.segments[0].ident.to_string();
@@ -51,7 +51,7 @@ impl<'a> TypeTracer for CodegenContext<'a> {
                 let receiver_ty = self.trace_expr_type(&m.receiver, locals)?;
                 let (func, trait_ty) = self.resolve_method_info(&receiver_ty, &m.method.to_string())?;
                 
-                let mut type_map = HashMap::new();
+                let mut type_map = BTreeMap::new();
                 type_map.insert("Self".to_string(), trait_ty.unwrap_or_else(|| receiver_ty.clone()));
                 
                 // Handle Turbofish and Generic Substitution
@@ -186,7 +186,7 @@ impl<'a> TypeTracer for CodegenContext<'a> {
                   let raw_field_ty = Type::from_syn(&f.ty).unwrap_or(Type::Unit);
                   // Canonicalize raw struct names from AST to FQNs
                   let field_ty = self.canonicalize_type(&raw_field_ty);
-                  let mut map = HashMap::new();
+                  let mut map = BTreeMap::new();
                   if let Some(g) = &struct_def.generics {
                        for (i, param) in g.params.iter().enumerate() {
                            let name = match param {
@@ -217,7 +217,7 @@ impl<'a> TypeTracer for CodegenContext<'a> {
         Ok((func, trait_ty))
     }
 
-    fn substitute_generics(&self, ty: &Type, type_map: &HashMap<String, Type>) -> Type {
+    fn substitute_generics(&self, ty: &Type, type_map: &BTreeMap<String, Type>) -> Type {
         ty.substitute(type_map) // Delegate to the robust implementation in types.rs
     }
 
@@ -281,7 +281,7 @@ impl<'a> TypeTracer for CodegenContext<'a> {
 }
 
 impl<'a, 'ctx> TypeTracer for crate::codegen::context::LoweringContext<'a, 'ctx> {
-    fn trace_expr_type(&self, expr: &Expr, locals: &HashMap<String, Type>) -> Result<Type, String> {
+    fn trace_expr_type(&self, expr: &Expr, locals: &BTreeMap<String, Type>) -> Result<Type, String> {
         match expr {
             Expr::Path(path) if path.path.segments.len() == 1 => {
                 let name = &path.path.segments[0].ident.to_string();
@@ -309,7 +309,7 @@ impl<'a, 'ctx> TypeTracer for crate::codegen::context::LoweringContext<'a, 'ctx>
             Expr::MethodCall(m) => {
                 let receiver_ty = self.trace_expr_type(&m.receiver, locals)?;
                 let (func, trait_ty) = self.resolve_method_info(&receiver_ty, &m.method.to_string())?;
-                let mut type_map = HashMap::new();
+                let mut type_map = BTreeMap::new();
                 type_map.insert("Self".to_string(), trait_ty.unwrap_or_else(|| receiver_ty.clone()));
                 if let Some(turbofish) = &m.turbofish {
                     if let Some(g) = &func.generics {
@@ -411,7 +411,7 @@ impl<'a, 'ctx> TypeTracer for crate::codegen::context::LoweringContext<'a, 'ctx>
             if let Some(f) = struct_def.fields.iter().find(|f| f.name.to_string() == field_name) {
                 let raw_field_ty = Type::from_syn(&f.ty).unwrap_or(Type::Unit);
                 let field_ty = self.canonicalize_type(&raw_field_ty);
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
                 if let Some(g) = &struct_def.generics {
                     for (i, param) in g.params.iter().enumerate() {
                         let name = match param {
@@ -439,7 +439,7 @@ impl<'a, 'ctx> TypeTracer for crate::codegen::context::LoweringContext<'a, 'ctx>
         Ok((func, trait_ty))
     }
 
-    fn substitute_generics(&self, ty: &Type, type_map: &HashMap<String, Type>) -> Type {
+    fn substitute_generics(&self, ty: &Type, type_map: &BTreeMap<String, Type>) -> Type {
         ty.substitute(type_map)
     }
 

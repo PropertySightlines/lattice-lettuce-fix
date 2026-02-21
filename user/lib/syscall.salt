@@ -1,0 +1,67 @@
+// =============================================================================
+// user/lib/syscall.salt
+// User-Space Syscall Abstraction Layer
+// =============================================================================
+//
+// Provides typed, safe interfaces to Lattice OS kernel syscalls.
+// All functions use the SYSCALL instruction via assembly stubs
+// (user/syscall_stubs.S) and return results in RAX.
+//
+// This is the ONLY interface between Ring 3 user programs and the
+// kernel. User programs must import this module rather than declaring
+// raw extern functions.
+//
+// Syscall ABI (x86_64 SYSCALL convention):
+//   RAX = syscall number
+//   RDI = arg0, RSI = arg1, RDX = arg2, R10 = arg3
+//   Returns: RAX = result
+// =============================================================================
+
+package user.lib.syscall
+
+// =============================================================================
+// Raw Assembly Stubs (provided by user/syscall_stubs.S)
+// =============================================================================
+extern fn sys_write(fd: u64, buf: u64, len: u64);
+extern fn sys_exit(code: u64);
+extern fn sys_brk(new_brk: u64) -> u64;
+extern fn sys_mmap(length: u64, prot: u64) -> u64;
+
+// =============================================================================
+// Syscall Constants
+// =============================================================================
+pub const STDOUT: u64 = 1;
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_RW: u64 = 3;  // PROT_READ | PROT_WRITE
+
+// =============================================================================
+// I/O
+// =============================================================================
+
+/// Write a message to stdout via sys_write(1, buf, len)
+pub fn write(buf: u64, len: u64) {
+    sys_write(STDOUT, buf, len);
+}
+
+/// Terminate the process with the given exit code. Never returns.
+pub fn exit(code: u64) {
+    sys_exit(code);
+}
+
+// =============================================================================
+// Memory Management
+// =============================================================================
+
+/// Query or set the program break (heap boundary).
+/// Pass 0 to query the current break.
+/// Returns the new break value.
+pub fn brk(new_brk: u64) -> u64 {
+    return sys_brk(new_brk);
+}
+
+/// Request an anonymous memory mapping of the given size.
+/// Returns the virtual address of the mapped region (0 on failure).
+pub fn mmap(length: u64, prot: u64) -> u64 {
+    return sys_mmap(length, prot);
+}

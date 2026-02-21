@@ -49,7 +49,6 @@ fn main() -> i32 {
     }
 
     // Test 3: fold
-    // Range(0..5).fold(0, add) = 0+1+2+3+4 = 10
     let mut r = Range::new(0, 5);
     let result = r.fold(0, add);
     if result != 10 {
@@ -58,8 +57,6 @@ fn main() -> i32 {
     }
 
     // Test 4: full chain — filter → map → fold
-    // Range(0..10).filter(is_even) → [0,2,4,6,8] → map(square) → [0,4,16,36,64]
-    // fold(0, add) → 0+4+16+36+64 = 120
     let mut pipeline = Range::new(0, 10).filter(is_even).map(square);
     let total = pipeline.fold(0, add);
     if total != 120 {

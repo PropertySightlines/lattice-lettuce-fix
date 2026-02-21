@@ -2,7 +2,7 @@ use crate::codegen::context::LoweringContext;
 use crate::codegen::collector::MonomorphizationTask;
 use crate::types::{Type, TypeKey};
 use crate::grammar::{Stmt};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use syn::{Expr, Pat};
 use crate::common::mangling::Mangler;
 
@@ -38,7 +38,7 @@ impl<'a, 'ctx, 'b> Seeker<'a, 'ctx, 'b> {
     }
 
 
-    pub fn resolve_receiver_type(&mut self, expr: &Expr, locals: &HashMap<String, Type>) -> Option<Type> {
+    pub fn resolve_receiver_type(&mut self, expr: &Expr, locals: &BTreeMap<String, Type>) -> Option<Type> {
          match expr {
              Expr::Path(path) => {
                  let name = path.path.segments.last()?.ident.to_string();
@@ -90,7 +90,7 @@ impl<'a, 'ctx, 'b> Seeker<'a, 'ctx, 'b> {
     }
 
     /// Exhaustively discovers all physical requirements of an expression.
-    pub fn discover_requirements(&mut self, expr: &Expr, tasks: &mut Vec<MonomorphizationTask>, locals: &mut HashMap<String, Type>) -> Result<(), String> {
+    pub fn discover_requirements(&mut self, expr: &Expr, tasks: &mut Vec<MonomorphizationTask>, locals: &mut BTreeMap<String, Type>) -> Result<(), String> {
         match expr {
             // THE STRUCT PIVOT: Every literal is a layout request.
             Expr::Struct(s) => {
@@ -325,7 +325,7 @@ impl<'a, 'ctx, 'b> Seeker<'a, 'ctx, 'b> {
         Ok(())
     }
 
-    pub fn walk_stmt(&mut self, stmt: &Stmt, tasks: &mut Vec<MonomorphizationTask>, locals: &mut HashMap<String, Type>) -> Result<(), String> {
+    pub fn walk_stmt(&mut self, stmt: &Stmt, tasks: &mut Vec<MonomorphizationTask>, locals: &mut BTreeMap<String, Type>) -> Result<(), String> {
          match stmt {
             Stmt::Syn(s) => self.walk_syn_stmt(s, tasks, locals)?,
             Stmt::Expr(e, _) => self.discover_requirements(e, tasks, locals)?,
@@ -360,7 +360,7 @@ impl<'a, 'ctx, 'b> Seeker<'a, 'ctx, 'b> {
         Ok(())
     }
 
-    pub fn walk_syn_stmt(&mut self, stmt: &syn::Stmt, tasks: &mut Vec<MonomorphizationTask>, locals: &mut HashMap<String, Type>) -> Result<(), String> {
+    pub fn walk_syn_stmt(&mut self, stmt: &syn::Stmt, tasks: &mut Vec<MonomorphizationTask>, locals: &mut BTreeMap<String, Type>) -> Result<(), String> {
         match stmt {
             syn::Stmt::Local(l) => {
                  if let Some(init) = &l.init {
@@ -429,7 +429,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
     pub fn resolve_method_to_task(&mut self, receiver_ty: &Type, method_name: &str, generics: Vec<Type>) -> Result<MonomorphizationTask, String> {
         let (func, trait_ty, imports) = self.resolve_method(receiver_ty, method_name)?;
         
-        let mut type_map = HashMap::new();
+        let mut type_map = BTreeMap::new();
         // Add Self?
         // [ABI FIX] Strip Reference wrapper from self_ty - during hydration, current_self_ty should be
         // the concrete type (e.g., Result<...>), not Reference(Result<...>), otherwise Self mangling is broken
@@ -508,7 +508,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
         
         // 3. PHASE C: Identity Construction
         // We must substitute generics in self_ty with type_map (e.g. Vec<T> -> Vec<u8>)
-        fn substitute(ty: &Type, map: &HashMap<String, Type>) -> Type {
+        fn substitute(ty: &Type, map: &BTreeMap<String, Type>) -> Type {
             match ty {
                 Type::Struct(name) => {
                     if let Some(replacement) = map.get(name) {
@@ -565,7 +565,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                  if let Some(func) = module.function_templates.get(&key.name) {
                      // Found function def!
                      
-                     let mut type_map = HashMap::new();
+                     let mut type_map = BTreeMap::new();
                      if let Some(g) = &func.generics {
                          for (i, p) in g.params.iter().enumerate() {
                              let p_name = match p {
@@ -633,7 +633,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                                   }
                              }
                              
-                             let mut type_map = HashMap::new();
+                             let mut type_map = BTreeMap::new();
                              if let Some(g) = &f.generics {
                                  for (i, p) in g.params.iter().enumerate() {
                                      let p_name = match p {
@@ -680,7 +680,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
 
     pub fn scan_function_for_calls(&mut self, func: &crate::grammar::SaltFn) -> Result<Vec<MonomorphizationTask>, String> {
         let mut tasks = Vec::new();
-        let mut locals = HashMap::new();
+        let mut locals = BTreeMap::new();
         // Register arguments
         for arg in &func.args {
             if let Some(ty) = &arg.ty {

@@ -1,0 +1,81 @@
+// =============================================================================
+// kernel/arch/x86/tss.salt
+// Task State Segment (TSS64) -- The Return Path
+// =============================================================================
+//
+// When a Ring 3 process is interrupted (PIT timer, SYSCALL, fault), the CPU
+// must switch back to Ring 0. But the Ring 3 RSP is untrusted -- the CPU
+// reads the Ring 0 stack pointer from TSS64.rsp0.
+//
+// Without a valid TSS, the first timer tick after entering Ring 3 will cause:
+//   1. #GP (General Protection) -- no valid kernel stack
+//   2. #DF (Double Fault) -- the #GP handler has no stack either
+//   3. Triple Fault -- QEMU reboot
+//
+// The TSS is loaded into the CPU via the LTR (Load Task Register) instruction
+// with selector 0x28 (GDT index 5).
+//
+// Layout: 104 bytes, hardware-dictated by AMD64 Architecture Manual Vol. 2,
+// Section 12.2.5 "64-Bit Task State Segment".
+// =============================================================================
+
+package kernel.arch.x86.tss
+
+// =============================================================================
+// TSS64 -- 104 bytes hardware-dictated layout
+// =============================================================================
+pub struct TSS64 {
+    reserved0: u32,
+    rsp0: u64,       // Ring 0 stack pointer -- THE critical field
+    rsp1: u64,       // Ring 1 stack (unused on x86_64)
+    rsp2: u64,       // Ring 2 stack (unused on x86_64)
+    reserved1: u64,
+    ist1: u64,       // Interrupt Stack Table entry 1 (for NMI, #DF, etc.)
+    ist2: u64,
+    ist3: u64,
+    ist4: u64,
+    ist5: u64,
+    ist6: u64,
+    ist7: u64,
+    reserved2: u64,
+    reserved3: u16,
+    iomap_base: u16, // Offset to IO permission bitmap (104 = deny all)
+}
+
+// =============================================================================
+// Static TSS instance -- lives in kernel .bss
+// =============================================================================
+global TSS: TSS64;
+
+// =============================================================================
+// init_tss -- Configure the TSS with the kernel stack pointer
+// =============================================================================
+// Must be called before LTR instruction and before any Ring 3 transition.
+//
+// kernel_rsp0: The top of the kernel stack that the CPU will switch to
+//              when returning from Ring 3 -> Ring 0.
+// =============================================================================
+pub fn init_tss(kernel_rsp0: u64) {
+    TSS.rsp0 = kernel_rsp0;
+    TSS.iomap_base = 104;  // sizeof(TSS64) -- deny all IO ports to Ring 3
+    // All other fields default to zero (IST entries, reserved fields)
+}
+
+// =============================================================================
+// get_tss_addr -- Return the virtual address of the static TSS
+// =============================================================================
+// Needed by the GDT to construct the TSS descriptor (index 5-6).
+// =============================================================================
+pub fn get_tss_addr() -> u64 {
+    return (&TSS) as u64;
+}
+
+// =============================================================================
+// set_rsp0 -- Update the kernel stack pointer in the TSS
+// =============================================================================
+// Called during context switch to point RSP0 at the new task's kernel stack.
+// This is critical for per-task kernel stacks.
+// =============================================================================
+pub fn set_rsp0(new_rsp0: u64) {
+    TSS.rsp0 = new_rsp0;
+}

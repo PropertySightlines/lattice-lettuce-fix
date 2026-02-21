@@ -1,0 +1,59 @@
+// Facet GPU — Metal Backend
+//
+// Implements GpuDevice by delegating to the facet_gpu.m C bridge.
+// All macOS/Metal specifics are contained here.
+
+package gpu.metal
+
+use std.core.ptr.Ptr
+
+// FFI — facet_gpu.m (Objective-C Metal bridge)
+extern fn facet_gpu_init() -> i64;
+extern fn facet_gpu_create_buffer(device: i64, size_bytes: i64) -> i64;
+extern fn facet_gpu_buffer_contents(buffer: i64) -> Ptr<u8>;
+extern fn facet_gpu_buffer_length(buffer: i64) -> i64;
+extern fn facet_gpu_compile_shader(device: i64, msl_source: Ptr<u8>, fn_name: Ptr<u8>) -> i64;
+extern fn facet_gpu_dispatch(device: i64, pipeline: i64, buffers: Ptr<i64>, buffer_count: i32, thread_count: i32);
+extern fn facet_gpu_destroy_buffer(buffer: i64);
+extern fn facet_gpu_destroy(device: i64);
+
+pub struct MetalDevice {
+    handle: i64,
+}
+
+impl MetalDevice {
+    pub fn init() -> i64 {
+        return facet_gpu_init();
+    }
+
+    pub fn destroy(device: i64) {
+        facet_gpu_destroy(device);
+        return;
+    }
+
+    pub fn create_buffer(device: i64, size_bytes: i64) -> i64 {
+        return facet_gpu_create_buffer(device, size_bytes);
+    }
+
+    pub fn buffer_contents(buffer: i64) -> Ptr<u8> {
+        return facet_gpu_buffer_contents(buffer);
+    }
+
+    pub fn buffer_length(buffer: i64) -> i64 {
+        return facet_gpu_buffer_length(buffer);
+    }
+
+    pub fn destroy_buffer(buffer: i64) {
+        facet_gpu_destroy_buffer(buffer);
+        return;
+    }
+
+    pub fn compile_shader(device: i64, source: Ptr<u8>, entry_point: Ptr<u8>) -> i64 {
+        return facet_gpu_compile_shader(device, source, entry_point);
+    }
+
+    pub fn dispatch(device: i64, pipeline: i64, buffers: Ptr<i64>, buffer_count: i32, thread_count: i32) {
+        facet_gpu_dispatch(device, pipeline, buffers, buffer_count, thread_count);
+        return;
+    }
+}

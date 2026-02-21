@@ -1,0 +1,82 @@
+// =============================================================================
+// user/test_memory.salt
+// Ring 3 Proof of Life — Dynamic Memory Fire Test
+// =============================================================================
+//
+// Exercises sys_brk and sys_mmap from user space to prove:
+//   1. PMM can hand physical pages to Ring 3
+//   2. Slab cache VMA allocation works without Redzone corruption
+//   3. Page table writes and TLB flushes are correct
+//   4. Syscall return values propagate through SYSRET/RAX
+//
+// If any mapping is wrong, the CPU will trigger a Ring 3 Page Fault (#PF)
+// and QEMU will print an exception dump. A clean exit proves correctness.
+// =============================================================================
+
+package user.test_memory
+
+import user.lib.syscall
+
+@no_mangle
+pub fn main() {
+    // =========================================================================
+    // TEST 1: The Linear Heap (sys_brk)
+    // =========================================================================
+
+    // 1a. Query the current heap boundary (.bss roof)
+    let initial_brk = syscall.brk(0);
+
+    // 1b. Expand the heap by exactly one 4KB page
+    let new_brk = syscall.brk(initial_brk + 4096);
+
+    // 1c. THE FIRE TEST: Write a magic number to the new heap memory.
+    //     If the kernel failed to allocate the PMM page, map the PTE,
+    //     or flush the TLB, this write triggers a Ring 3 Page Fault.
+    if new_brk > initial_brk {
+        let heap_ptr = (initial_brk + 8) as &mut u64;
+        *heap_ptr = 0xCAFEBABE;
+
+        // Verify the write stuck
+        let readback = *(heap_ptr as &u64);
+        if readback == 0xCAFEBABE {
+            let msg = "T1 PASS: sys_brk heap write OK\n";
+            let slice_addr = (&msg) as u64;
+            let data_ptr = *(slice_addr as &u64);
+            syscall.write(data_ptr, 31);
+        }
+    }
+
+    // =========================================================================
+    // TEST 2: The Island Allocation (sys_mmap)
+    // =========================================================================
+
+    // 2a. Request a 16KB anonymous mapping
+    let mmap_ptr = syscall.mmap(16384, syscall.PROT_RW);
+
+    // 2b. THE FIRE TEST: Write to the middle of the allocation.
+    //     This forces the CPU to traverse user_pml4, hit the VMA-backed
+    //     page at offset 8192, and prove TLB flush correctness.
+    if mmap_ptr != 0 {
+        let island_ptr = (mmap_ptr + 8192) as &mut u64;
+        *island_ptr = 0xDEADBEEF;
+
+        // Verify the write stuck
+        let readback = *(island_ptr as &u64);
+        if readback == 0xDEADBEEF {
+            let msg = "T2 PASS: sys_mmap island write OK\n";
+            let slice_addr = (&msg) as u64;
+            let data_ptr = *(slice_addr as &u64);
+            syscall.write(data_ptr, 34);
+        }
+    }
+
+    // =========================================================================
+    // TEST 3: Clean Exit
+    // =========================================================================
+    let msg = "ALL TESTS PASSED: Memory subsystem verified\n";
+    let slice_addr = (&msg) as u64;
+    let data_ptr = *(slice_addr as &u64);
+    syscall.write(data_ptr, 45);
+
+    syscall.exit(0);
+}

@@ -8,9 +8,12 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
     let mut skip_scan = false;
     let mut vverify = false;
     let mut binary_mode = false;
+    let mut object_mode = false;
     let mut disable_alias_scopes = false;
     let mut no_verify = false;
     let mut lib_mode = false;
+    let mut debug_info = false;
+    let mut target_name: Option<String> = None;
     
     let mut i = 1;
     while i < args.len() {
@@ -18,14 +21,18 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
         if arg == "--release" {
             release_mode = true;
         } else if arg == "--help" || arg == "-h" {
-            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [--lib] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
+            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [-c] [--target <target>] [--lib] [-g] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
             println!("");
             println!("Flags:");
             println!("  --release    Enable optimizations");
             println!("  --binary     Produce native Mach-O/ELF binary via Iron Driver");
+            println!("  -c           Produce .o object file (like clang -c)");
+            println!("  --target T   Target: macos, linux-arm64, lattice, lattice-x86_64");
             println!("  --verify     Run Z3 verification passes");
             println!("  --skip-scan  Skip import scanning");
             println!("  --lib        Library mode (no main entry point required)");
+            println!("  -g           Emit DWARF debug info (MLIR loc annotations)");
+            println!("  --debug-info Emit DWARF debug info (same as -g)");
             println!("  --disable-alias-scopes  Suppress LLVM alias scope metadata (for mlir-opt compatibility)");
             println!("  --no-verify  Skip Z3/ownership verification for fast builds");
             println!("  -o <path>    Output path (MLIR or binary)");
@@ -41,12 +48,24 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
             // Sovereign binary mode: full MLIR → native pipeline
             binary_mode = true;
             release_mode = true; // Binary mode implies release
+        } else if arg == "-c" {
+            object_mode = true;
+            release_mode = true; // Object mode implies release
+        } else if arg == "--target" {
+            if i + 1 < args.len() {
+                target_name = Some(args[i+1].clone());
+                i += 1;
+            } else {
+                anyhow::bail!("--target requires an argument (e.g. lattice, macos, linux-arm64)");
+            }
         } else if arg == "--disable-alias-scopes" {
             disable_alias_scopes = true;
         } else if arg == "--no-verify" {
             no_verify = true;
         } else if arg == "--lib" {
             lib_mode = true;
+        } else if arg == "-g" || arg == "--debug-info" {
+            debug_info = true;
         } else if arg == "-o" {
             if i + 1 < args.len() {
                 output_path = Some(args[i+1].clone());
@@ -65,7 +84,7 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
     let path = match path_opt {
         Some(p) => p,
         None => {
-            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [--lib] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
+            println!("Usage: salt-front <file.salt> [-o output] [--release] [--binary] [-c] [--target <target>] [--lib] [-g] [--skip-scan] [--verify] [--no-verify] [--disable-alias-scopes]");
             return Ok(());
         }
     };
@@ -91,7 +110,7 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
 
     load_imports(&file, &mut registry);
 
-    match crate::compile_ast(&mut file, release_mode, Some(&registry), skip_scan, vverify, disable_alias_scopes, no_verify, lib_mode) {
+    match crate::compile_ast(&mut file, release_mode, Some(&registry), skip_scan, vverify, disable_alias_scopes, no_verify, lib_mode, debug_info, &path) {
         Ok(mlir) => {
             if binary_mode {
                 // ============================================================
@@ -107,13 +126,31 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
                     .unwrap_or_else(|| PathBuf::from(basename));
                 
                 let build_dir = std::env::temp_dir().join("salt-build");
-                let driver = crate::driver::SaltDriver::new(build_dir);
+                let mut driver = crate::driver::SaltDriver::new(build_dir);
+                if let Some(ref t) = target_name {
+                    driver = driver.with_target(
+                        crate::driver::DriverTarget::from_str(t)
+                            .ok_or_else(|| anyhow::anyhow!("Unknown target: '{}'. Valid: macos, linux-arm64, lattice, lattice-x86_64", t))?
+                    );
+                }
                 
                 eprintln!("🏛️  [Sovereign] Driving MLIR → native binary...");
                 eprintln!("    Target: {:?}", driver.target);
-                eprintln!("    Runtime: {:?}", driver.runtime_obj);
                 
-                match driver.compile(&mlir, basename) {
+                let is_lattice = matches!(driver.target,
+                    crate::driver::DriverTarget::LatticeArm64 |
+                    crate::driver::DriverTarget::LatticeX86_64
+                );
+
+                let compile_result = if is_lattice {
+                    eprintln!("    Linker: ld.lld (freestanding ELF)");
+                    driver.compile_lattice_binary(&mlir, basename)
+                } else {
+                    eprintln!("    Runtime: {:?}", driver.runtime_obj);
+                    driver.compile(&mlir, basename)
+                };
+
+                match compile_result {
                     Ok(produced_path) => {
                         // Copy to requested output path if different
                         if produced_path != output_bin {
@@ -133,6 +170,45 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
                         eprintln!("❌  [Sovereign] Binary synthesis failed: {}", e);
                         eprintln!("    Ensure LLVM tools are installed at /opt/homebrew/opt/llvm/bin/");
                         eprintln!("    Ensure sovereign_rt.o is built (cd sovereign_rt && make)");
+                        std::process::exit(1);
+                    }
+                }
+            } else if object_mode {
+                // ============================================================
+                // OBJECT MODE — MLIR → .o (like clang -c)
+                // ============================================================
+                let basename = std::path::Path::new(&path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+
+                let output_obj = output_path
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("{}.o", basename)));
+
+                let build_dir = std::env::temp_dir().join("salt-build");
+                let mut driver = crate::driver::SaltDriver::new(build_dir)
+                    .with_debug_info(debug_info);
+                if let Some(ref t) = target_name {
+                    driver = driver.with_target(
+                        crate::driver::DriverTarget::from_str(t)
+                            .ok_or_else(|| anyhow::anyhow!("Unknown target: '{}'. Valid: macos, linux-arm64, lattice, lattice-x86_64", t))?
+                    );
+                }
+
+                eprintln!("🔧 [Object] Compiling to .o...");
+
+                match driver.compile_object(&mlir, basename) {
+                    Ok(produced_path) => {
+                        if produced_path != output_obj {
+                            fs::copy(&produced_path, &output_obj).map_err(|e| {
+                                anyhow::anyhow!("Failed to copy object to {:?}: {}", output_obj, e)
+                            })?;
+                        }
+                        eprintln!("✅ Object file: {:?}", output_obj);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Object compilation failed: {}", e);
                         std::process::exit(1);
                     }
                 }

@@ -1,0 +1,55 @@
+// =============================================================================
+// std.io.LatticeReactor — Lattice kernel backend for the Reactor trait
+// =============================================================================
+// Stub implementation for the native Lattice kernel VirtIO stack.
+// All methods currently return -1 (not implemented).
+//
+// When the Kernel Worktree completes the VirtIO net driver, this file becomes
+// the production backend. The syscall numbers map to kernel/core/syscall.salt:
+//   128 → reactor_create
+//   129 → reactor_register
+//   130 → reactor_deregister
+//   131 → reactor_wait
+
+package std.io.reactor_lattice
+
+use std.core.ptr.Ptr
+use std.core.result.Result
+use std.status.Status
+use std.io.reactor.{Reactor, Filter}
+
+/// Lattice kernel VirtIO-backed I/O reactor.
+/// Stub: returns errors until the kernel VirtIO stack is ready.
+pub struct LatticeReactor {
+    reactor_fd: i32
+}
+
+impl LatticeReactor {
+    /// Create a new LatticeReactor.
+    /// Currently fails unconditionally — VirtIO not yet available.
+    pub fn new() -> Result<LatticeReactor> {
+        // TODO: syscall 128 (reactor_create) when kernel is ready
+        return Result::Err(Status::internal("LatticeReactor: VirtIO backend not yet implemented"));
+    }
+}
+
+impl Reactor for LatticeReactor {
+    pub fn register(&self, fd: i32, filter: Filter) -> i32 {
+        // TODO: syscall 129 (reactor_register)
+        return -1;
+    }
+
+    pub fn deregister(&self, fd: i32) -> i32 {
+        // TODO: syscall 130 (reactor_deregister)
+        return -1;
+    }
+
+    pub fn wait(&self, event_buf: Ptr<i64>, max_events: i32, timeout_ms: i32) -> i32 {
+        // TODO: syscall 131 (reactor_wait)
+        return -1;
+    }
+
+    pub fn fd(&self) -> i32 {
+        return self.reactor_fd;
+    }
+}

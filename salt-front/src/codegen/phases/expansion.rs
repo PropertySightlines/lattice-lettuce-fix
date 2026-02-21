@@ -1,7 +1,7 @@
 //! Phase 2: Expansion State
 //! Contains monomorphization and specialization state - write-heavy during expansion.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use crate::types::Type;
 use crate::codegen::collector::MonomorphizationTask;
 use crate::evaluator::Evaluator;
@@ -39,7 +39,7 @@ pub struct ExpansionState {
     /// Monomorphizer work queue state
     pub monomorphizer: MonomorphizerState,
     /// Current type substitution map (generic name -> concrete type)
-    pub current_type_map: HashMap<String, Type>,
+    pub current_type_map: BTreeMap<String, Type>,
     /// Current generic arguments being processed
     pub current_generic_args: Vec<Type>,
     /// Current Self type in impl block
@@ -61,7 +61,7 @@ impl ExpansionState {
             specializations: HashMap::new(),
             pending_generations: VecDeque::new(),
             monomorphizer: MonomorphizerState::new(),
-            current_type_map: HashMap::new(),
+            current_type_map: BTreeMap::new(),
             current_generic_args: Vec::new(),
             current_self_ty: None,
             current_ret_ty: None,

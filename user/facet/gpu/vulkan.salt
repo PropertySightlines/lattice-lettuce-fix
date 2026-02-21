@@ -1,0 +1,55 @@
+// Facet GPU — Vulkan Backend (Stub)
+//
+// Placeholder for the Vulkan rendering backend. When the Lattice kernel
+// supports VirtIO-GPU or a native graphics driver, this file will map
+// to raw Vulkan command buffers. No macOS dependencies.
+
+package gpu.vulkan
+
+use std.core.ptr.Ptr
+
+pub struct VulkanDevice {
+    handle: i64,
+}
+
+impl VulkanDevice {
+    pub fn init() -> i64 {
+        println("VulkanDevice: not yet implemented");
+        return 0;
+    }
+
+    pub fn destroy(device: i64) {
+        println("VulkanDevice: not yet implemented");
+        return;
+    }
+
+    pub fn create_buffer(device: i64, size_bytes: i64) -> i64 {
+        println("VulkanDevice: not yet implemented");
+        return 0;
+    }
+
+    pub fn buffer_contents(buffer: i64) -> Ptr<u8> {
+        println("VulkanDevice: not yet implemented");
+        return 0 as Ptr<u8>;
+    }
+
+    pub fn buffer_length(buffer: i64) -> i64 {
+        println("VulkanDevice: not yet implemented");
+        return 0;
+    }
+
+    pub fn destroy_buffer(buffer: i64) {
+        println("VulkanDevice: not yet implemented");
+        return;
+    }
+
+    pub fn compile_shader(device: i64, source: Ptr<u8>, entry_point: Ptr<u8>) -> i64 {
+        println("VulkanDevice: not yet implemented");
+        return 0;
+    }
+
+    pub fn dispatch(device: i64, pipeline: i64, buffers: Ptr<i64>, buffer_count: i32, thread_count: i32) {
+        println("VulkanDevice: not yet implemented");
+        return;
+    }
+}

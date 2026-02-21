@@ -2,46 +2,45 @@ package kernel.core.main
 
 import kernel.arch.x86.gdt
 import kernel.arch.x86.idt
+import kernel.arch.x86.tss
 import kernel.drivers.pit
 import kernel.core.io
 import kernel.drivers.serial
 import kernel.drivers.vga
 import kernel.core.scheduler
-import std.test
 import kernel.core.panic
-import kernel.sched.affinity
-import kernel.core.context_switch
-import benchmarks.ring_of_fire
-import benchmarks.ring_of_fire_1k
-import benchmarks.syscall_bench
-import benchmarks.ipc_bench
-import benchmarks.alloc_bench
-import kernel.core.timing
-
-// IPC responder fiber — defined in ipc_bench.salt with @no_mangle
-extern fn ipc_responder();
+import kernel.core.pmm
+import kernel.core.process
+import kernel.core.syscall
+import kernel.core.exec_user
+import kernel.core.memory
+import kernel.mem.slab_cache
+import kernel.core.vma
+import kernel.core.dispatcher
 
 
-// const VGA_VIRTUAL: u64 = 0xFFFFFFFF800B8000;
-// 
-// fn get_vga_window() -> Window<u16> {
-//     region vga(VGA_VIRTUAL, 4000) {
-//         return vga.window(0, 80);
-//     }
-// }
+
+// Assembly FFI (unmangled symbols)
+extern fn read_cr3() -> u64;
+extern fn idle_halt();
+extern fn proc_context_switch(old_rsp_ptr: u64, new_rsp: u64, new_cr3: u64, new_rsp0: u64);
+extern fn get_user_elf_a_addr() -> u64;
+extern fn get_user_elf_b_addr() -> u64;
+extern fn get_kernel_event_loop_addr() -> u64;
+
+// Local copies of process constants
+const MAX_PROCS: u64   = 16;
+const PROC_RUNNING: u64 = 2;
 
 @no_mangle
 pub fn salt_yield_check() {
-    // Heartbeat handler - no-op in kernel for now
 }
 
 @no_mangle
 pub fn kmain(magic: u32, mb_info: &u8) {
-    // EARLY SERIAL: Initialize first for debugging
     serial.init();
     serial.print("LATTICE BOOT: Serial OK\n");
-    
-    // 1. Critical Initialization
+
     serial.print("LATTICE BOOT: GDT...\n");
     gdt.init();
     serial.print("LATTICE BOOT: IDT...\n");
@@ -50,65 +49,76 @@ pub fn kmain(magic: u32, mb_info: &u8) {
     pit.init();
     serial.print("LATTICE BOOT: Scheduler...\n");
     scheduler.init();
-    
-    // 2. VGA Boot Banner — visible in QEMU display
-    vga.clear();
-    vga.print_colored(" LATTICE OS v0.5 ", 0x1F);
-    vga.print("\n");
-    vga.print_colored(" Salt-powered ", 0x0A);
-    vga.print_colored(" Z3-verified ", 0x0A);
-    vga.print("\n\n");
-    vga.print("Booting kernel...\n");
 
-    // 3. Start the scheduler before spawning fibers
+    // PMM: 32MB-64MB physical (per mm_layout.salt)
+    serial.print("LATTICE BOOT: PMM...\n");
+    pmm.init(0x2000000, 0x4000000);
+    serial.print("LATTICE BOOT: Slab Cache...\n");
+    slab_cache.init();
+    serial.print("LATTICE BOOT: VMA...\n");
+    vma.init();
     serial.print("LATTICE KERNEL BOOT [OK]\n");
-    serial.print("STARTING RING OF FIRE BENCHMARK...\n");
-    
-    // 4. START PREEMPTIVE SCHEDULING
-    // This calls STI and enables the PIT timer fire
+
+    vga.clear();
+    vga.print_colored(" LATTICE OS v0.6 ", 0x1F);
+    vga.print("\n");
+
     scheduler.start();
-    serial.print("[Lattice] PREEMPTIVE MODE (PIT Active)\n");
-    vga.print("Preemptive mode active (PIT @ 100Hz)\n");
-    
-    // 5. Run Benchmark Suite
-    serial.print("=== LATTICE OS BENCHMARK SUITE ===\n");
-    vga.print_colored("=== Benchmark Suite ===\n", 0x0E);
+    serial.print("[Lattice] PREEMPTIVE MODE\n");
 
-    // 5a. Ring of Fire — context switch latency (4 fibers)
-    vga.print("Running Ring of Fire benchmark...\n");
-    ring_of_fire.run_benchmark();
+    // GDT/TSS for Ring 3
+    let kernel_rsp0: u64 = 0xFFFFFFFF80126000;
+    tss.init_tss(kernel_rsp0);
+    let tss_addr = tss.get_tss_addr();
+    gdt.init_ring3(tss_addr);
+    serial.print("[Lattice] GDT/TSS Ring 3 ready\n");
 
-    // 5b. Ring of Fire 1K — scheduler scalability (1000 fibers)
-    vga.print("Running Ring of Fire 1K benchmark...\n");
-    ring_of_fire_1k.run_benchmark();
+    // Save kernel PML4
+    let kernel_pml4 = read_cr3();
+    syscall.set_kernel_pml4(kernel_pml4);
 
-    // 5c. Syscall Overhead — int 0x80 null round-trip
-    syscall_bench.run();
+    // =========================================================================
+    // SPAWN TASK 0: Immortal Ring 0 Dispatcher Thread
+    // =========================================================================
+    // Task 0 MUST be slot 0. It runs kernel_event_loop() in Ring 0 with IF=1.
+    // It drains the PulseEvent queue and yields when empty.
+    // =========================================================================
+    let task0_entry = get_kernel_event_loop_addr();
+    let slot_task0 = exec_user.spawn_kernel_thread(task0_entry, kernel_pml4);
+    process.set_state(slot_task0, PROC_READY);
+    serial.print("[Lattice] Task 0 (dispatcher) spawned\n");
 
-    // 5d. IPC Ping-Pong — fiber-to-fiber message latency
-    let ipc_resp_addr = (&ipc_responder) as u64;
-    scheduler.spawn(ipc_resp_addr);
-    ipc_bench.run();
+    // Spawn Ring 3 user processes
+    serial.print("[Lattice] SPAWNING PROCESSES\n");
 
-    // 5e. Memory Allocation — slab bump allocator throughput
-    alloc_bench.run();
+    let elf_a = get_user_elf_a_addr();
+    let slot_a = exec_user.spawn_process(elf_a, kernel_pml4);
+    serial.print("[Lattice] Process A spawned\n");
 
-    // 6. Suite complete — halt cleanly
-    serial.print("=== BENCHMARK SUITE COMPLETE ===\n");
-    vga.print_colored("\nBENCHMARK SUITE COMPLETE", 0x0A);
-    panic.halt();
-}
+    let elf_b = get_user_elf_b_addr();
+    let slot_b = exec_user.spawn_process(elf_b, kernel_pml4);
+    process.set_state(slot_b, PROC_READY);
+    serial.print("[Lattice] Process B spawned\n");
 
-fn task_alpha() {
-    let mut i = 0;
-    while i < 10000000 {
-        i = i + 1;
+    // Start first user process (not Task 0 — Task 0 will be scheduled reactively)
+    if slot_a < MAX_PROCS {
+        process.set_current(slot_a);
+        process.set_state(slot_a, PROC_RUNNING);
+
+        let new_rsp  = process.get_kernel_rsp(slot_a);
+        let new_cr3  = process.get_pml4(slot_a);
+        let new_rsp0 = process.get_kernel_stack_top(slot_a);
+
+        // Set TSS.RSP0 with virtual address for Ring 3 → Ring 0 transitions
+        tss.set_rsp0(new_rsp0);
+
+        let dummy: u64 = 0;
+        serial.print("[Lattice] Switching to first process...\n");
+        proc_context_switch((&dummy) as u64, new_rsp, new_cr3, new_rsp0);
     }
-}
 
-fn task_beta() {
-    let mut i = 0;
-    while i < 10000000 {
-        i = i + 1;
+    serial.print("[Lattice] All processes complete. Idle.\n");
+    loop {
+        idle_halt();
     }
 }

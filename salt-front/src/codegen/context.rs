@@ -118,6 +118,11 @@ pub struct CodegenContext<'a> {
     /// Set via --no-verify CLI flag for fast iteration builds.
     pub no_verify: bool,
     pub lib_mode: bool,
+    /// When true, emit MLIR `loc()` annotations for DWARF debug info.
+    /// Set via -g / --debug-info CLI flag.
+    pub debug_info: bool,
+    /// Source file path for debug info `loc()` annotations.
+    pub source_file: String,
     
     // === Per-function State ===
     pub evaluator: RefCell<Evaluator>,
@@ -164,6 +169,8 @@ pub struct CodegenConfig<'a> {
     pub emit_alias_scopes: bool,
     pub no_verify: bool,
     pub lib_mode: bool,
+    pub debug_info: bool,
+    pub source_file: &'a str,
 }
 
 /// LoweringContext: A "view struct" holding direct &mut references to phase structs.
@@ -440,8 +447,8 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
     pub fn enum_registry_mut(&mut self) -> &mut std::collections::HashMap<crate::types::TypeKey, crate::registry::EnumInfo> { &mut self.discovery.enum_registry }
     pub fn trait_registry(&self) -> &crate::codegen::trait_registry::TraitRegistry { &self.discovery.trait_registry }
     pub fn trait_registry_mut(&mut self) -> &mut crate::codegen::trait_registry::TraitRegistry { &mut self.discovery.trait_registry }
-    pub fn globals(&self) -> &std::collections::HashMap<String, Type> { &self.discovery.globals }
-    pub fn globals_mut(&mut self) -> &mut std::collections::HashMap<String, Type> { &mut self.discovery.globals }
+    pub fn globals(&self) -> &std::collections::BTreeMap<String, Type> { &self.discovery.globals }
+    pub fn globals_mut(&mut self) -> &mut std::collections::BTreeMap<String, Type> { &mut self.discovery.globals }
     pub fn imports(&self) -> &Vec<crate::grammar::ImportDecl> { &self.discovery.imports }
     pub fn imports_mut(&mut self) -> &mut Vec<crate::grammar::ImportDecl> { &mut self.discovery.imports }
     pub fn generic_impls(&self) -> &std::collections::HashMap<String, (crate::grammar::SaltFn, Vec<crate::grammar::ImportDecl>)> { &self.discovery.generic_impls }
@@ -456,8 +463,8 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
     pub fn specializations_mut(&mut self) -> &mut std::collections::HashMap<(String, Vec<Type>), String> { &mut self.expansion.specializations }
     pub fn pending_generations(&self) -> &std::collections::VecDeque<crate::codegen::collector::MonomorphizationTask> { &self.expansion.pending_generations }
     pub fn pending_generations_mut(&mut self) -> &mut std::collections::VecDeque<crate::codegen::collector::MonomorphizationTask> { &mut self.expansion.pending_generations }
-    pub fn current_type_map(&self) -> &std::collections::HashMap<String, Type> { &self.expansion.current_type_map }
-    pub fn current_type_map_mut(&mut self) -> &mut std::collections::HashMap<String, Type> { &mut self.expansion.current_type_map }
+    pub fn current_type_map(&self) -> &std::collections::BTreeMap<String, Type> { &self.expansion.current_type_map }
+    pub fn current_type_map_mut(&mut self) -> &mut std::collections::BTreeMap<String, Type> { &mut self.expansion.current_type_map }
     pub fn current_generic_args(&self) -> &Vec<Type> { &self.expansion.current_generic_args }
     pub fn current_generic_args_mut(&mut self) -> &mut Vec<Type> { &mut self.expansion.current_generic_args }
     pub fn current_self_ty(&self) -> &Option<Type> { &self.expansion.current_self_ty }
@@ -471,6 +478,16 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
 
     // --- Emission Phase ---
     pub fn next_id(&mut self) -> usize { self.emission.next_id() }
+
+    /// Generate an MLIR `loc("file":line:col)` annotation for the given span.
+    /// Returns empty string when debug info is disabled.
+    pub fn loc_tag(&self, span: proc_macro2::Span) -> String {
+        if !self.config.debug_info || self.config.source_file.is_empty() {
+            return String::new();
+        }
+        let start = span.start();
+        format!(" loc(\"{}\":{}:{})", self.config.source_file, start.line, start.column)
+    }
     pub fn alloca_out(&self) -> &String { &self.emission.alloca_out }
     pub fn alloca_out_mut(&mut self) -> &mut String { &mut self.emission.alloca_out }
     pub fn decl_out(&self) -> &String { &self.emission.decl_out }
@@ -1190,18 +1207,20 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
     pub fn resolve_method(&self, receiver_ty: &Type, method_name: &str) -> Result<(crate::grammar::SaltFn, Option<Type>, Vec<crate::grammar::ImportDecl>), String> {
         // [FIX] Extract the receiver type's base name to match against method keys.
         // This prevents Slice::offset from shadowing Ptr::offset when called on a Ptr receiver.
-        let receiver_prefix = match receiver_ty {
-            Type::Concrete(name, _) => Some(name.clone()),
-            Type::Struct(name) => Some(name.clone()),
-            Type::Pointer { .. } => Some("std__core__ptr__Ptr".to_string()),
-            Type::Reference(inner, _) => match inner.as_ref() {
+        // [CRITICAL FIX] Recursively peel all Reference wrappers to reach the base type.
+        // Inside hydrated methods, `self` may be double-wrapped: Reference(Reference(Concrete(...)))
+        // which previously fell through to None, causing non-deterministic method resolution.
+        fn extract_receiver_prefix(ty: &Type) -> Option<String> {
+            match ty {
                 Type::Concrete(name, _) => Some(name.clone()),
                 Type::Struct(name) => Some(name.clone()),
                 Type::Pointer { .. } => Some("std__core__ptr__Ptr".to_string()),
+                Type::Reference(inner, _) => extract_receiver_prefix(inner),
+                other if other.is_numeric() || *other == Type::Bool => Some(other.mangle_suffix()),
                 _ => None,
-            },
-            _ => None,
-        };
+            }
+        }
+        let receiver_prefix = extract_receiver_prefix(receiver_ty);
 
         // Search generic_impls for method — prefer receiver-type-specific matches
         let mut receiver_match = None;    // Matches receiver type prefix (highest priority)
@@ -1293,7 +1312,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                             concrete_tys: vec![],
                             self_ty: None,
                             imports: file.imports.clone(),
-                            type_map: std::collections::HashMap::new(),
+                            type_map: std::collections::BTreeMap::new(),
                         });
                         break;
                     }
@@ -1314,7 +1333,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
     /// Uses closure pattern instead of Drop to avoid locking the &mut reference.
     pub fn with_generic_context<R>(
         &mut self,
-        new_args: HashMap<String, Type>,
+        new_args: std::collections::BTreeMap<String, Type>,
         self_ty: Type,
         ordered_args: Vec<Type>,
         f: impl FnOnce(&mut Self) -> R,
@@ -1523,6 +1542,8 @@ impl<'a> CodegenContext<'a> {
                 emit_alias_scopes: self.emit_alias_scopes,
                 no_verify: self.no_verify,
                 lib_mode: self.lib_mode,
+                debug_info: self.debug_info,
+                source_file: &self.source_file,
             },
         };
 
@@ -1554,6 +1575,8 @@ impl<'a> CodegenContext<'a> {
             emit_alias_scopes: true, // default: emit scopes
             no_verify: false, // default: verification enabled
             lib_mode: false,
+            debug_info: false,
+            source_file: String::new(),
             
             // Per-function state
             evaluator: RefCell::new(Evaluator::new()),
@@ -1734,6 +1757,18 @@ impl<'a> CodegenContext<'a> {
     /// [SOVEREIGN V2.0] Get liveness result for a function (None if synchronous)
     pub fn get_liveness(&self, fn_name: &str) -> Option<crate::codegen::passes::liveness::LivenessResult> {
         self.discovery.borrow().liveness_results.get(fn_name).cloned()
+    }
+
+    /// [PHASE 11] Register HIR items for an async function that has been lowered
+    /// via lower_async_fn_cfg. The items (struct + step fn) are cached so emit_fn
+    /// can bypass AST codegen and delegate directly to emit_hir_items.
+    pub fn register_hir_async(&self, fn_name: &str, items: Vec<crate::hir::items::Item>) {
+        self.discovery.borrow_mut().hir_async_items.insert(fn_name.to_string(), items);
+    }
+
+    /// [PHASE 11] Get HIR items for a function (None if not lowered via HIR path)
+    pub fn get_hir_async_items(&self, fn_name: &str) -> Option<Vec<crate::hir::items::Item>> {
+        self.discovery.borrow().hir_async_items.get(fn_name).cloned()
     }
 
     /// [SOVEREIGN V2.0] Get the I/O backend for the current target platform.
@@ -2119,10 +2154,10 @@ impl<'a> CodegenContext<'a> {
         ("write_i32".to_string(), expr.to_string())
     }
     
-    pub fn globals(&self) -> std::cell::Ref<'_, std::collections::HashMap<String, Type>> {
+    pub fn globals(&self) -> std::cell::Ref<'_, std::collections::BTreeMap<String, Type>> {
         std::cell::Ref::map(self.discovery.borrow(), |d| &d.globals)
     }
-    pub fn globals_mut(&self) -> std::cell::RefMut<'_, std::collections::HashMap<String, Type>> {
+    pub fn globals_mut(&self) -> std::cell::RefMut<'_, std::collections::BTreeMap<String, Type>> {
         std::cell::RefMut::map(self.discovery.borrow_mut(), |d| &mut d.globals)
     }
     pub fn imports(&self) -> std::cell::Ref<'_, Vec<ImportDecl>> {
@@ -2163,10 +2198,10 @@ impl<'a> CodegenContext<'a> {
     pub fn monomorphizer_mut(&self) -> std::cell::RefMut<'_, crate::codegen::phases::MonomorphizerState> {
         std::cell::RefMut::map(self.expansion.borrow_mut(), |e| &mut e.monomorphizer)
     }
-    pub fn current_type_map(&self) -> std::cell::Ref<'_, std::collections::HashMap<String, Type>> {
+    pub fn current_type_map(&self) -> std::cell::Ref<'_, std::collections::BTreeMap<String, Type>> {
         std::cell::Ref::map(self.expansion.borrow(), |e| &e.current_type_map)
     }
-    pub fn current_type_map_mut(&self) -> std::cell::RefMut<'_, std::collections::HashMap<String, Type>> {
+    pub fn current_type_map_mut(&self) -> std::cell::RefMut<'_, std::collections::BTreeMap<String, Type>> {
         std::cell::RefMut::map(self.expansion.borrow_mut(), |e| &mut e.current_type_map)
     }
     pub fn current_generic_args(&self) -> std::cell::Ref<'_, Vec<Type>> {
@@ -2940,13 +2975,13 @@ impl<'a> CodegenContext<'a> {
 
 pub struct GenericContextGuard<'b, 'a> {
     ctx: &'b CodegenContext<'a>,
-    old_args: HashMap<String, Type>,
+    old_args: std::collections::BTreeMap<String, Type>,
     old_self: Option<Type>,
     old_ordered_args: Vec<Type>,
 }
 
 impl<'b, 'a> GenericContextGuard<'b, 'a> {
-    pub fn new(ctx: &'b CodegenContext<'a>, new_args: HashMap<String, Type>, self_ty: Type, ordered_args: Vec<Type>) -> Self {
+    pub fn new(ctx: &'b CodegenContext<'a>, new_args: std::collections::BTreeMap<String, Type>, self_ty: Type, ordered_args: Vec<Type>) -> Self {
         let old_args = std::mem::replace(&mut *ctx.current_type_map_mut(), new_args);
         let old_self = std::mem::replace(&mut *ctx.current_self_ty_mut(), Some(self_ty));
         let old_ordered_args = std::mem::replace(&mut *ctx.current_generic_args_mut(), ordered_args);
@@ -3314,7 +3349,7 @@ impl<'a> CodegenContext<'a> {
                          concrete_tys: vec![],
                          self_ty: None,
                          imports: file.imports.clone(),
-                         type_map: HashMap::new(),
+                         type_map: std::collections::BTreeMap::new(),
                      };
                      
                      // Push to worklist and mark seen

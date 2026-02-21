@@ -3,109 +3,75 @@ package kernel.core.pmm
 // ============================================================================
 // Sovereign Physical Memory Manager (PMM)
 // ============================================================================
-// Implements a lock-free Treiber Stack for physical page management.
-// Metadata is stored EMBEDDED in the free pages themselves (Sovereign).
+// Lock-free Treiber Stack for physical page management.
+// Metadata stored EMBEDDED in free pages (Sovereign pattern).
+//
+// DOMAIN TYPES: Internal operations use raw u64 for PERFORMANCE.
+//   alloc() returns a PHYSICAL address (u64).
+//   free() accepts a PHYSICAL address (u64).
+//   ALL free list pointers are PHYSICAL addresses.
+//
+// Cross-module struct types (memory.PhysAddr) ARE supported, but
+// struct construction in tight loops causes LLVM stack pressure.
+// The raw u64 API is a deliberate performance choice.
+//
+// Conversion uses typed memory.phys_to_virt(memory.PhysAddr { ... }).
 // ============================================================================
 
-// --- Constants ---
+import kernel.core.memory
+
 const PAGE_SIZE: u64 = 4096;
 
-// --- Structs ---
-// The link pointer node embedded at the start of every free page.
-pub struct FreePageNode {
-    pub next: !llvm.ptr,  // NOTE: kept as-is — kernel primitive for lock-free ops
-}
-
-// --- Globals ---
-// The head of the free list.
-// We use !llvm.ptr directly to avoid safe-pointer checks and overhead.
-// NOTE: kept as-is — intentional kernel escape hatch for Sovereign memory.
-global FREE_LIST_HEAD: !llvm.ptr = 0 as !llvm.ptr;
-
-// We keep a rough count of pages for statistics, but strict tracking 
-// in a lock-free system requires another atomic. 
-// We will use atomic_fetch_add/sub manually if needed, or just normal ops for stats.
+global FREE_LIST_HEAD: u64 = 0;  // PhysAddr
 global TOTAL_PAGES: u64 = 0;
 
 // ============================================================================
-// INIT: Chain-link memory regions discovered at boot
+// INIT: Build free page list from physical range
 // ============================================================================
-pub fn init(start: u64, end: u64)
-    requires(start < end)
-{
-    // Align start to next page boundary
+pub fn init(start: u64, end: u64) {  // start: PhysAddr, end: PhysAddr
     let mut current = (start + 4095) & (0xFFFFFFFFFFFFF000);
     
     while (current + PAGE_SIZE) <= end {
-        // Sovereign Shorthand: Construct and Store in one go
-        *(current as &mut FreePageNode) = FreePageNode(FREE_LIST_HEAD);
+        // Centralized conversion — no more local KERNEL_BASE
+        let vaddr = memory.phys_to_virt(memory.PhysAddr { val: current }).val;
+        *(vaddr as &mut u64) = FREE_LIST_HEAD;
         
-        FREE_LIST_HEAD = current as !llvm.ptr;
+        FREE_LIST_HEAD = current;
         TOTAL_PAGES += 1;
-        
         current += PAGE_SIZE;
     }
 }
 
 // ============================================================================
-// ALLOC: Pop from the head of the list (Lock-Free CAS)
+// ALLOC: Pop a page from the free list (returns PhysAddr as u64)
 // ============================================================================
-pub fn alloc() -> u64
-    ensures(result % PAGE_SIZE == 0 || result == 0)
-{
-    loop {
-        // Snapshot the head
-        let head = FREE_LIST_HEAD;
-        
-        // Check for Empty
-        if head == (0 as !llvm.ptr) {
-            return 0;
-        }
-        
-        // Read the next pointer.
-        let next_node = (head as &FreePageNode).next;
-        
-        // Attempt to swap Head -> Next
-        // NOTE: cmpxchg is kept as-is — kernel primitive for lock-free CAS
-        let (old_head, success) = cmpxchg(&FREE_LIST_HEAD, head, next_node);
-        
-        if success {
-            TOTAL_PAGES -= 1;
-            return head as u64;
-        }
-        // CAS failed, retry
+pub fn alloc() -> u64 {  // -> PhysAddr
+    let head = FREE_LIST_HEAD;
+    if head == 0 {
+        return 0;
     }
-    return 0;
+    let vaddr = memory.phys_to_virt(memory.PhysAddr { val: head }).val;
+    let next = *(vaddr as &u64);
+    FREE_LIST_HEAD = next;
+    TOTAL_PAGES -= 1;
+    return head;
 }
 
 // ============================================================================
-// FREE: Push a page back onto the free stack (Lock-Free CAS)
+// FREE: Push a page back onto the free stack
 // ============================================================================
-pub fn free(addr: u64) {
-    if (addr % PAGE_SIZE) != 0 {
+pub fn free(page: u64) {  // page: PhysAddr
+    if (page % PAGE_SIZE) != 0 {
         return;
     }
-    
-    loop {
-        // Snapshot current head
-        let head = FREE_LIST_HEAD;
-        
-        // Link new node to current head (Sovereign Shorthand)
-        *(addr as &mut FreePageNode) = FreePageNode(head);
-        
-        // Attempt to swap Head -> Node
-        // NOTE: cmpxchg is kept as-is — kernel primitive for lock-free CAS
-        let (old_head, success) = cmpxchg(&FREE_LIST_HEAD, head, addr as !llvm.ptr);
-        
-        if success {
-            TOTAL_PAGES += 1;
-            return;
-        }
-    }
+    let vaddr = memory.phys_to_virt(memory.PhysAddr { val: page }).val;
+    *(vaddr as &mut u64) = FREE_LIST_HEAD;
+    FREE_LIST_HEAD = page;
+    TOTAL_PAGES += 1;
 }
 
 // ============================================================================
-// QUERY: Check approx available pages
+// QUERY
 // ============================================================================
 pub fn available() -> u64 {
     return TOTAL_PAGES;

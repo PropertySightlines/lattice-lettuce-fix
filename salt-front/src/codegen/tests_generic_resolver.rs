@@ -3,7 +3,7 @@ mod tests {
     use crate::codegen::generic_resolver::*;
     use crate::types::{Type, Provenance};
     use crate::grammar::GenericParam;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     // ═══════════════════════════════════════════════════════════════════
     // unify_types tests
@@ -11,7 +11,7 @@ mod tests {
 
     #[test]
     fn test_unify_generic_binds_name() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types(&Type::Generic("T".into()), &Type::I64, &mut map);
         assert_eq!(map.get("T"), Some(&Type::I64));
     }
@@ -19,14 +19,14 @@ mod tests {
     #[test]
     fn test_unify_struct_single_char_uppercase_does_not_bind() {
         // After hack removal: Struct("T") is NOT treated as generic
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types(&Type::Struct("T".into()), &Type::I64, &mut map);
         assert!(map.is_empty(), "Struct('T') should NOT bind — use Generic('T')");
     }
 
     #[test]
     fn test_unify_struct_multi_char_does_not_bind() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types(&Type::Struct("Range".into()), &Type::I64, &mut map);
         assert!(map.is_empty(), "Multi-char Struct name should not be treated as generic");
     }
@@ -34,14 +34,14 @@ mod tests {
     #[test]
     fn test_unify_struct_single_char_does_not_bind() {
         // Hack removed: even Struct("T") is NOT treated as generic
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types(&Type::Struct("T".into()), &Type::I64, &mut map);
         assert!(map.is_empty(), "Single-char Struct('T') should NOT be treated as generic — use Generic('T')");
     }
 
     #[test]
     fn test_unify_concrete_recurse() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Concrete("Vec".into(), vec![Type::Generic("T".into())]);
         let concrete = Type::Concrete("Vec".into(), vec![Type::I64]);
         unify_types(&template, &concrete, &mut map);
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn test_unify_fn_type() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Fn(
             vec![Type::Generic("A".into())],
             Box::new(Type::Generic("B".into())),
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn test_unify_pointer_recurse() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Pointer {
             element: Box::new(Type::Generic("T".into())),
             provenance: Provenance::Naked,
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_unify_pointer_vs_concrete_ptr() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Pointer {
             element: Box::new(Type::Generic("T".into())),
             provenance: Provenance::Naked,
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_unify_reference_auto_deref() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Generic("T".into());
         let concrete = Type::Reference(Box::new(Type::I64), false);
         unify_types(&template, &concrete, &mut map);
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_unify_does_not_overwrite() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".into(), Type::I64);
         unify_types(&Type::Generic("T".into()), &Type::F64, &mut map);
         assert_eq!(map.get("T"), Some(&Type::I64), "Should not overwrite existing binding");
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn test_unify_nested_concrete() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Concrete(
             "Result".into(),
             vec![
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_unify_qualified_name_matching() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = Type::Concrete("Result".into(), vec![Type::Generic("T".into())]);
         let concrete = Type::Concrete("std__core__result__Result".into(), vec![Type::I32]);
         // Should match because "std__core__result__Result" ends with "__Result"
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn test_phantom_basic_fn_return() {
         // Map<I, F, T> with F = Fn(i64)->i64 => T = i64
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".into(), Type::Struct("Range".into()));
         map.insert("F".into(), Type::Fn(vec![Type::I64], Box::new(Type::I64)));
         let declared = vec!["I".into(), "F".into(), "T".into()];
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_phantom_no_unresolved() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".into(), Type::I64);
         let declared = vec!["T".into()];
         infer_phantom_generics(&declared, &mut map);
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_phantom_no_fn_types() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".into(), Type::Struct("Range".into()));
         let declared = vec!["I".into(), "T".into()];
         infer_phantom_generics(&declared, &mut map);
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_phantom_multiple_unresolved_no_infer() {
         // Ambiguous: two unresolved generics, one Fn type
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("F".into(), Type::Fn(vec![Type::I64], Box::new(Type::F64)));
         let declared = vec!["F".into(), "T".into(), "U".into()];
         infer_phantom_generics(&declared, &mut map);
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_phantom_fn_returning_struct() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("F".into(), Type::Fn(
             vec![Type::I64],
             Box::new(Type::Struct("MyStruct".into())),

@@ -230,7 +230,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                 out.push_str(&format!(
                     "    {} = \"llvm.cmpxchg\"({}, {}, {}) {{\
                         success_ordering = 5 : i64, \
-                        failure_ordering = 1 : i64\
+                        failure_ordering = 2 : i64\
                     }} : (!llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.struct<(!llvm.ptr, i1)>\n",
                     cas_res, addr_val, old_val, new_val
                 ));
@@ -456,6 +456,31 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                     val_var, ptr_var
                 ));
                 return Ok(Some(("".to_string(), Type::Unit)));
+            }
+
+            // atomic_cas_i64(addr: &i64, expected: i64, desired: i64) -> i64
+            // Compare-and-swap with SeqCst/Monotonic ordering, returns old value
+            // On M4: lowers to CAS instruction (FEAT_LSE)
+            "salt_atomic_cas_i64" | "atomic_cas_i64" | "sovereign__atomic_cas_i64" => {
+                if args.len() != 3 {
+                    return Err("atomic_cas_i64 expects 3 arguments: (addr, expected, desired)".to_string());
+                }
+                let (addr_val, _) = emit_expr(self, out, &args[0], local_vars, None)?;
+                let (old_val, _) = emit_expr(self, out, &args[1], local_vars, Some(&Type::I64))?;
+                let (new_val, _) = emit_expr(self, out, &args[2], local_vars, Some(&Type::I64))?;
+
+                // llvm.cmpxchg returns {i64, i1} — we extract the i64 result
+                let cas_res = format!("%cas_res_{}", self.next_id());
+                let cas_val = format!("%cas_val_{}", self.next_id());
+                out.push_str(&format!(
+                    "    {} = \"llvm.cmpxchg\"({}, {}, {}) {{success_ordering = 5 : i64, failure_ordering = 2 : i64}} : (!llvm.ptr, i64, i64) -> !llvm.struct<(i64, i1)>\n",
+                    cas_res, addr_val, old_val, new_val
+                ));
+                out.push_str(&format!(
+                    "    {} = llvm.extractvalue {}[0] : !llvm.struct<(i64, i1)>\n",
+                    cas_val, cas_res
+                ));
+                return Ok(Some((cas_val, Type::I64)));
             }
 
             // =================================================================
@@ -3618,7 +3643,7 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                             concrete_tys: vec![],
                             self_ty: Some(ty.clone()),
                             imports: func_imports,
-                            type_map: std::collections::HashMap::new(),
+                            type_map: std::collections::BTreeMap::new(),
                         };
                         self.entity_registry_mut().request_specialization(task.clone());
                         self.pending_generations_mut().push_back(task);

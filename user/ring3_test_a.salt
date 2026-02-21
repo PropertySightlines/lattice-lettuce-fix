@@ -1,0 +1,30 @@
+// user/ring3_test_a.salt
+// Process A: prints identification message in a loop, then exits
+
+package user.ring3_test_a
+
+extern fn sys_write(fd: u64, buf: u64, len: u64);
+extern fn sys_exit(code: u64);
+
+@no_mangle
+pub fn main() {
+    let msg = "[A] Hello from Process A!\n";
+    let slice_addr = (&msg) as u64;
+    let data_ptr = *(slice_addr as &u64);
+    let len: u64 = 26;
+
+    let mut i: u64 = 0;
+    while i < 10 {
+        sys_write(1, data_ptr, len);
+
+        // Spin to stay alive longer than the PIT tick (~714µs)
+        let mut spin: u64 = 0;
+        while spin < 5000000 {
+            spin = spin + 1;
+        }
+
+        i = i + 1;
+    }
+
+    sys_exit(0);
+}

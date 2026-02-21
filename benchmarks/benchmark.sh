@@ -61,10 +61,7 @@ usage() {
 }
 
 # Feature tests (excluded from perf benchmarks)
-EXCLUDED_TESTS=(
-    # Kernel-only benchmarks (require bare-metal runtime)
-    "alloc_bench" "ipc_bench" "ring_of_fire" "ring_of_fire_1k" "syscall_bench"
-)
+EXCLUDED_TESTS=()
 
 is_excluded() {
     local name="$1"

@@ -3,6 +3,8 @@
 // where Ptr::empty() is used in a return statement and the generic T 
 // should be inferred from the function's return type.
 
+package main
+
 use std.core.ptr.Ptr
 
 struct Node {

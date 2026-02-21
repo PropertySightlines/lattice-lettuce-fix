@@ -1,0 +1,35 @@
+// Facet GPU — Device Abstraction Trait
+//
+// Defines the OS-agnostic interface for GPU compute and rendering.
+// Backends implement this trait to target specific hardware APIs
+// (Metal on macOS, Vulkan on Lattice kernel, etc.).
+//
+// All handles are opaque i64 values. The backend is responsible
+// for mapping them to native GPU objects.
+
+package gpu.device
+
+// Opaque handle types — passed through from backend, never dereferenced.
+pub type BufferHandle = i64;
+pub type PipelineHandle = i64;
+pub type TextureHandle = i64;
+
+use std.core.ptr.Ptr
+
+pub trait GpuDevice {
+    // Lifecycle
+    fn init() -> i64;
+    fn destroy(device: i64);
+
+    // Buffer management
+    fn create_buffer(device: i64, size_bytes: i64) -> BufferHandle;
+    fn buffer_contents(buffer: BufferHandle) -> Ptr<u8>;
+    fn buffer_length(buffer: BufferHandle) -> i64;
+    fn destroy_buffer(buffer: BufferHandle);
+
+    // Shader compilation
+    fn compile_shader(device: i64, source: Ptr<u8>, entry_point: Ptr<u8>) -> PipelineHandle;
+
+    // Compute dispatch
+    fn dispatch(device: i64, pipeline: PipelineHandle, buffers: Ptr<i64>, buffer_count: i32, thread_count: i32);
+}

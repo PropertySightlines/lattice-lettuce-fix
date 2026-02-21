@@ -295,6 +295,43 @@ impl Parse for SynType {
             let inner = input.parse::<SynType>()?;
             return Ok(SynType::Reference(Box::new(inner), is_mut));
         }
+
+        // [CROSS-MODULE STRUCT] Intercept dotted module paths: module.StructName
+        // Salt uses `.` as the module separator (not `::`), so `addr.PhysAddr`
+        // in type position is parsed as a field access by syn::Type. We intercept
+        // `Ident.Ident` and build a multi-segment SynPath.
+        if input.peek(Ident) {
+            let fork = input.fork();
+            let _: Ident = fork.parse()?;
+            if fork.peek(Token![.]) {
+                let _: Token![.] = fork.parse()?;
+                if fork.peek(Ident) {
+                    // Pattern confirmed: Ident.Ident — consume from the real input
+                    let first: Ident = input.parse()?;
+                    input.parse::<Token![.]>()?;
+                    let second: Ident = input.parse()?;
+                    
+                    // Parse optional generic args: module.Struct<T, U>
+                    let mut args = Vec::new();
+                    if input.peek(Token![<]) {
+                        input.parse::<Token![<]>()?;
+                        loop {
+                            if input.peek(Token![>]) { break; }
+                            args.push(input.parse::<SynType>()?);
+                            if !input.peek(Token![,]) { break; }
+                            input.parse::<Token![,]>()?;
+                        }
+                        input.parse::<Token![>]>()?;
+                    }
+                    
+                    let segments = vec![
+                        SynPathSegment { ident: first, args: vec![] },
+                        SynPathSegment { ident: second, args },
+                    ];
+                    return Ok(SynType::Path(SynPath { segments }));
+                }
+            }
+        }
         
         // Fallback: Parse as syn::Type and convert
         // This handles Arrays, Tuples, and standard Paths (validating no NativePtr)

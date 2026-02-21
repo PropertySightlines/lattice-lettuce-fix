@@ -12,7 +12,7 @@
 /// 5. **Phantom** — infer unresolved generics from `Fn` return types
 /// 6. **Completeness** — verify all generics are resolved
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use crate::types::Type;
 use crate::codegen::context::LoweringContext;
 use crate::grammar::{GenericParam, SaltFn};
@@ -51,8 +51,8 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
         self_ty: Option<&Type>,
         struct_generics: Option<&[GenericParam]>,
         struct_concrete_args: &[Type],
-    ) -> Result<HashMap<String, Type>, String> {
-        let mut map = HashMap::new();
+    ) -> Result<BTreeMap<String, Type>, String> {
+        let mut map = BTreeMap::new();
 
         // Compute struct-level generic names for filtering downstream
         // func.generics.params = [impl_params... , method_params...] by convention
@@ -103,7 +103,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn apply_turbofish(&mut self,
         template: &SaltFn,
         turbofish_args: &[Type],
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         if let Some(generics) = &template.generics {
             for (i, param) in generics.params.iter().enumerate() {
@@ -119,7 +119,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn apply_struct_turbofish(&mut self,
         struct_generics: Option<&[GenericParam]>,
         turbofish_args: &[Type],
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         if let Some(params) = struct_generics {
             for (i, param) in params.iter().enumerate() {
@@ -135,7 +135,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn apply_struct_generics(&mut self,
         struct_generics: Option<&[GenericParam]>,
         concrete_args: &[Type],
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         if let Some(params) = struct_generics {
             for (i, param) in params.iter().enumerate() {
@@ -160,9 +160,9 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
         template: &SaltFn,
         call_arg_exprs: &[syn::Expr],
         local_vars: &HashMap<String, (Type, crate::codegen::context::LocalKind)>,
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
-        let trace_locals: HashMap<String, Type> = local_vars.iter()
+        let trace_locals: BTreeMap<String, Type> = local_vars.iter()
             .map(|(k, (t, _))| (k.clone(), t.clone()))
             .collect();
 
@@ -232,7 +232,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
         defined_self: &Type,
         call_arg_exprs: &[syn::Expr],
         local_vars: &HashMap<String, (Type, crate::codegen::context::LocalKind)>,
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         let is_instance_method = template.args.first()
             .map(|arg| arg.name.to_string() == "self")
@@ -240,7 +240,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
 
         if is_instance_method {
             if let Some(first_expr) = call_arg_exprs.first() {
-                let trace_locals: HashMap<String, Type> = local_vars.iter()
+                let trace_locals: BTreeMap<String, Type> = local_vars.iter()
                     .map(|(k, (t, _))| (k.clone(), t.clone()))
                     .collect();
                 if let Ok(ty) = crate::codegen::tracer::TypeTracer::trace_expr_type(
@@ -256,7 +256,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn infer_from_return_type(&mut self,
         template: &SaltFn,
         expected_ret_ty: Option<&Type>,
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         let Some(expected) = expected_ret_ty else { return };
         
@@ -271,14 +271,14 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
                 None => return,
             };
             self.ctx.with_generic_context(
-                HashMap::new(),
+                BTreeMap::new(),
                 Type::Unit,
                 Vec::new(),
                 |ctx| crate::codegen::type_bridge::resolve_type(ctx, &rt),
             )
         };
 
-        let mut inferred = HashMap::new();
+        let mut inferred = BTreeMap::new();
         unify_types(&template_ret_ty, expected, &mut inferred);
 
         for name in &unmapped {
@@ -297,7 +297,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     /// output type of a function-typed generic parameter.
     fn infer_phantom_generics_from_template(&mut self,
         template: &SaltFn,
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         if let Some(generics) = &template.generics {
             let declared: Vec<String> = generics.params.iter()
@@ -315,7 +315,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn infer_phantom_generics_method_only(&mut self,
         template: &SaltFn,
         struct_generic_names: &[String],
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
     ) {
         if let Some(generics) = &template.generics {
             let method_only_declared: Vec<String> = generics.params.iter()
@@ -334,7 +334,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     fn verify_completeness_method_only(&mut self,
         template: &SaltFn,
         struct_generic_names: &[String],
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
         expected_ret_ty: Option<&Type>,
         self_ty: Option<&Type>,
     ) -> Result<(), String> {
@@ -363,7 +363,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     /// Phase 7: Verify all required generics are resolved.
     fn verify_completeness(&mut self,
         template: &SaltFn,
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
         expected_ret_ty: Option<&Type>,
         self_ty: Option<&Type>,
     ) -> Result<(), String> {
@@ -413,7 +413,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
         let template_ret_ty = {
             let rt = template.ret_type.as_ref()?;
             self.ctx.with_generic_context(
-                HashMap::new(),
+                BTreeMap::new(),
                 Type::Unit,
                 Vec::new(),
                 |ctx| crate::codegen::type_bridge::resolve_type(ctx, rt),
@@ -428,7 +428,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
             .unwrap_or_default();
         let normalized = normalize_generics(&template_ret_ty, &declared);
 
-        let mut temp_map = HashMap::new();
+        let mut temp_map = BTreeMap::new();
         unify_types(&normalized, expected, &mut temp_map);
         temp_map.remove(generic_name)
     }
@@ -441,7 +441,7 @@ impl<'a, 'ctx, 'b> GenericResolver<'a, 'ctx, 'b> {
     }
 
     /// Collect generic param names that are NOT yet in the map.
-    fn get_unmapped_generics(&mut self, template: &SaltFn, map: &HashMap<String, Type>) -> Vec<String> {
+    fn get_unmapped_generics(&mut self, template: &SaltFn, map: &BTreeMap<String, Type>) -> Vec<String> {
         template.generics.as_ref()
             .map(|g| g.params.iter()
                 .map(|p| generic_param_name(p))
@@ -470,7 +470,7 @@ pub fn generic_param_name(param: &GenericParam) -> String {
 /// among the declared generics, bind the unresolved generic to the Fn's return type.
 pub fn infer_phantom_generics(
     declared_generics: &[String],
-    map: &mut HashMap<String, Type>,
+    map: &mut BTreeMap<String, Type>,
 ) {
     let unresolved: Vec<String> = declared_generics.iter()
         .filter(|g| !map.contains_key(*g))
@@ -551,7 +551,7 @@ pub fn normalize_generics(ty: &Type, declared: &[String]) -> Type {
 pub fn unify_types(
     template: &Type,
     concrete: &Type,
-    map: &mut HashMap<String, Type>,
+    map: &mut BTreeMap<String, Type>,
 ) {
     match (template, concrete) {
         // Explicit generic marker

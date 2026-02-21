@@ -14,7 +14,7 @@
 #[cfg(test)]
 mod tests {
     use crate::types::{Type, Provenance};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     // =========================================================================
     // Section 1: Type::substitute for Pointer { element: Struct("T") }
@@ -34,7 +34,7 @@ mod tests {
             is_mutable: true,
         };
 
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::F32);
 
         let result = ty.substitute(&map);
@@ -67,7 +67,7 @@ mod tests {
             ],
         );
 
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::F32);
 
         let result = ty.substitute(&map);
@@ -96,7 +96,7 @@ mod tests {
             is_mutable: true,
         };
 
-        let map = HashMap::new();
+        let map = BTreeMap::new();
         let result = ty.substitute(&map);
 
         // With empty map, Struct("T") stays Struct("T")
@@ -137,7 +137,7 @@ mod tests {
             is_mutable: true,
         };
 
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::F32);
 
         let result = ty.substitute(&map);
@@ -162,7 +162,7 @@ mod tests {
             ],
         );
 
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::F32);
         map.insert("E".to_string(), Type::Struct("IOError".to_string()));
 
@@ -265,13 +265,13 @@ mod tests {
     }
 
     /// Mini unifier using Generic("T") for templates (Struct("T") is not a generic)
-    fn unify_types(template: &Type, concrete: &Type) -> HashMap<String, Type> {
-        let mut map = HashMap::new();
+    fn unify_types(template: &Type, concrete: &Type) -> BTreeMap<String, Type> {
+        let mut map = BTreeMap::new();
         unify_recursive(template, concrete, &mut map);
         map
     }
 
-    fn unify_recursive(template: &Type, concrete: &Type, map: &mut HashMap<String, Type>) {
+    fn unify_recursive(template: &Type, concrete: &Type, map: &mut BTreeMap<String, Type>) {
         match (template, concrete) {
             (Type::Generic(name), _) => {
                 map.insert(name.clone(), concrete.clone());

@@ -1,0 +1,266 @@
+// =============================================================================
+// Slab Reclaim Benchmark — Stack Recycling Verification
+// =============================================================================
+// Test-driven verification of P0: Slab Allocator Stack Reclamation.
+//
+// Phase 1 — Unit Test (Treiber Stack Correctness):
+//   Pop N stacks, push them back, pop again. Verify address reuse and
+//   watermark invariant (bump counter must not advance on recycled pops).
+//
+// Phase 2 — Integration Test (100K Ephemeral Fibers):
+//   Spawn fibers in batches of 500 across 200 generations (100,000 total).
+//   Each fiber does trivial work then calls fiber_exit(). Verify that the
+//   slab watermark plateaus after generation 1 — proving the Treiber stack
+//   endlessly recycles the same pool of 16KB slots.
+//
+// Pass criteria:
+//   Phase 1: All N round-trip stacks match, watermark stable.
+//   Phase 2: Watermark after generation 200 == watermark after generation 1.
+//            No "SLAB EXHAUSTED" panic despite 100K total spawns.
+//
+// Expected output:
+//   BENCH:slab_reclaim:start
+//   BENCH:slab_reclaim:phase1 recycled=64 fresh=0
+//   BENCH:slab_reclaim:phase1:PASS
+//   BENCH:slab_reclaim:phase2 gen=1 watermark=564
+//   BENCH:slab_reclaim:phase2 gen=200 watermark=564
+//   BENCH:slab_reclaim:phase2:PASS 100000 fibers, watermark stable
+// =============================================================================
+
+package benchmarks.slab_reclaim_bench
+
+use kernel.drivers.serial
+use kernel.drivers.vga
+use kernel.core.scheduler
+
+// slab.salt (kernel.mem) — @no_mangle
+extern fn pop_stack() -> u64;
+extern fn push_stack(ptr: u64);
+extern fn slab_watermark() -> i32;
+
+// =============================================================================
+// Ephemeral Fiber Entry Point
+// =============================================================================
+// Does trivial compute then exits cleanly. The fiber_exit() call triggers
+// deferred stack reclamation via the scheduler's PENDING_RECLAIM protocol.
+// =============================================================================
+@no_mangle
+fn ephemeral_fiber() {
+    let mut x: u64 = 0;
+    while x < 100 {
+        x = x + 1;
+    }
+    scheduler.exit_fiber();
+}
+
+// =============================================================================
+// Phase 1: Direct Treiber Stack Round-Trip
+// =============================================================================
+fn phase1() -> bool {
+    serial.print("BENCH:slab_reclaim:phase1:start\n");
+
+    let num_slots: i32 = 64;
+    let mut addrs: [u64; 64] = [0 as u64; 64];
+    let mut i: i32 = 0;
+
+    // Pop N stacks
+    while i < num_slots {
+        addrs[i] = pop_stack();
+        if addrs[i] == 0 {
+            serial.print("BENCH:slab_reclaim:phase1:FAIL pop returned 0 at i=");
+            serial.print_u64(i as u64);
+            serial.print("\n");
+            return false;
+        }
+        i = i + 1;
+    }
+
+    let watermark_after_pop = slab_watermark();
+
+    // Push all N stacks back (recycle)
+    let mut j: i32 = 0;
+    while j < num_slots {
+        push_stack(addrs[j]);
+        j = j + 1;
+    }
+
+    // Pop N stacks again — must reuse recycled addresses
+    let mut recycled: i32 = 0;
+    let mut fresh: i32 = 0;
+    let mut k: i32 = 0;
+
+    while k < num_slots {
+        let addr = pop_stack();
+        if addr == 0 {
+            serial.print("BENCH:slab_reclaim:phase1:FAIL round2 pop returned 0\n");
+            return false;
+        }
+
+        // Check if address was in round 1
+        let mut found = false;
+        let mut m: i32 = 0;
+        while m < num_slots {
+            if addr == addrs[m] {
+                found = true;
+                m = num_slots;
+            }
+            m = m + 1;
+        }
+
+        if found {
+            recycled = recycled + 1;
+        } else {
+            fresh = fresh + 1;
+        }
+
+        k = k + 1;
+    }
+
+    let watermark_after_round2 = slab_watermark();
+
+    serial.print("BENCH:slab_reclaim:phase1 recycled=");
+    serial.print_u64(recycled as u64);
+    serial.print(" fresh=");
+    serial.print_u64(fresh as u64);
+    serial.print("\n");
+
+    // Push round-2 stacks back for Phase 2 to use
+    let mut p: i32 = 0;
+    while p < num_slots {
+        push_stack(addrs[p]);
+        p = p + 1;
+    }
+
+    // Verdict: all recycled, watermark stable
+    if recycled == num_slots {
+        if watermark_after_round2 == watermark_after_pop {
+            serial.print("BENCH:slab_reclaim:phase1:PASS\n");
+            return true;
+        }
+    }
+
+    serial.print("BENCH:slab_reclaim:phase1:FAIL watermark or recycled mismatch\n");
+    return false;
+}
+
+// =============================================================================
+// Phase 2: 100K Ephemeral Fiber Stress Test
+// =============================================================================
+// Spawns fibers in batches, lets them die and get recycled, repeats.
+// The slab watermark must plateau — proving stacks are recycled, not leaked.
+// =============================================================================
+fn phase2() -> bool {
+    serial.print("BENCH:slab_reclaim:phase2:start\n");
+
+    let batch_size: i32 = 500;
+    let num_generations: i32 = 200;
+    let mut total_spawned: u64 = 0;
+    let mut watermark_gen1: i32 = 0;
+    let mut gen: i32 = 0;
+
+    // Record baseline fiber count BEFORE spawning. Prior benchmarks (ROF, ROF-1K)
+    // may leave persistent fibers alive, so we cannot assume fiber_count() == 1.
+    let baseline_count = scheduler.get_fiber_count();
+
+    while gen < num_generations {
+        // Spawn a batch of ephemeral fibers
+        let mut s: i32 = 0;
+        while s < batch_size {
+            let entry = (&ephemeral_fiber) as u64;
+            let result = scheduler.spawn(entry);
+
+            // If spawn fails (no free bitmap slots), yield to let fibers die
+            if result == 9999 {
+                scheduler.yield_now();
+                s = s - 1;
+            }
+
+            s = s + 1;
+        }
+
+        // Yield repeatedly until all ephemeral fibers have exited.
+        // Drain until fiber_count returns to the baseline (pre-spawn) level.
+        let mut safety: i32 = 0;
+        while scheduler.get_fiber_count() > baseline_count {
+            scheduler.yield_now();
+            safety = safety + 1;
+            if safety > 1000000 {
+                serial.print("BENCH:slab_reclaim:phase2:FAIL fibers did not exit\n");
+                return false;
+            }
+        }
+
+        total_spawned = total_spawned + (batch_size as u64);
+
+        // Record watermark after first generation (the high-water mark)
+        if gen == 0 {
+            watermark_gen1 = slab_watermark();
+            serial.print("BENCH:slab_reclaim:phase2 gen=1 watermark=");
+            serial.print_u64(watermark_gen1 as u64);
+            serial.print("\n");
+        }
+
+        // Periodic progress report (every 50 generations)
+        if gen > 0 {
+            let check = gen % 50;
+            if check == 0 {
+                serial.print("BENCH:slab_reclaim:phase2 gen=");
+                serial.print_u64((gen + 1) as u64);
+                serial.print(" watermark=");
+                serial.print_u64(slab_watermark() as u64);
+                serial.print(" total=");
+                serial.print_u64(total_spawned);
+                serial.print("\n");
+            }
+        }
+
+        gen = gen + 1;
+    }
+
+    let watermark_final = slab_watermark();
+
+    serial.print("BENCH:slab_reclaim:phase2 final watermark=");
+    serial.print_u64(watermark_final as u64);
+    serial.print(" total_spawned=");
+    serial.print_u64(total_spawned);
+    serial.print("\n");
+
+    // Verdict: watermark must not have grown after generation 1
+    if watermark_final == watermark_gen1 {
+        serial.print("BENCH:slab_reclaim:phase2:PASS ");
+        serial.print_u64(total_spawned);
+        serial.print(" fibers, watermark stable\n");
+        return true;
+    }
+
+    serial.print("BENCH:slab_reclaim:phase2:FAIL watermark grew from ");
+    serial.print_u64(watermark_gen1 as u64);
+    serial.print(" to ");
+    serial.print_u64(watermark_final as u64);
+    serial.print("\n");
+    return false;
+}
+
+// =============================================================================
+// Public Entry Point
+// =============================================================================
+pub fn run() {
+    serial.print("BENCH:slab_reclaim:start\n");
+    vga.print("Slab reclaim benchmark...\n");
+
+    let p1 = phase1();
+    if !p1 {
+        vga.print_colored("  Slab reclaim Phase 1: FAIL\n", 0x0C);
+        return;
+    }
+    vga.print_colored("  Slab reclaim Phase 1: PASS\n", 0x0A);
+
+    let p2 = phase2();
+    if !p2 {
+        vga.print_colored("  Slab reclaim Phase 2: FAIL\n", 0x0C);
+        return;
+    }
+    vga.print_colored("  Slab reclaim Phase 2: PASS (100K fibers)\n", 0x0A);
+
+    serial.print("BENCH:slab_reclaim:COMPLETE\n");
+}

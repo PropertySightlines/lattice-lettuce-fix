@@ -1,0 +1,30 @@
+// =============================================================================
+// user/ring3_test.salt
+// Ring 3 Integration Test -- Hello World via SYSCALL
+// =============================================================================
+//
+// The first talking user-space program. Calls:
+//   1. sys_write(1, msg, 19) — prints "Hello from Ring 3!\n" to serial
+//   2. sys_exit(0) — cleanly terminates the process
+//
+// Compiled to a standalone ELF and embedded in the kernel via .incbin.
+// =============================================================================
+
+package main
+
+// Assembly syscall stubs (linked from syscall_stubs.S)
+extern fn sys_write(fd: u64, buf: &u8, len: u64) -> u64;
+extern fn sys_exit(code: u64);
+
+fn main() -> i32 {
+    // "Hello from Ring 3!\n" is 19 bytes
+    let msg = "Hello from Ring 3!\n";
+
+    // Syscall 1: write to stdout (fd=1), 19 bytes
+    sys_write(1, msg, 19);
+
+    // Syscall 60: exit with code 0
+    sys_exit(0);
+
+    return 0;
+}

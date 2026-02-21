@@ -15,7 +15,7 @@
 mod tests {
     use crate::types::{Type, Provenance};
     use crate::codegen::expr::unify_types_recursive;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     // ============================
     // Helper constructors
@@ -51,21 +51,21 @@ mod tests {
     
     #[test]
     fn test_generic_placeholder_binds_to_i32() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&generic("T"), &Type::I32, &mut map);
         assert_eq!(map.get("T"), Some(&Type::I32));
     }
     
     #[test]
     fn test_generic_placeholder_binds_to_f64() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&generic("T"), &Type::F64, &mut map);
         assert_eq!(map.get("T"), Some(&Type::F64));
     }
     
     #[test]
     fn test_generic_placeholder_binds_to_struct() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let file_ty = struct_ty("std__io__file__File");
         unify_types_recursive(&generic("T"), &file_ty, &mut map);
         assert_eq!(map.get("T"), Some(&file_ty));
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_generic_placeholder_binds_to_pointer() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let ptr_f32 = ptr(Type::F32);
         unify_types_recursive(&generic("T"), &ptr_f32, &mut map);
         assert_eq!(map.get("T"), Some(&ptr_f32));
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn test_generic_first_binding_wins() {
         // If T is already bound, don't overwrite
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::I32);
         unify_types_recursive(&generic("T"), &Type::F32, &mut map);
         assert_eq!(map.get("T"), Some(&Type::I32), "First binding should win");
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn test_struct_single_char_does_not_bind() {
         // After hack removal: Struct("T") is NOT treated as a generic
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&struct_ty("T"), &Type::F32, &mut map);
         assert!(map.is_empty(), "Struct('T') should NOT be treated as generic — use Generic('T') or normalize_generics");
     }
@@ -103,14 +103,14 @@ mod tests {
     #[test]
     fn test_struct_multi_char_is_not_placeholder() {
         // "File" is not a generic placeholder — it's a real struct name
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&struct_ty("File"), &Type::I32, &mut map);
         assert!(map.is_empty(), "Multi-char struct names should not be treated as generic placeholders");
     }
     
     #[test]
     fn test_struct_lowercase_single_char_is_not_placeholder() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&struct_ty("x"), &Type::I32, &mut map);
         assert!(map.is_empty(), "Lowercase single-char struct names should not be treated as generic placeholders");
     }
@@ -121,7 +121,7 @@ mod tests {
     
     #[test]
     fn test_pointer_recurses_into_element() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = ptr(generic("T"));
         let concrete_ty = ptr(Type::F32);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -130,7 +130,7 @@ mod tests {
     
     #[test]
     fn test_pointer_with_generic_element() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = ptr(generic("T"));
         let concrete_ty = ptr(Type::U64);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -139,7 +139,7 @@ mod tests {
     
     #[test]
     fn test_nested_pointer_recurses() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = ptr(ptr(generic("T")));
         let concrete_ty = ptr(ptr(Type::I32));
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_concrete_result_infers_both_params() {
         // Result<T, E> matched against Result<File, IOError>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("std__core__result__Result", vec![
             generic("T"),
             generic("E"),
@@ -171,7 +171,7 @@ mod tests {
     fn test_concrete_result_with_nested_pointer() {
         // Result<Ptr<T>, IOError> matched against Result<Ptr<f32>, IOError>
         // This is the exact mmap<T> scenario
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("std__core__result__Result", vec![
             ptr(generic("T")),
             concrete("std__io__file__IOError", vec![]),
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_concrete_result_with_u8_pointer() {
         // Result<Ptr<T>, IOError> matched against Result<Ptr<u8>, IOError>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("std__core__result__Result", vec![
             ptr(generic("T")),
             concrete("std__io__file__IOError", vec![]),
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_concrete_name_mismatch_no_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Vec", vec![generic("T")]);
         let concrete_ty = concrete("HashMap", vec![Type::I32]);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -211,7 +211,7 @@ mod tests {
     
     #[test]
     fn test_concrete_arity_mismatch_no_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Result", vec![generic("T"), generic("E")]);
         let concrete_ty = concrete("Result", vec![Type::I32]);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_concrete_vec_single_param() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Vec", vec![generic("T")]);
         let concrete_ty = concrete("Vec", vec![Type::I64]);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_concrete_nested_concrete() {
         // Vec<Result<T, E>> matched against Vec<Result<i32, IOError>>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Vec", vec![
             concrete("Result", vec![generic("T"), generic("E")])
         ]);
@@ -248,7 +248,7 @@ mod tests {
     
     #[test]
     fn test_reference_recurses_into_inner() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = reference(generic("T"), false);
         let concrete_ty = reference(Type::F32, false);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -257,7 +257,7 @@ mod tests {
     
     #[test]
     fn test_reference_mutable_recurses() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = reference(generic("T"), true);
         let concrete_ty = reference(Type::I64, true);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn test_reference_with_concrete_inner() {
         // &Result<T, E> matched against &Result<File, IOError>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = reference(
             concrete("Result", vec![generic("T"), generic("E")]),
             false,
@@ -287,7 +287,7 @@ mod tests {
     
     #[test]
     fn test_array_recurses_into_element() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = array(generic("T"), 10);
         let concrete_ty = array(Type::F32, 10);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -300,14 +300,14 @@ mod tests {
     
     #[test]
     fn test_primitive_vs_primitive_no_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&Type::I32, &Type::I32, &mut map);
         assert!(map.is_empty(), "Matching primitives should not produce bindings");
     }
 
     #[test]
     fn test_primitive_vs_different_primitive_no_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&Type::I32, &Type::F32, &mut map);
         assert!(map.is_empty(), "Different primitives should not produce bindings");
     }
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn test_pointer_vs_reference_no_binding() {
         // Pointer and Reference are different type constructors
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = ptr(generic("T"));
         let concrete_ty = reference(Type::F32, false);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_concrete_vs_pointer_no_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Result", vec![generic("T")]);
         let concrete_ty = ptr(Type::F32);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -339,7 +339,7 @@ mod tests {
     fn test_multiple_generics_same_type() {
         // HashMap<T, T> matched against HashMap<i32, i32>
         // First T binds to i32, second T sees existing binding
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("HashMap", vec![generic("T"), generic("T")]);
         let concrete_ty = concrete("HashMap", vec![Type::I32, Type::I32]);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn test_deeply_nested_inference() {
         // Result<Ptr<Vec<T>>, E> matched against Result<Ptr<Vec<f32>>, IOError>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Result", vec![
             ptr(concrete("Vec", vec![generic("T")])),
             generic("E"),
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn test_empty_concrete_args_matches() {
         // IOError matched against IOError (no args)
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("IOError", vec![]);
         let concrete_ty = concrete("IOError", vec![]);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -375,14 +375,14 @@ mod tests {
 
     #[test]
     fn test_generic_name_e_binds() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&generic("E"), &struct_ty("IOError"), &mut map);
         assert_eq!(map.get("E"), Some(&struct_ty("IOError")));
     }
 
     #[test]
     fn test_struct_placeholder_e_binds_to_concrete() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(
             &generic("E"),
             &concrete("std__io__file__IOError", vec![]),
@@ -401,7 +401,7 @@ mod tests {
         // Method return: Result<Ptr<Struct("T")>, IOError>  
         // Expected type: Result<Ptr<F32>, IOError>
         // Should infer: T -> F32
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let ret_template = concrete("std__core__result__Result", vec![
             ptr(generic("T")),
             concrete("std__io__file__IOError", vec![]),
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_mmap_u8_scenario() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let ret_template = concrete("std__core__result__Result", vec![
             ptr(generic("T")),
             concrete("std__io__file__IOError", vec![]),
@@ -443,7 +443,7 @@ mod tests {
     /// Step A: Bare minimum — unify single Struct("T") against F32
     #[test]
     fn test_pipeline_step_a_single_binding() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&generic("T"), &Type::F32, &mut map);
         assert_eq!(map.len(), 1);
         assert_eq!(map["T"], Type::F32);
@@ -452,7 +452,7 @@ mod tests {
     /// Step B: After unification, substitute replaces Struct("T") with the binding
     #[test]
     fn test_pipeline_step_b_substitute_after_unify() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = ptr(generic("T"));
         let concrete_ty = ptr(Type::F32);
         unify_types_recursive(&template, &concrete_ty, &mut map);
@@ -477,7 +477,7 @@ mod tests {
         // Generic("T") is the proper way to represent generic placeholders,
         // but has_generics checks Type::Generic not Type::Struct. 
         // So check that substitute actually resolves it:
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("T".to_string(), Type::F32);
         let resolved = unresolved.substitute(&map);
         assert_eq!(resolved, ptr(Type::F32));
@@ -495,7 +495,7 @@ mod tests {
         // Called as: let r: Result<Ptr<f32>, IOError> = file.mmap(...)
         
         let declared_generics = vec!["T".to_string()];
-        let mut method_generic_map: HashMap<String, Type> = HashMap::new();
+        let mut method_generic_map: BTreeMap<String, Type> = BTreeMap::new();
         
         // Step 1: Check unmapped
         let unmapped: Vec<&String> = declared_generics.iter()
@@ -535,7 +535,7 @@ mod tests {
     /// Step D variant: Same pipeline but for T=u8
     #[test]
     fn test_pipeline_step_d_u8_variant() {
-        let mut method_generic_map: HashMap<String, Type> = HashMap::new();
+        let mut method_generic_map: BTreeMap<String, Type> = BTreeMap::new();
         
         let ret_template = concrete("Result", vec![
             ptr(generic("T")),
@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn test_pipeline_bidir_bridge_injection() {
         let declared_generics = vec!["T".to_string()];
-        let mut method_generic_map: HashMap<String, Type> = HashMap::new();
+        let mut method_generic_map: BTreeMap<String, Type> = BTreeMap::new();
         
         // Unify
         let ret_template = ptr(generic("T"));
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn test_pipeline_two_param_bridge() {
         let declared_generics = vec!["T".to_string(), "E".to_string()];
-        let mut map: HashMap<String, Type> = HashMap::new();
+        let mut map: BTreeMap<String, Type> = BTreeMap::new();
         
         let ret_template = concrete("Result", vec![generic("T"), generic("E")]);
         let expected_ty = concrete("Result", vec![Type::I32, struct_ty("MyError")]);
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_generic_multi_char_f2_binds() {
         // Type::Generic("F2") should unify just like Generic("T")
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let fn_type = Type::Fn(vec![Type::I64], Box::new(Type::Bool));
         unify_types_recursive(&generic("F2"), &fn_type, &mut map);
         assert_eq!(map.get("F2"), Some(&fn_type),
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_generic_multi_char_item_binds() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         unify_types_recursive(&generic("Item"), &Type::I64, &mut map);
         assert_eq!(map.get("Item"), Some(&Type::I64),
             "Generic('Item') should bind to I64");
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_generic_multi_char_allocator_binds() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let alloc_ty = struct_ty("BumpAllocator");
         unify_types_recursive(&generic("Allocator"), &alloc_ty, &mut map);
         assert_eq!(map.get("Allocator"), Some(&alloc_ty),
@@ -639,7 +639,7 @@ mod tests {
     fn test_concrete_with_multi_char_generic_args() {
         // Map<Generic("I"), Generic("F2"), Generic("Output")> vs
         // Map<Range, Fn(i64)->i64, i64>
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let template = concrete("Map", vec![
             generic("I"),
             generic("F2"),
@@ -663,7 +663,7 @@ mod tests {
         // Called as: filter.map(|x| x * 2)
         // Template ret: Concrete("Map", [Generic("I"), Generic("F2"), Generic("Output")])
         // Concrete ret: Concrete("Map", [Filter_Range_Fn, Fn(i64)->i64, i64])
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let filter_ty = concrete("Filter", vec![struct_ty("Range"), Type::Fn(vec![Type::I64], Box::new(Type::Bool))]);
         let template = concrete("Map", vec![
             generic("I"),       // Self type (Filter<Range, Fn>)
@@ -685,7 +685,7 @@ mod tests {
     fn test_pipeline_multi_char_full_flow() {
         // Full pipeline: unify → substitute → verify no generics
         let declared_generics = vec!["F2".to_string(), "Output".to_string()];
-        let mut map: HashMap<String, Type> = HashMap::new();
+        let mut map: BTreeMap<String, Type> = BTreeMap::new();
 
         let ret_template = concrete("Map", vec![
             struct_ty("Range"),
@@ -719,7 +719,7 @@ mod tests {
     fn test_phantom_generic_map_i_f_t() {
         // Map<I, F, T> with I=Range, F=Fn(i64)->i64 => T should be i64
         let declared = vec!["I".to_string(), "F".to_string(), "T".to_string()];
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), struct_ty("Range"));
         map.insert("F".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::I64)));
 
@@ -734,7 +734,7 @@ mod tests {
     fn test_phantom_generic_no_unresolved() {
         // When all generics are resolved, nothing should change
         let declared = vec!["I".to_string(), "F".to_string()];
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), struct_ty("Range"));
         map.insert("F".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::Bool)));
 
@@ -748,7 +748,7 @@ mod tests {
     fn test_phantom_generic_no_fn_types() {
         // When no Fn types are resolved, phantom generics remain unresolved
         let declared = vec!["I".to_string(), "T".to_string()];
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), struct_ty("Range"));
 
         infer_phantom_generics(&declared, &mut map);
@@ -760,7 +760,7 @@ mod tests {
     fn test_phantom_generic_fn_returns_struct() {
         // F = Fn(i64) -> MyStruct, T should be MyStruct
         let declared = vec!["I".to_string(), "F".to_string(), "Output".to_string()];
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), struct_ty("Vec"));
         map.insert("F".to_string(), Type::Fn(vec![Type::I64], Box::new(struct_ty("MyStruct"))));
 
@@ -774,7 +774,7 @@ mod tests {
     fn test_phantom_generic_two_unresolved_no_inference() {
         // Two unresolved generics + one Fn -> should NOT infer (ambiguous)
         let declared = vec!["I".to_string(), "F".to_string(), "T".to_string(), "U".to_string()];
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("I".to_string(), struct_ty("Range"));
         map.insert("F".to_string(), Type::Fn(vec![Type::I64], Box::new(Type::I64)));
 

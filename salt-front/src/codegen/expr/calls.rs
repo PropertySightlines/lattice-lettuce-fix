@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use crate::types::Type;
 use crate::codegen::context::{LoweringContext, LocalKind};
 use super::utils::*;
@@ -1421,7 +1422,7 @@ pub fn emit_method_call(ctx: &mut LoweringContext, out: &mut String, m: &syn::Ex
                                 mangled = ctx.request_specialization(&original_mangled, concrete.clone(), None);
 
                                 // [Fix] Substitute generics in return type and args locally
-                                let mut subst_map = HashMap::new();
+                                let mut subst_map = BTreeMap::new();
                                 for (i, param) in generics.params.iter().enumerate() {
                                     if let crate::grammar::GenericParam::Type { name, .. } = param {
                                          if let Some(c) = concrete.get(i) {
@@ -1487,7 +1488,7 @@ pub fn emit_method_call(ctx: &mut LoweringContext, out: &mut String, m: &syn::Ex
                   
                   if let Some((func_def, _, _)) = registry_result {
                       // Build substitution map from receiver type args
-                      let mut subst_map = HashMap::new();
+                      let mut subst_map = BTreeMap::new();
                       
                       // CRITICAL: Map Self to the EFFECTIVE receiver type after TYPE-OVERRIDE
                       // If type_based_pkg was used (meaning there's a TYPE-OVERRIDE), construct

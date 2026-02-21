@@ -1,10 +1,11 @@
 //! Phase 1: Discovery State
 //! Contains templates, registries, and imports - read-mostly after initialization.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::grammar::{SaltFile, SaltFn, ImportDecl, StructDef, EnumDef};
 use crate::registry::{Registry, StructInfo, EnumInfo};
 use crate::types::{Type, TypeKey};
+use crate::hir::items::Item;
 use crate::codegen::collector::EntityRegistry;
 use crate::codegen::trait_registry::TraitRegistry;
 
@@ -32,7 +33,7 @@ pub struct DiscoveryState {
     /// All methods must be registered with their signature for overload resolution.
     pub trait_registry: TraitRegistry,
     /// Global variable types
-    pub globals: HashMap<String, Type>,
+    pub globals: BTreeMap<String, Type>,
     /// Import declarations for current scope
     pub imports: Vec<ImportDecl>,
     /// Generic implementations: name -> (function, imports)
@@ -63,6 +64,10 @@ pub struct DiscoveryState {
     /// Populated by the liveness analysis phase for @yielding/@pulse functions.
     /// Used by emit_fn to divert async functions to StateMachineEmitter.
     pub liveness_results: HashMap<String, LivenessResult>,
+    /// [PHASE 11] HIR async items: fn_name -> lowered Items (struct + step fn)
+    /// Populated by lower_async_fn_cfg. When emit_fn sees a @yielding function,
+    /// it checks here first; if items exist, it bypasses AST codegen entirely.
+    pub hir_async_items: HashMap<String, Vec<Item>>,
 }
 
 impl DiscoveryState {
@@ -76,7 +81,7 @@ impl DiscoveryState {
             struct_registry: HashMap::new(),
             enum_registry: HashMap::new(),
             trait_registry: TraitRegistry::default(),
-            globals: HashMap::new(),
+            globals: BTreeMap::new(),
             imports: Vec::new(),
             generic_impls: HashMap::new(),
             entity_registry: EntityRegistry::default(),
@@ -87,6 +92,7 @@ impl DiscoveryState {
             trait_origins: HashMap::new(),
             trait_impls: HashMap::new(),
             liveness_results: HashMap::new(),
+            hir_async_items: HashMap::new(),
         }
     }
 

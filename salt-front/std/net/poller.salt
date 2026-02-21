@@ -1,8 +1,13 @@
 // =============================================================================
-// std.net.Poller — Event loop abstraction over kqueue
+// std.net.Poller — Event loop abstraction (delegates to Reactor backend)
 // =============================================================================
 // Layer 2 of the 3-layer network architecture.
-// Wraps raw kqueue syscalls into a safe, ergonomic event poller.
+// Wraps an I/O Reactor backend into a safe, ergonomic event poller.
+//
+// The Reactor trait (std.io.reactor) defines the OS-agnostic interface.
+// On macOS, this uses KqueueReactor. On the Lattice kernel, it will use
+// LatticeReactor once VirtIO lands. Applications use Poller and never
+// interact with backends directly.
 
 package std.net.poller
 
@@ -10,28 +15,28 @@ use std.os.syscall
 use std.core.ptr.Ptr
 use std.status.Status
 use std.core.result.Result
+use std.io.reactor_kqueue.KqueueReactor
 
-/// Event filter types
+/// Event filter types.
 pub enum Filter {
     Read,
     Write
 }
 
-
-
-/// Safe abstraction over kqueue (macOS) / epoll (Linux)
+/// Safe abstraction over the I/O reactor backend.
+/// On macOS, delegates to KqueueReactor (kqueue via http_bridge.c).
 pub struct Poller {
-    kq: i32
+    reactor: KqueueReactor
 }
 
 impl Poller {
-    /// Create a new Poller.
+    /// Create a new Poller backed by the default Reactor for this platform.
     pub fn new() -> Result<Poller> {
-        let kq = syscall::http_kq_create();
-        if kq < 0 {
-            return Result::Err(Status::internal("kqueue operation failed"));
+        let reactor_result = KqueueReactor::new();
+        if reactor_result.is_err() {
+            return Result::Err(Status::internal("reactor creation failed"));
         }
-        return Result::Ok(Poller { kq: kq });
+        return Result::Ok(Poller { reactor: reactor_result.unwrap() });
     }
 
     /// Register a file descriptor for read or write events.
@@ -41,24 +46,25 @@ impl Poller {
             Filter::Read => 0,
             Filter::Write => 1
         };
-        return syscall::http_kq_register(self.kq, fd, f);
+        return syscall::http_kq_register(self.reactor.fd(), fd, f);
     }
 
     /// Deregister a file descriptor from the poller.
     /// Returns 0 on success, -1 on error.
     pub fn deregister(&self, fd: i32) -> i32 {
-        return syscall::http_kq_deregister(self.kq, fd);
+        return syscall::http_kq_deregister(self.reactor.fd(), fd);
     }
 
     /// Wait for events. Fills the provided buffer and returns count.
+    /// Zero-allocation: caller provides a stack-allocated event buffer.
     /// timeout_ms: -1 = block forever, 0 = poll, >0 = timeout in ms.
     /// Returns number of events, or -1 on error.
     pub fn wait(&self, event_buf: Ptr<i64>, max_events: i32, timeout_ms: i32) -> i32 {
-        return syscall::http_kq_wait(self.kq, event_buf, max_events, timeout_ms);
+        return syscall::http_kq_wait(self.reactor.fd(), event_buf, max_events, timeout_ms);
     }
 
-    /// Get the raw kqueue file descriptor (for advanced use).
+    /// Get the raw file descriptor backing this Poller's reactor.
     pub fn fd(&self) -> i32 {
-        return self.kq;
+        return self.reactor.fd();
     }
 }

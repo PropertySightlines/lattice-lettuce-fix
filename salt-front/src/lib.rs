@@ -20,6 +20,7 @@ pub mod types;
 pub mod registry;
 pub mod common;
 pub mod grammar_tokens;
+pub mod hir;
 
 
 
@@ -86,6 +87,10 @@ pub fn preprocess(source: &str) -> String {
             // [SOVEREIGN] Convert postfix ~ (force-unwrap) to __force_unwrap__! macro
             // val~ -> __force_unwrap__!(val)
             let line = convert_force_unwrap(&line);
+            
+            // [CROSS-MODULE STRUCT] Convert module.StructName { ... } to module::StructName { ... }
+            // so syn parses it as a struct literal, not field access + block.
+            let line = convert_module_struct_literal(&line);
             
             line
         })
@@ -1077,12 +1082,12 @@ fn extract_force_unwrap_expr(s: &str) -> String {
 // with full TraitRegistry context for signature-aware format spec dispatch.
 
 
-pub fn compile_ast(file: &mut SaltFile, release_mode: bool, registry: Option<&crate::registry::Registry>, skip_scan: bool, vverify: bool, disable_alias_scopes: bool, no_verify: bool, lib_mode: bool) -> anyhow::Result<String> {
+pub fn compile_ast(file: &mut SaltFile, release_mode: bool, registry: Option<&crate::registry::Registry>, skip_scan: bool, vverify: bool, disable_alias_scopes: bool, no_verify: bool, lib_mode: bool, debug_info: bool, source_file: &str) -> anyhow::Result<String> {
     // Run Comptime Evaluation Pass
     passes::comptime::run(file)
         .map_err(|e| anyhow::anyhow!("Comptime Error: {:?}", e))?;
 
-    let mut mlir = emit_mlir(file, release_mode, registry, skip_scan, no_verify, disable_alias_scopes, lib_mode).map_err(|e| anyhow::anyhow!(e))?;
+    let mut mlir = emit_mlir(file, release_mode, registry, skip_scan, no_verify, disable_alias_scopes, lib_mode, debug_info, source_file).map_err(|e| anyhow::anyhow!(e))?;
     
     // Prepend Alias Scope Definitions (MLIR Attribute Aliases)
     // V7.3: Added per-argument scopes (scope_arg_0 through scope_arg_9) for fine-grained noalias
@@ -1122,7 +1127,80 @@ pub fn compile(source: &str, release_mode: bool, registry: Option<&crate::regist
     }
     let processed = preprocess(source);
     let mut file: SaltFile = parse_str(&processed)?;
-    compile_ast(&mut file, release_mode, registry, skip_scan, vverify, false, false, false)
+    compile_ast(&mut file, release_mode, registry, skip_scan, vverify, false, false, false, false, "<stdin>")
+}
+
+/// [CROSS-MODULE STRUCT] Convert `module.StructName { ... }` to `module::StructName { ... }`
+/// so that syn parses it as a struct literal construction, not a field access + block.
+///
+/// Detection heuristic: `ident.UpperCaseIdent` followed by ` {` or `{`.
+/// The uppercase check ensures we don't convert field accesses like `p.val`
+/// or method calls like `addr.make_phys()`.
+fn convert_module_struct_literal(line: &str) -> String {
+    // Quick check: must contain a `.` to be relevant
+    if !line.contains('.') {
+        return line.to_string();
+    }
+
+    let mut result = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < len {
+        let c = chars[i];
+
+        // Track string context
+        if c == '"' && !in_string {
+            in_string = true;
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' && in_string {
+            let escaped = i > 0 && chars[i - 1] == '\\';
+            if !escaped {
+                in_string = false;
+            }
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            result.push(c);
+            i += 1;
+            continue;
+        }
+
+        // Look for pattern: ident.UpperIdent followed by `{` or ` {`
+        if c == '.' && i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            // Check if the char after `.` is uppercase (struct name convention)
+            if i + 1 < len && chars[i + 1].is_ascii_uppercase() {
+                // Scan ahead to find the end of the identifier after `.`
+                let mut j = i + 1;
+                while j < len && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                // Check if followed by `{` or ` {` (struct literal)
+                let mut k = j;
+                while k < len && chars[k] == ' ' {
+                    k += 1;
+                }
+                if k < len && chars[k] == '{' {
+                    // Pattern confirmed: module.StructName { → module::StructName {
+                    result.push_str("::");
+                    i += 1; // skip the `.`
+                    continue;
+                }
+            }
+        }
+
+        result.push(c);
+        i += 1;
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1515,4 +1593,65 @@ mod tests {
         assert!(!output.contains("__force_unwrap__"),
             "~ inside string should NOT be converted, got: {}", output);
     }
+
+    // ============================================================
+    // CROSS-MODULE STRUCT LITERAL PREPROCESSOR TESTS
+    // ============================================================
+    // The preprocessor must convert `module.StructName { ... }` to
+    // `module::StructName { ... }` so syn parses it as a struct literal,
+    // not field access + block.
+
+    #[test]
+    fn test_module_struct_literal_basic() {
+        let output = convert_module_struct_literal("let p = addr.PhysAddr { val: 0x1000 };");
+        assert!(output.contains("addr::PhysAddr { val: 0x1000 }"),
+            "module.Struct {{ }} should become module::Struct {{ }}, got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_multifield() {
+        let output = convert_module_struct_literal("let v = memory.VirtAddr { val: x, tag: 0 };");
+        assert!(output.contains("memory::VirtAddr { val: x, tag: 0 }"),
+            "Multi-field struct literal should convert, got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_in_return() {
+        let output = convert_module_struct_literal("return addr.PhysAddr { val: p.val * 2 };");
+        assert!(output.contains("addr::PhysAddr { val: p.val * 2 }"),
+            "Struct literal in return should convert, got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_preserves_method_calls() {
+        // module.function() must NOT be converted — only module.UpperCase { ... }
+        let output = convert_module_struct_literal("addr.make_phys(0x1000);");
+        assert!(output.contains("addr.make_phys(0x1000)"),
+            "Method calls should be preserved, got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_preserves_field_access() {
+        // p.val should NOT be converted — only when followed by { ... }
+        let output = convert_module_struct_literal("let x = p.val;");
+        assert!(output.contains("p.val"),
+            "Field access should be preserved, got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_preserves_lowercase() {
+        // addr.phys_addr { ... } — lowercase after dot is NOT a struct name
+        let output = convert_module_struct_literal("let p = addr.phys_addr { val: 0 };");
+        assert!(!output.contains("addr::phys_addr"),
+            "Lowercase after dot should NOT be converted (not a struct), got: {}", output);
+    }
+
+    #[test]
+    fn test_module_struct_literal_in_string() {
+        // Inside a string literal, no conversion
+        let output = convert_module_struct_literal(r#"let s = "addr.PhysAddr { val: 0 }";"#);
+        assert!(!output.contains("addr::PhysAddr"),
+            "String content should NOT be converted, got: {}", output);
+    }
 }
+

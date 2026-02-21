@@ -13,7 +13,7 @@
 //! 2. **Pins** the resulting !llvm.ptr in the ProvenanceMap
 //! 3. **Routes** all buffer[i] accesses through GEP using the pinned pointer
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use crate::types::Type;
 
 /// Tracks the origin of u64 addresses to enable GEP-based optimization.
@@ -21,7 +21,7 @@ use crate::types::Type;
 pub struct ProvenanceMap {
     /// Maps a local variable name to its underlying element Type.
     /// e.g., "height" -> Type::I32 for Buffer<i32>
-    bases: HashMap<String, Type>,
+    bases: BTreeMap<String, Type>,
 }
 
 impl ProvenanceMap {

@@ -1007,7 +1007,7 @@ pub fn prove_layout_compatibility_ctx(ctx: &mut LoweringContext, from: &Type, to
 /// [GRAYDON FIX] Recursively substitute generic placeholders using current_type_map.
 /// This is the "Secret of $i64$" - when HashMap<i64, i64> looks at Entry<K, V>,
 /// this function transforms it to Entry<i64, i64> by consulting the active type context.
-pub fn substitute_generics(type_map: &std::collections::HashMap<String, Type>, ty: &Type) -> Type {
+pub fn substitute_generics(type_map: &std::collections::BTreeMap<String, Type>, ty: &Type) -> Type {
     match ty {
         // Generics stored as Struct names (parser artifact) — check type_map
         Type::Struct(name) if type_map.contains_key(name) => {
@@ -1387,7 +1387,8 @@ pub fn resolve_codegen_type(ctx: &mut LoweringContext, ty: &Type) -> Type {
                     return if is_enum { Type::Enum(resolved_base) } else { Type::Struct(resolved_base) };
                 }
                 
-                let segments = vec![name.clone()];
+                // [CROSS-MODULE STRUCT] Split qualified names like "addr::PhysAddr" into segments
+                let segments: Vec<String> = name.split("::").map(|s| s.to_string()).collect();
                 if let Some((pkg, item)) = crate::codegen::expr::utils::resolve_package_prefix_ctx(ctx, &segments) {
                      let resolved_base = if item.is_empty() { pkg } else if pkg.is_empty() { item } else { format!("{}__{}", pkg, item) };
                      let mut resolved_params = vec![];
@@ -1526,7 +1527,16 @@ pub fn resolve_codegen_type(ctx: &mut LoweringContext, ty: &Type) -> Type {
                 // Fix 2: Resolve base_name
                 let mut resolved_base = base_name.clone();
                 let mut found = false;
-                
+
+                // [CROSS-MODULE STRUCT] If base_name contains "::" (e.g. "addr::PhysAddr"),
+                // split into segments and use resolve_package_prefix_ctx to resolve to FQN.
+                if base_name.contains("::") {
+                    let segments: Vec<String> = base_name.split("::").map(|s| s.to_string()).collect();
+                    if let Some((pkg, item)) = crate::codegen::expr::utils::resolve_package_prefix_ctx(ctx, &segments) {
+                        resolved_base = if item.is_empty() { pkg } else if pkg.is_empty() { item } else { format!("{}__{}", pkg, item) };
+                        found = true;
+                    }
+                }
                 // 1. Try explicit imports - Transactional Block
                 {
                     let imports = ctx.imports();
@@ -3032,9 +3042,30 @@ pub fn emit_global_def(ctx: &mut LoweringContext, _out: &mut String, g: &crate::
     
     let mlir_ty = ty.to_mlir_storage_type(ctx)?;
     
-    // Check for explicit initializer (not fully supported yet, but placeholder logic)
-    let init_val = if let Some(_val) = &g.init {
-        "".to_string()
+    // Check for explicit initializer and evaluate it
+    let init_val = if let Some(val_expr) = &g.init {
+        let eval = crate::evaluator::Evaluator::new();
+        match eval.eval_expr(val_expr) {
+            Ok(crate::evaluator::ConstValue::Integer(i)) => {
+                let suffix = match &ty {
+                    Type::I64 | Type::U64 | Type::Usize => "i64",
+                    Type::I32 | Type::U32 => "i32",
+                    Type::I16 | Type::U16 => "i16",
+                    Type::I8 | Type::U8 => "i8",
+                    Type::Bool => "i1",
+                    _ => "i64",
+                };
+                format!("{} : {}", i, suffix)
+            }
+            Ok(crate::evaluator::ConstValue::Float(f)) => {
+                let suffix = if matches!(&ty, Type::F32) { "f32" } else { "f64" };
+                format!("{} : {}", f, suffix)
+            }
+            Ok(crate::evaluator::ConstValue::Bool(b)) => {
+                format!("{} : i1", if b { 1 } else { 0 })
+            }
+            _ => "".to_string(), // Complex types: still zero-init for now
+        }
     } else {
         "".to_string()
     };

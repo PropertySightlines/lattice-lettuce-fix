@@ -1,7 +1,7 @@
 use crate::codegen::context::LoweringContext;
 use crate::types::{Type, TypeKey};
 use crate::codegen::expr::utils::{resolve_path_to_enum, EnumVariantResolution, resolve_package_prefix_ctx};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use crate::common::mangling::Mangler;
 use crate::grammar::SaltFn;
 use crate::codegen::collector::MonomorphizationTask;
@@ -357,7 +357,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
                                         if let Some(func) = mod_info.function_templates.get(&raw_name) {
 
                                             
-                                            let empty_map = std::collections::HashMap::new();
+                                            let empty_map = std::collections::BTreeMap::new();
                                             let (ret_ty, arg_tys) = self.resolve_signature(func, &empty_map)?;
                                             
                                             let lazy_task = Box::new(crate::codegen::collector::MonomorphizationTask {
@@ -367,7 +367,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
                                                 concrete_tys: vec![],
                                                 self_ty: None,
                                                 imports: mod_info.imports.clone(),
-                                                type_map: std::collections::HashMap::new(),
+                                                type_map: std::collections::BTreeMap::new(),
                                             });
                                             
                                             return Ok(CallKind::Function(single_str, ret_ty, arg_tys, Some(lazy_task)));
@@ -962,7 +962,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         call_args: &[syn::Expr],
         local_vars: &HashMap<String, (Type, crate::codegen::context::LocalKind)>,
         expected_ret_ty: Option<&Type>
-    ) -> Result<HashMap<String, Type>, String> {
+    ) -> Result<BTreeMap<String, Type>, String> {
 
         
         // Extract struct generic params from self_ty
@@ -1008,7 +1008,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
 
     fn verify_completeness(&mut self, 
         template: &SaltFn, 
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
         expected_ret_ty: Option<&Type>
     ) -> Result<(), String> {
         self.verify_completeness_with_struct_generics(template, map, expected_ret_ty, None)
@@ -1019,7 +1019,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
     /// unbound struct-level generics (like T) are inferred from `expected_ret_ty`.
     pub fn verify_completeness_with_struct_generics(&mut self, 
         template: &SaltFn, 
-        map: &mut HashMap<String, Type>,
+        map: &mut BTreeMap<String, Type>,
         expected_ret_ty: Option<&Type>,
         self_ty: Option<&Type>
     ) -> Result<(), String> {
@@ -1091,7 +1091,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         // to preserve 'T' as a generic parameter rather than substituting it with 'u8'.
         let template_ret_ty = {
             self.ctx.with_generic_context(
-                HashMap::new(), 
+                BTreeMap::new(), 
                 Type::Unit, 
                 Vec::new(),
                 |ctx| {
@@ -1110,7 +1110,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         
 
 
-        let mut temp_map: HashMap<String, Type> = HashMap::new();
+        let mut temp_map: BTreeMap<String, Type> = BTreeMap::new();
         // Since we want to find T, we treat 'template_ret_ty' as pattern and 'expected' as concrete.
         if self.unify_types(&template_ret_ty, expected, &mut temp_map).is_ok() {
              if let Some(res) = temp_map.get(generic_name) {
@@ -1121,7 +1121,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         None
     }
 
-    pub fn unify_types(&mut self, pattern: &Type, concrete: &Type, map: &mut HashMap<String, Type>) -> Result<(), String> {
+    pub fn unify_types(&mut self, pattern: &Type, concrete: &Type, map: &mut BTreeMap<String, Type>) -> Result<(), String> {
         match (pattern, concrete) {
             (Type::Generic(name), _) => {
                  if let Some(existing) = map.get(name) {
@@ -1262,7 +1262,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         }
     }
 
-    fn mangle_specialization(&mut self, base_name: &str, map: &HashMap<String, Type>, template: &SaltFn) -> String {
+    fn mangle_specialization(&mut self, base_name: &str, map: &BTreeMap<String, Type>, template: &SaltFn) -> String {
         // If no generics, identity
         if map.is_empty() { return base_name.to_string(); }
         
@@ -1352,7 +1352,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         }
     }
     
-    fn resolve_signature(&mut self, template: &SaltFn, map: &HashMap<String, Type>) -> Result<(Type, Vec<Type>), String> {
+    fn resolve_signature(&mut self, template: &SaltFn, map: &BTreeMap<String, Type>) -> Result<(Type, Vec<Type>), String> {
          let ret = if let Some(rt) = &template.ret_type {
              let resolved = crate::codegen::type_bridge::resolve_type(self.ctx, rt);
              let substituted = resolved.substitute(map);
