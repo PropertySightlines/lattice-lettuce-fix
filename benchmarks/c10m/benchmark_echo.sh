@@ -6,7 +6,7 @@
 #   1. C     (raw kqueue, single-threaded)
 #   2. Rust  (Tokio async runtime)
 #   3. TS    (Bun native TCP)
-#   4. Salt  (Sovereign runtime, no libc)
+#   3. Salt  (kqueue via FFI bridge, MLIR pipeline)
 #
 # Metrics collected:
 #   - Connections/sec (accept rate)
@@ -28,8 +28,9 @@ BUILD_DIR="$SCRIPT_DIR/build"
 RESULTS_FILE="$SCRIPT_DIR/echo_benchmark_results.txt"
 
 # LLVM Tools
-CLANG="${CLANG:-/opt/homebrew/opt/llvm/bin/clang}"
-LLC="${LLC:-/opt/homebrew/opt/llvm/bin/llc}"
+export PATH="/opt/homebrew/opt/llvm@18/bin:$PATH"
+CLANG="${CLANG:-/opt/homebrew/opt/llvm@18/bin/clang}"
+LLC="${LLC:-/opt/homebrew/opt/llvm@18/bin/llc}"
 
 # Colors
 RED='\033[0;31m'
@@ -89,27 +90,35 @@ else
     RUST_SIZE=0
 fi
 
-# --- TypeScript (Bun) ---
-echo -e "\n${BOLD}[3/4] TypeScript / Bun${NC}"
-if command -v bun &>/dev/null; then
-    TS_SIZE=$(stat -f%z "$SCRIPT_DIR/echo_ts.ts" 2>/dev/null || stat -c%s "$SCRIPT_DIR/echo_ts.ts")
-    pass "echo_ts.ts ready ($TS_SIZE bytes source, JIT runtime)"
-else
-    fail "Bun not installed (skipping TS benchmark)"
-    TS_SIZE=0
-fi
-
-# --- Salt (Sovereign) ---
-echo -e "\n${BOLD}[4/4] Salt / Sovereign${NC}"
+# --- Salt (kqueue via FFI bridge) ---
+echo -e "\n${BOLD}[3/3] Salt / kqueue${NC}"
 SALT_SIZE=0
 if [ -f "$SCRIPT_DIR/echo_salt.salt" ]; then
-    pass "echo_salt.salt ready (requires full pipeline to build binary)"
-    # TODO: Once the Iron Driver pipeline is wired end-to-end:
-    # cargo run --release --manifest-path salt-front/Cargo.toml --bin salt-front -- echo_salt.salt > echo_salt.mlir
-    # mlir-opt ... echo_salt.mlir -o echo_salt_opt.mlir
-    # mlir-translate --mlir-to-llvmir echo_salt_opt.mlir -o echo_salt.ll
-    # llc -O3 -reserved-reg=aarch64:x19 -mattr=+lse echo_salt.ll -o echo_salt.o
-    # clang -nostdlib -static sovereign_rt.o echo_salt.o -o echo_salt
+    SALT_FRONT="$SCRIPT_DIR/../../salt-front/target/release/salt-front"
+    RUNTIME_C="$SCRIPT_DIR/../../salt-front/runtime.c"
+    if [ ! -f "$SALT_FRONT" ]; then
+        fail "salt-front release binary not found (run: cargo build --release)"
+    else
+        # Salt → MLIR → LLVM IR → native binary (with C bridge)
+        DYLD_LIBRARY_PATH=/opt/homebrew/lib $SALT_FRONT "$SCRIPT_DIR/echo_salt.salt" --release --danger-no-verify 2>/dev/null \
+            | grep -v "^DEBUG:\|^Debug:\|^>>>\|^State\|salt.verify\|^\[V4.0\]" \
+            > "$BUILD_DIR/echo_salt_clean.mlir" && \
+        mlir-opt --convert-linalg-to-loops --expand-strided-metadata --lower-affine \
+            --convert-scf-to-cf --canonicalize --sroa --mem2reg --canonicalize \
+            --finalize-memref-to-llvm --convert-arith-to-llvm --convert-math-to-llvm \
+            --convert-func-to-llvm --convert-cf-to-llvm --reconcile-unrealized-casts \
+            "$BUILD_DIR/echo_salt_clean.mlir" -o "$BUILD_DIR/echo_salt.opt.mlir" 2>/dev/null && \
+        mlir-translate --mlir-to-llvmir "$BUILD_DIR/echo_salt.opt.mlir" -o "$BUILD_DIR/echo_salt.ll" 2>/dev/null && \
+        opt -O3 "$BUILD_DIR/echo_salt.ll" -S -o "$BUILD_DIR/echo_salt_opt.ll" 2>/dev/null && \
+        $CLANG -O3 "$BUILD_DIR/echo_salt_opt.ll" "$SCRIPT_DIR/echo_salt_bridge.c" "$RUNTIME_C" \
+            -o "$BUILD_DIR/echo_salt" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            SALT_SIZE=$(stat -f%z "$BUILD_DIR/echo_salt" 2>/dev/null || stat -c%s "$BUILD_DIR/echo_salt")
+            pass "Built echo_salt ($SALT_SIZE bytes)"
+        else
+            fail "Salt build failed"
+        fi
+    fi
 else
     fail "echo_salt.salt not found"
 fi
@@ -123,8 +132,7 @@ echo ""
 echo "Binary Size Comparison:"
 echo "  C (kqueue):      ${C_SIZE:-N/A} bytes"
 echo "  Rust (Tokio):    ${RUST_SIZE:-N/A} bytes"
-echo "  TS (Bun):        ${TS_SIZE:-N/A} bytes (source only, JIT)"
-echo "  Salt (Sovereign): ${SALT_SIZE:-N/A} bytes"
+echo "  Salt (kqueue):   ${SALT_SIZE:-N/A} bytes"
 echo ""
 
 # Helper: benchmark a server
@@ -193,14 +201,9 @@ if [ -f "$BUILD_DIR/echo_rust_proj/target/release/echo_rust" ]; then
     benchmark_server "Rust / Tokio" "$BUILD_DIR/echo_rust_proj/target/release/echo_rust" 1
 fi
 
-if command -v bun &>/dev/null; then
-    benchmark_server "TS / Bun" "bun run $SCRIPT_DIR/echo_ts.ts" 2
+if [ -f "$BUILD_DIR/echo_salt" ]; then
+    benchmark_server "Salt / kqueue" "$BUILD_DIR/echo_salt" 2
 fi
-
-# Salt benchmark will be enabled once the full pipeline is wired
-# if [ -f "$BUILD_DIR/echo_salt" ]; then
-#     benchmark_server "Salt / Sovereign" "$BUILD_DIR/echo_salt" 3
-# fi
 
 # =============================================================================
 # Phase 3: Summary
@@ -212,11 +215,10 @@ echo "Target          | Binary Size | Status"
 echo "----------------|-------------|--------"
 printf "C / kqueue      | %10s | %s\n" "${C_SIZE:-N/A}" "$([ ${C_SIZE:-0} -gt 0 ] && echo '✅ Ready' || echo '❌ Failed')"
 printf "Rust / Tokio    | %10s | %s\n" "${RUST_SIZE:-N/A}" "$([ ${RUST_SIZE:-0} -gt 0 ] && echo '✅ Ready' || echo '❌ Failed')"
-printf "TS / Bun        | %10s | %s\n" "${TS_SIZE:-N/A} (src)" "$(command -v bun &>/dev/null && echo '✅ Ready' || echo '⚠️  Bun missing')"
-printf "Salt / Sovereign| %10s | %s\n" "${SALT_SIZE:-N/A}" "⏳ Pipeline pending"
+printf "Salt / kqueue   | %10s | %s\n" "${SALT_SIZE:-N/A}" "$([ ${SALT_SIZE:-0} -gt 0 ] && echo '✅ Ready' || echo '❌ Failed')"
 echo ""
 
 echo "Results saved to: $RESULTS_FILE"
 date > "$RESULTS_FILE"
 echo "Port: $PORT, Duration: ${DURATION}s, Connections: $NUM_CONNS" >> "$RESULTS_FILE"
-echo "C_SIZE=$C_SIZE RUST_SIZE=${RUST_SIZE:-0} TS_SIZE=${TS_SIZE:-0} SALT_SIZE=${SALT_SIZE:-0}" >> "$RESULTS_FILE"
+echo "C_SIZE=$C_SIZE RUST_SIZE=${RUST_SIZE:-0} SALT_SIZE=${SALT_SIZE:-0}" >> "$RESULTS_FILE"

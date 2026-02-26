@@ -17,20 +17,23 @@ extern fn echo_server_init(port: i32) -> i32;
 extern fn echo_kq_create(listen_fd: i32) -> i32;
 extern fn echo_kq_poll(kq: i32, listen_fd: i32, buf: u64, buf_len: i64) -> i64;
 
+// CLI port parsing (reads argv[1] if available)
+extern fn echo_get_port(default_port: i32) -> i32;
+
 // Timing
 extern fn rdtsc() -> i64;
 
 // Memory
 extern fn malloc(size: i64) -> u64;
 
-const PORT: i32 = 8080;
 const BUF_SIZE: i64 = 4096;
 
 fn main() -> i32 {
-    println("=== Salt Echo Server (port 8080) ===");
-    
+    let port = echo_get_port(8080);
+    println("=== Salt Echo Server ===");
+
     // Setup: socket + bind + listen
-    let listen_fd = echo_server_init(PORT);
+    let listen_fd = echo_server_init(port);
     if listen_fd < 0 {
         println("ERROR: server init failed");
         return 1;
@@ -46,7 +49,7 @@ fn main() -> i32 {
     // Allocate echo buffer
     let buf = malloc(BUF_SIZE);
     
-    println("[Salt/kqueue] Echo server listening on port 8080");
+    println("[Salt/kqueue] Echo server listening");
     
     // Event loop: poll returns bytes echoed (or 0 for accept, -1 for error)
     let mut total_bytes: i64 = 0;

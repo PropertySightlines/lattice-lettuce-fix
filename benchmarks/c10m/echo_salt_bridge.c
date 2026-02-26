@@ -23,6 +23,23 @@
 #include <unistd.h>
 
 // =============================================================================
+// 0. Port from CLI — reads argv[1] via salt runtime's salt_get_argv
+// =============================================================================
+extern int32_t salt_get_argc(void);
+extern const char *salt_get_argv(int32_t idx);
+
+int32_t echo_get_port(int32_t default_port) {
+  if (salt_get_argc() > 1) {
+    const char *arg = salt_get_argv(1);
+    if (arg) {
+      int p = atoi(arg);
+      if (p > 0 && p < 65536) return p;
+    }
+  }
+  return default_port;
+}
+
+// =============================================================================
 // 1. Server Init — returns listen fd or -1
 // =============================================================================
 int32_t echo_server_init(int32_t port) {

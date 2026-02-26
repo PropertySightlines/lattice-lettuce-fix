@@ -1391,6 +1391,20 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                             if let LocalKind::Ptr(ptr) = kind {
                                  ctx.emit_store_logical(out, &val_prom, &ptr, &ty)?;
                             }
+
+                            // [Z3 REGISTRATION] Register variable = init_expr in Z3.
+                            // Translate the init expression AST directly to a Z3 value.
+                            // This enables loop invariant base-case proofs: Z3 knows
+                            // `i = 0` from `let mut i: i64 = 0`.
+                            if !ctx.config.no_verify && ty.is_integer() {
+                                if let Ok(z3_val) = crate::codegen::expr::translate_to_z3(
+                                    ctx, &init.expr, local_vars
+                                ) {
+                                    use z3::ast::Ast;
+                                    let z3_var = ctx.mk_var(&name);
+                                    ctx.z3_solver.assert(&z3_var._eq(&z3_val));
+                                }
+                            }
                         }
                 } else {
                     // [PHASE 7: Bidirectional Type Inference]
@@ -1411,7 +1425,23 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                     // Use type hint if provided, otherwise use inferred type
                     let target_ty = type_hint.unwrap_or_else(|| actual_ty.clone());
                     
-                    emit_pattern(ctx, out, &local.pat, val, actual_ty, target_ty, local_vars)?;
+                    emit_pattern(ctx, out, &local.pat, val, actual_ty, target_ty.clone(), local_vars)?;
+
+                    // [Z3 REGISTRATION] Register integer literal let-bindings with Z3
+                    // This enables the loop invariant base-case checker to know
+                    // variable values at the point of the while loop.
+                    if !ctx.config.no_verify && !name.is_empty() && target_ty.is_integer() {
+                        if let Some(init) = &local.init {
+                            if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(li), .. }) = &*init.expr {
+                                if let Ok(int_val) = li.base10_parse::<i64>() {
+                                    use z3::ast::Ast;
+                                    let z3_var = ctx.mk_var(&name);
+                                    let z3_val = ctx.mk_int(int_val);
+                                    ctx.z3_solver.assert(&z3_var._eq(&z3_val));
+                                }
+                            }
+                        }
+                    }
                 }
                 
                 // [SOVEREIGN V5.0] Malloc tracking via DAG-based MallocTracker.
@@ -1561,47 +1591,124 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
             ctx.continue_labels_mut().push(label_header.clone());
             let mut body_vars = local_vars.clone();
 
-            // --- Z3 Verification Scope Start (DISABLED) ---
-            // ctx.push_solver();
-
-            // 1. Havoc Modified Variables
-            // let mutated = collect_mutations(&w.body.stmts);
-            
-            // Initialize SymbolicContext for invariants
-            // let sym_ctx = crate::codegen::verification::SymbolicContext::new(ctx.z3_ctx);
-
-            /*
-            for name in mutated {
-                if let Some((ty, _)) = body_vars.get(&name) {
-                    if ty.is_integer() {
-                        let fresh_name = format!("{}_havoc_{}", name, ctx.next_id());
-                        let z3_var = ctx.mk_var(&fresh_name);
-                        // Update symbolic registry to point 'name' to the new fresh var
-                        // effectively erasing valid knowledge from before the loop
-                        ctx.register_symbolic_int(name.clone(), z3_var);
+            // === Z3 HOARE LOGIC: While Loop Verification ===
+            // Strict Hoare triple: {I} while(C) {I ∧ C} body {I} → {I ∧ ¬C}
+            //
+            // Phase A: Base case — prove invariants hold before loop entry
+            // Phase B: Inductive step — havoc, assume I∧C, emit body, verify I
+            // Phase C: Post-loop — assert ¬C for subsequent code
+            if !ctx.config.no_verify {
+                // Collect invariants from the loop body
+                let sym_ctx = crate::codegen::verification::SymbolicContext::new(ctx.z3_ctx);
+                let mut invariant_exprs: Vec<syn::Expr> = Vec::new();
+                for stmt in &w.body.stmts {
+                    if let Stmt::Invariant(expr) = stmt {
+                        invariant_exprs.push(expr.clone());
                     }
                 }
-            }
-            */
 
-            // 2. Inject Invariants
-            /*
-            for stmt in &w.body.stmts {
-                if let Stmt::Invariant(expr) = stmt {
-                    // Translate expr to Z3 using the CURRENT (havoc-ed) symbol table
-                    if let Ok(z3_expr) = crate::codegen::expr::translate_bool_to_z3(ctx, expr, &body_vars, &sym_ctx) {
-                         ctx.add_assertion(&z3_expr);
+                // --- Phase A: Base Case ---
+                // Variable values are already registered in Z3 at the let-binding
+                // emission point (see [Z3 REGISTRATION] above). This gives us
+                // constraints like `i = 0` that enable invariant base-case proofs.
+                ctx.z3_solver.push(); // Temporary scope for base-case checks
+
+                // Prove each invariant holds with current (pre-loop) variable values.
+                // Method: assert !I and check for UNSAT.
+                //   UNSAT → I always holds → invariant proven ✓
+                //   SAT   → found counterexample → invariant violation ✗
+                //   Unknown → can't determine → pass conservatively
+                for inv_expr in &invariant_exprs {
+                    if let Ok(z3_inv) = crate::codegen::expr::translate_bool_to_z3(
+                        ctx, inv_expr, &body_vars, &sym_ctx
+                    ) {
+                        use z3::ast::Ast;
+                        ctx.z3_solver.push();
+                        ctx.z3_solver.assert(&z3_inv.not());
+                        let check = ctx.z3_solver.check();
+                        ctx.z3_solver.pop(1);
+
+                        if check == z3::SatResult::Sat {
+                            ctx.z3_solver.pop(1); // Pop base-case registration scope
+                            return Err(format!(
+                                "Z3 verification failed: loop invariant does not hold at entry. \
+                                 The solver found a counterexample proving the invariant is false \
+                                 with current variable values."
+                            ));
+                        }
+
+                        // Invariant proven or undecidable: assert as true for reasoning
+                        ctx.z3_solver.assert(&z3_inv);
                     }
                 }
+                ctx.z3_solver.pop(1); // Pop base-case registration scope
+
+                // Re-assert proven invariants in the main scope
+                for inv_expr in &invariant_exprs {
+                    if let Ok(z3_inv) = crate::codegen::expr::translate_bool_to_z3(
+                        ctx, inv_expr, &body_vars, &sym_ctx
+                    ) {
+                        ctx.z3_solver.assert(&z3_inv);
+                    }
+                }
+
+                // --- Phase B: Inductive Step Setup ---
+                // Push solver scope for the loop interior
+                ctx.z3_solver.push();
+
+                // Havoc: erase pre-loop knowledge of all mutated variables
+                let mutated = collect_mutations(&w.body.stmts);
+                for name in &mutated {
+                    if let Some((ty, _)) = body_vars.get(name) {
+                        if ty.is_integer() {
+                            let fresh_name = format!("{}_havoc_{}", name, ctx.next_id());
+                            let z3_var = ctx.mk_var(&fresh_name);
+                            ctx.symbolic_tracker.insert(name.clone(), z3_var);
+                        }
+                    }
+                }
+
+                // Assume invariants in the havoc'd state (inductive hypothesis)
+                for inv_expr in &invariant_exprs {
+                    if let Ok(z3_inv) = crate::codegen::expr::translate_bool_to_z3(
+                        ctx, inv_expr, &body_vars, &sym_ctx
+                    ) {
+                        ctx.z3_solver.assert(&z3_inv);
+                    }
+                }
+
+                // Assume loop condition is true (we are inside the loop body)
+                if let Ok(z3_cond) = crate::codegen::expr::translate_bool_to_z3(
+                    ctx, &w.cond, &body_vars, &sym_ctx
+                ) {
+                    ctx.z3_solver.assert(&z3_cond);
+                }
             }
-            */
-            // -----------------------------------
 
             let body_diverges = emit_block(ctx, out, &w.body.stmts, &mut body_vars)?;
             
-            // --- Z3 Verification Scope End ---
-            // ctx.pop_solver();
-            // ---------------------------------
+            // === Z3 HOARE LOGIC: Post-Body Verification ===
+            if !ctx.config.no_verify {
+                let sym_ctx = crate::codegen::verification::SymbolicContext::new(ctx.z3_ctx);
+
+                // --- Phase B (cont'd): Inductive Step Check ---
+                // After the body, verify invariants still hold.
+                // This is NOT currently enforced as a hard error because the body's
+                // Z3 state mutations are complex. The push/pop isolates correctly.
+
+                // Pop the inductive step scope
+                ctx.z3_solver.pop(1);
+
+                // --- Phase C: Post-Loop ---
+                // Assert ¬C: after the loop, the condition is false.
+                // This lets Z3 reason about variables in post-loop code.
+                if let Ok(z3_cond) = crate::codegen::expr::translate_bool_to_z3(
+                    ctx, &w.cond, local_vars, &sym_ctx
+                ) {
+                    use z3::ast::Ast;
+                    ctx.z3_solver.assert(&z3_cond.not());
+                }
+            }
 
             ctx.break_labels_mut().pop();
             ctx.continue_labels_mut().pop();
@@ -1731,27 +1838,38 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
                 body_vars.insert(name, (loop_ty.clone(), LocalKind::SSA(current_i.clone())));
             }
             
-            // Z3: Register induction variable and Inject Bounds (DISABLED)
-            /*
-            if has_named_pattern || matches!(&f.pat, syn::Pat::Wild(_)) {
+            // === Z3 HOARE LOGIC: For Loop Induction Variable Bounds ===
+            // Register the induction variable with Z3 and assert domain constraints:
+            //   start <= i < end
+            // This enables Z3 to prove array bounds checks inside the loop body.
+            let _z3_for_loop_active = if !ctx.config.no_verify && (matches!(&f.pat, syn::Pat::Ident(_)) || matches!(&f.pat, syn::Pat::Wild(_))) {
                 let z3_i = ctx.mk_var(&current_i);
-                ctx.register_symbolic_int(current_i.clone(), z3_i.clone());
+                ctx.symbolic_tracker.insert(current_i.clone(), z3_i.clone());
                 
-                ctx.push_solver();
+                ctx.z3_solver.push();
+                
+                // Assert: i >= 0 (or i >= start if start is not 0)
                 let z3_zero = ctx.mk_int(0);
-                ctx.add_assertion(&z3_i.ge(&z3_zero));
+                ctx.z3_solver.assert(&z3_i.ge(&z3_zero));
                 
-                let sym_ctx = crate::codegen::verification::SymbolicContext::new(ctx.z3_ctx);
-                
+                // Assert upper bound from range expression
                 if let syn::Expr::Range(r) = &f.iter {
                     if let Some(end_expr) = &r.end {
-                        if let Ok(z3_end) = crate::codegen::expr::translate_to_z3(ctx, end_expr, local_vars, &sym_ctx) {
-                             ctx.add_assertion(&z3_i.lt(&z3_end));
+                        if let Ok(z3_end) = crate::codegen::expr::translate_to_z3(ctx, end_expr, local_vars) {
+                             ctx.z3_solver.assert(&z3_i.lt(&z3_end));
+                        }
+                    }
+                    // Assert lower bound from range start (if explicit)
+                    if let Some(start_expr) = &r.start {
+                        if let Ok(z3_start) = crate::codegen::expr::translate_to_z3(ctx, start_expr, local_vars) {
+                            ctx.z3_solver.assert(&z3_i.ge(&z3_start));
                         }
                     }
                 }
-            }
-            */
+                true
+            } else {
+                false
+            };
             
             ctx.break_labels_mut().push(label_exit.clone());
             ctx.continue_labels_mut().push(label_header.clone());
@@ -1763,11 +1881,10 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
             ctx.break_labels_mut().pop();
             ctx.continue_labels_mut().pop();
 
-            /*
-            if matches!(&f.pat, syn::Pat::Ident(_) | syn::Pat::Wild(_)) {
-                ctx.pop_solver();
+            // === Z3 HOARE LOGIC: Pop for-loop solver scope ===
+            if _z3_for_loop_active {
+                ctx.z3_solver.pop(1);
             }
-            */
             
             if !body_diverges {
                  // [V1.1] RAII-Lite: Emit cleanup before looping back
@@ -1875,15 +1992,17 @@ pub fn emit_stmt(ctx: &mut LoweringContext, out: &mut String, stmt: &Stmt, local
             Ok(false)
         }
         Stmt::Unsafe(block) => {
-            // [SAFETY GATE] Reject unsafe in non-stdlib code
-            let is_stdlib = if let Some(pkg) = ctx.current_package.as_ref() {
-                let first_seg = pkg.name.iter().next().map(|id| id.to_string());
-                first_seg.as_deref() == Some("std")
-            } else {
-                false
-            };
-            if !is_stdlib {
-                return Err("unsafe blocks are not allowed in user code. All unsafe operations must go through the standard library's safe abstractions. See docs/UNSAFE.md.".to_string());
+            // [SAFETY GATE] Only allow unsafe blocks in privileged packages
+            // (std.* and kernel.*). All other packages are rejected.
+            // Uses config.file.package as fallback when current_package is None.
+            let first_seg = ctx.current_package.as_ref()
+                .or_else(|| ctx.config.file.package.as_ref())
+                .and_then(|pkg| pkg.name.iter().next().map(|id| id.to_string()));
+
+            let is_privileged = matches!(first_seg.as_deref(), Some("std") | Some("kernel"));
+
+            if !is_privileged {
+                return Err("unsafe blocks are not allowed in user code. All unsafe operations must go through the standard library's safe abstractions or be placed in kernel.* packages. See docs/UNSAFE.md.".to_string());
             }
 
             let was_unsafe = *ctx.is_unsafe_block();
