@@ -65,3 +65,39 @@ pub fn brk(new_brk: u64) -> u64 {
 pub fn mmap(length: u64, prot: u64) -> u64 {
     return sys_mmap(length, prot);
 }
+
+// =============================================================================
+// IPC — Fast-Path Register-Level Message Passing
+// =============================================================================
+
+extern fn sys_ipc_send(target_pid: u64, msg0: u64, msg1: u64, msg2: u64) -> u64;
+extern fn sys_ipc_recv() -> u64;
+
+/// Send a 3-word message to target process via register-level IPC.
+/// The kernel overwrites the target's saved context and immediately yields
+/// the CPU to it. Returns 0 on success.
+pub fn ipc_send(target: u64, m0: u64, m1: u64, m2: u64) -> u64 {
+    return sys_ipc_send(target, m0, m1, m2);
+}
+
+/// Block until an IPC message arrives.
+/// When a message is received, the registers contain the payload:
+///   RAX = sender_pid, RDI = msg0, RSI = msg1, RDX = msg2
+/// Returns: sender_pid (0 if error).
+pub fn ipc_recv() -> u64 {
+    return sys_ipc_recv();
+}
+
+// =============================================================================
+// Shared Memory — Zero-Copy Bulk Data Transfer
+// =============================================================================
+
+extern fn sys_shm_grant(target_pid: u64, src_vaddr: u64, dst_vaddr: u64, flags: u64) -> u64;
+
+/// Grant the target process access to a physical page at src_vaddr.
+/// The same physical frame is mapped into target's address space at dst_vaddr.
+/// Enables zero-copy bulk data transfer between processes.
+/// Returns 0 on success, -1 on error.
+pub fn shm_grant(target: u64, src: u64, dst: u64, flags: u64) -> u64 {
+    return sys_shm_grant(target, src, dst, flags);
+}

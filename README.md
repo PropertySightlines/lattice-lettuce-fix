@@ -353,17 +353,15 @@ lattice/
 
 Salt is pre-1.0 and under active development. The compiler, standard library, and tooling are functional and benchmarked. Expect breaking changes.
 
-| Component | Status | Version |
-|-----------|--------|---------|
-| Compiler (`salt-front`) | ✅ Compiles all benchmarks and examples | v0.7.0 |
-| Standard Library | ✅ 70+ modules, production-tested in LETTUCE | v0.7.0 |
-| Z3 Verification | ✅ Contracts + @pulse async cycle-budget proofs | v0.7.0 |
-| Benchmarks | ✅ 19/22 at C-parity or better | — |
-| LSP Server | ✅ Diagnostics, go-to-definition, completions | v0.1.0 |
-| Package Manager (`sp`) | 🚧 Builds from `salt.toml` | v0.1.0 |
-| Basalt (LLM Inference) | ✅ Llama 2 forward pass, tokenizer, mmap | v0.3.0 |
-| Lattice Kernel | ✅ 4-core SMP, Universal Task Pointer (invoke_task 29cy, async yield 111cy, preempt 430cy, spawn 99cy), Ring 3 SYSCALL (102cy), slab CAS (103cy), Ring 3 Isolation (SWAPGS, KPTI CR3, user_stack_init), SIP IPC (188cy) | v0.8.0 |
-| Facet Compositor | ✅ Rasterizer, window, Metal, benchmarked vs C | v0.3.0 |
+| Component | Version | Milestone |
+| :--- | :--- | :--- |
+| **Salt Compiler / Stdlib** | `v0.7.0` | Z3 Verification Stable & Multi-Dialect Codegen |
+| **Lattice Platform** (OS) | `v0.9.0` | Unified Ring 3 Networking (NetD Daemon & Zero-Trap Sockets) |
+| **Lattice Kernel** | `v0.9.0` | 4-Core SMP, Preemptive Scheduler, Ring 3 Isolation |
+| **Basalt** (LLM Inference) | `v0.3.0` | Proof-of-Concept (C-parity inference speed) |
+| **Facet** (2D Compositor) | `v0.3.0` | Proof-of-Concept (Metal compute & verified rasterizer) |
+| **Lettuce** (KV Store) | `v0.1.0` | Proof-of-Concept (234K ops/sec — 2x Redis throughput) |
+| **Tooling** (LSP & `sp` Build) | `v0.1.0` | Foundation: diagnostics, completions, manifest parsing |
 
 ## License
 

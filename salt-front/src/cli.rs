@@ -63,11 +63,25 @@ pub fn run_cli(args: Vec<String>) -> anyhow::Result<()> {
         } else if arg == "--disable-alias-scopes" {
             disable_alias_scopes = true;
         } else if arg == "--danger-no-verify" {
-            eprintln!("⚠️  WARNING: --danger-no-verify disables ALL Z3 verification. NOT for production use.");
-            no_verify = true;
+            #[cfg(not(debug_assertions))]
+            {
+                panic!("FATAL: Z3 verification cannot be disabled in release builds.");
+            }
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("⚠️  WARNING: --danger-no-verify disables ALL Z3 verification. NOT for production use.");
+                no_verify = true;
+            }
         } else if arg == "--no-verify" {
-            eprintln!("⚠️  DEPRECATED: --no-verify is deprecated. Use --danger-no-verify instead.");
-            no_verify = true;
+            #[cfg(not(debug_assertions))]
+            {
+                panic!("FATAL: Z3 verification cannot be disabled in release builds.");
+            }
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("⚠️  DEPRECATED: --no-verify is deprecated. Use --danger-no-verify instead.");
+                no_verify = true;
+            }
         } else if arg == "--lib" {
             lib_mode = true;
         } else if arg == "--sip" {

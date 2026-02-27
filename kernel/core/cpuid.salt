@@ -16,6 +16,7 @@ use kernel.drivers.serial
 
 extern fn cpuid_leaf1_ecx() -> u64;
 extern fn cpuid_hypervisor_id() -> u64;
+extern fn cpuid_base_freq_mhz() -> u64;
 
 // Check if running inside a hypervisor (CPUID leaf 1, ECX bit 31)
 pub fn is_hypervisor() -> bool {
@@ -44,6 +45,18 @@ pub fn get_bench_divisor() -> u64 {
     return 1;          // Bare metal — full speed
 }
 
+// Return the TSC frequency in Hz.
+// Uses CPUID leaf 0x16 (Processor Frequency Information) on Intel Skylake+.
+// Falls back to 3,000,000,000 (3.0 GHz) if the leaf is unsupported.
+pub fn get_tsc_hz() -> u64 {
+    let mhz = cpuid_base_freq_mhz();
+    if mhz > 0 {
+        return mhz * 1000000;
+    }
+    // Fallback: assume 3.0 GHz (conservative for PPS estimates)
+    return 3000000000;
+}
+
 pub fn print_topology() {
     serial.print("[BENCH HARNESS] Topology: ");
     if is_hypervisor() {
@@ -61,4 +74,10 @@ pub fn print_topology() {
     serial.print("[BENCH HARNESS] Scale divisor: ");
     serial.print_u64(divisor);
     serial.print("x\n");
+
+    let hz = get_tsc_hz();
+    let mhz = hz / 1000000;
+    serial.print("[BENCH HARNESS] TSC frequency: ");
+    serial.print_u64(mhz);
+    serial.print(" MHz\n");
 }

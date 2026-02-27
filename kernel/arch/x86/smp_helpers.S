@@ -140,6 +140,13 @@ atomic_cas_u64:
     lock cmpxchg qword ptr [rdi], rdx   // if [rdi]==RAX then [rdi]=RDX
     ret                         // RAX = old value (== expected on success)
 
+// smp_cas_u64 — Alias for Salt (avoids intrinsic name collision)
+.global smp_cas_u64
+smp_cas_u64:
+    mov     rax, rsi
+    lock cmpxchg qword ptr [rdi], rdx
+    ret
+
 // =============================================================================
 // disable_pic — Mask all legacy 8259 PIC interrupts
 // =============================================================================

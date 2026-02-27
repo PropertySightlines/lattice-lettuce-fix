@@ -48,7 +48,7 @@ ssh $SSH_OPTS "${EC2_USER}@${INSTANCE_IP}" "timeout $BENCH_TIMEOUT qemu-system-x
     -serial stdio \
     -monitor none \
     -device virtio-net-pci,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::5555-:7 \
+    -netdev user,id=net0,hostfwd=udp::5555-:5555 \
     > ~/bench_output.txt 2>&1" || true
 
 echo ""

@@ -79,6 +79,8 @@
             opacity: 0.03;
             pointer-events: none;
             z-index: 0;
+            will-change: transform;
+            transition: transform 0.1s cubic-bezier(0.2, 0.8, 0.2, 1);
         }
 
         .glow-orb.purple {
@@ -747,6 +749,8 @@
 
             .code-window pre {
                 overflow-x: auto;
+                font-size: 0.78rem;
+                padding: 16px;
             }
 
             .ergo-card {
@@ -765,8 +769,101 @@
                 font-size: 2.2rem;
             }
 
+            h2 {
+                font-size: 1.6rem;
+            }
+
+            .hero-sub {
+                font-size: 1.05rem;
+                text-align: left;
+            }
+
             section {
                 padding: 60px 0;
+            }
+
+            .bench-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .lettuce-stats {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .stdlib-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            /* Inline stat grids (Lattice kernel benchmarks) */
+            [style*="grid-template-columns: repeat(3"] {
+                grid-template-columns: 1fr !important;
+                gap: 12px !important;
+            }
+
+            .glow-orb {
+                opacity: 0.015;
+                filter: blur(180px);
+            }
+
+            .container {
+                padding: 0 16px;
+            }
+
+            .cta-section h2 {
+                font-size: 1.8rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            h1 {
+                font-size: 1.8rem;
+            }
+
+            .hero {
+                padding: 100px 0 40px;
+            }
+
+            .hero-sub {
+                font-size: 0.95rem;
+            }
+
+            .hero-actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .btn {
+                justify-content: center;
+            }
+
+            .lettuce-stats {
+                grid-template-columns: 1fr;
+            }
+
+            .stdlib-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .code-window pre {
+                font-size: 0.72rem;
+                padding: 12px;
+                line-height: 1.5;
+            }
+
+            .feature-card {
+                padding: 20px;
+            }
+
+            .stat-value {
+                font-size: 1.4rem;
+            }
+
+            .glow-orb {
+                display: none;
             }
         }
 
@@ -1017,24 +1114,31 @@
                 background: var(--accent) !important;
             }
 
-            /* Glow orbs */
+            /* Glow orbs — much more diffuse in dark mode */
             .glow-orb {
-                opacity: 0.08;
+                opacity: 0.035;
+                filter: blur(400px);
             }
 
             .glow-orb.purple {
                 background: #6c5ce7;
-                opacity: unset;
+                width: 1000px;
+                height: 1000px;
+                opacity: 0.04;
             }
 
             .glow-orb.blue {
                 background: #54a0ff;
-                opacity: unset;
+                width: 900px;
+                height: 900px;
+                opacity: 0.035;
             }
 
             .glow-orb.green {
                 background: #00d68f;
-                opacity: unset;
+                width: 800px;
+                height: 800px;
+                opacity: 0.035;
             }
 
             /* Hero badge */
@@ -1428,10 +1532,11 @@
                         <h2>Lattice</h2>
                         <p style="color: var(--text-muted); margin-top: 12px; line-height: 1.7;">
                             A unikernel that boots on real x86 hardware, written from scratch in Salt.
-                            It has its own GDT, IDT, PIT timer, ACPI/APIC, SMP bring-up (INIT-SIPI-SIPI),
-                            preemptive scheduler, per-core sharded allocators, and serial driver. No C
-                            runtime, no libc, no external dependencies at all. Benchmarked on bare-metal
-                            AWS instances with KVM.
+                            GDT, IDT, PIT timer, ACPI/APIC, SMP bring-up (INIT-SIPI-SIPI),
+                            preemptive scheduler, per-core sharded allocators, a zero-trap socket API
+                            where <code>read()</code> and <code>write()</code> are pure shared-memory
+                            operations with no kernel traps, and a Ring 3 network daemon with TCP/IP stack.
+                            No C runtime, no libc, no external dependencies.
                         </p>
                         <div class="lettuce-stats">
                             <div class="stat-card">
@@ -1463,7 +1568,8 @@
                     style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; text-align: center;">
                     <div style="font-size: 2rem; font-weight: 800; color: #00d68f;">59 cycles</div>
                     <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 8px;">Arena Allocation</div>
-                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">~15 ns @ 4.0 GHz · glibc malloc ≈ 1,000–5,000
+                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">~15 ns @ 4.0 GHz · glibc malloc ≈
+                        1,000–5,000
                     </div>
                 </div>
                 <div class="stat-card"
@@ -1478,12 +1584,42 @@
                     style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; text-align: center;">
                     <div style="font-size: 2rem; font-weight: 800; color: #f78c6c;">297 cycles</div>
                     <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 8px;">IPC Ping-Pong</div>
-                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">~74 ns · fiber-to-fiber zero-copy yield
+                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">~74 ns · fiber-to-fiber zero-copy
+                        yield
+                    </div>
+                </div>
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 0 0 24px;">
+                <div class="stat-card"
+                    style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; text-align: center;">
+                    <div style="font-size: 2rem; font-weight: 800; color: #00d68f;">60M+ PPS</div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 8px;">NetD C10M Data Plane
+                    </div>
+                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">Ring 3 SPSC bridge · 6× C10M
+                        target
+                    </div>
+                </div>
+                <div class="stat-card"
+                    style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; text-align: center;">
+                    <div style="font-size: 2rem; font-weight: 800; color: #54a0ff;">102 cycles</div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 8px;">Null Syscall (Ring
+                        3→0→3)</div>
+                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">~26 ns · SWAPGS + KPTI · 7.4×
+                        Linux
+                    </div>
+                </div>
+                <div class="stat-card"
+                    style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; text-align: center;">
+                    <div style="font-size: 2rem; font-weight: 800; color: #f78c6c;">136 cycles</div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 8px;">Socket Data Plane</div>
+                    <div style="font-size: 0.75rem; color: #545480; margin-top: 4px;">per 64B read+write · zero kernel
+                        traps
                     </div>
                 </div>
             </div>
             <p style="font-size: 0.8rem; color: #545480; text-align: center; margin-bottom: 32px;">
-                Intel Xeon Platinum 8151 (Skylake, 4.0 GHz), AWS z1d.metal, QEMU/KVM. <code>-enable-kvm -cpu host</code>.
+                Intel Xeon Platinum 8151 (Skylake, 4.0 GHz), AWS z1d.metal, QEMU/KVM.
+                <code>-enable-kvm -cpu host</code>.
                 <a href="https://github.com/bneb/lattice/blob/main/docs/LATTICE_BENCHMARKS.md"
                     style="color: var(--accent);">Full methodology →</a>
             </p>
@@ -2352,6 +2488,36 @@ process(&amp;buf);     <span class="cmt">// ✗ compile error: use of moved valu
                 pain.querySelector('.ergo-code-' + lang).classList.add('visible');
             });
         });
+        /* ─── Ambient Glow Parallax ─────────────────────────────────── */
+        const orbs = document.querySelectorAll('.glow-orb');
+        let rafId = null;
+        let lastScrollY = window.scrollY;
+
+        // Different scroll speed multipliers for each orb to create depth (parallax)
+        const speeds = [0.15, -0.1, 0.05];
+
+        function updateOrbs() {
+            const scrollY = window.scrollY;
+            if (scrollY === lastScrollY) {
+                rafId = window.requestAnimationFrame(updateOrbs);
+                return;
+            }
+            lastScrollY = scrollY;
+
+            orbs.forEach((orb, i) => {
+                // translate3d forces GPU hardware acceleration
+                const yOffset = scrollY * speeds[i % speeds.length];
+                const xOffset = scrollY * (speeds[i % speeds.length] * 0.5); // Slight diagonal drift
+                orb.style.transform = `translate3d(${xOffset}px, ${yOffset}px, 0)`;
+            });
+
+            rafId = window.requestAnimationFrame(updateOrbs);
+        }
+
+        // Only animate if not on a small mobile device (preserves battery/perf)
+        if (window.innerWidth > 480) {
+            rafId = window.requestAnimationFrame(updateOrbs);
+        }
     </script>
 </body>
 

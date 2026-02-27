@@ -76,7 +76,7 @@ if grep -q 'facet_window_open' "$SALT_FILE" 2>/dev/null; then
 fi
 
 # Detect Facet GPU bridge
-if grep -q 'facet_gpu_init' "$SALT_FILE" 2>/dev/null; then
+if grep -q 'facet_gpu' "$SALT_FILE" 2>/dev/null || grep -q 'facet_gpu' $(dirname "$SALT_FILE")/*.salt 2>/dev/null || grep -q 'facet_gpu' $(dirname "$SALT_FILE")/../*/*.salt 2>/dev/null; then
     BRIDGES+=("$PROJECT_ROOT/user/facet/gpu/facet_gpu.m")
     LD_FLAGS+=("-framework" "Metal" "-fobjc-arc")
 fi

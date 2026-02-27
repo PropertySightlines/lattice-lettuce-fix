@@ -1,0 +1,264 @@
+// =============================================================================
+// user/lib/socket.salt
+// Application Socket Library — Zero-Trap Data Plane
+// =============================================================================
+//
+// Architecture:
+//   Control Plane: bind(), accept(), close() use synchronous IPC to NetD.
+//   Data Plane:    read(), write() use shared-memory SPSC rings — zero syscalls.
+//
+// The control plane negotiates connections via CMD_BIND / CMD_ACCEPT / CMD_CLOSE
+// messages to the NetD daemon (PID 5). Upon successful bind, NetD grants shared
+// memory pages for RX/TX SPSC rings at deterministic virtual addresses computed
+// from the file descriptor number.
+//
+// The data plane reads/writes directly from/to those memory-mapped rings.
+// No kernel transitions, no TLB flushes, no scheduler involvement.
+// =============================================================================
+
+package user.lib.socket
+
+use user.lib.syscall
+use user.lib.socket_protocol
+
+// =============================================================================
+// SPSC Ring Constants (must match kernel/lib/ipc_shm.salt)
+// =============================================================================
+// Ring header layout: [head:8][tail:8][capacity:8][flags:8]...
+// Data region starts at offset 128.
+const RING_HEAD_OFF: u64     = 0;
+const RING_TAIL_OFF: u64     = 8;
+const RING_CAPACITY_OFF: u64 = 16;
+const RING_DATA_OFF: u64     = 128;
+
+// =============================================================================
+// Volatile Memory Access (inline — no extern needed in user space)
+// =============================================================================
+fn vol_read64(addr: u64) -> u64 {
+    return *((addr) as &u64);
+}
+
+fn vol_write64(addr: u64, val: u64) {
+    *((addr) as &mut u64) = val;
+}
+
+// =============================================================================
+// User-Space SPSC Operations — Zero Kernel Traps
+// =============================================================================
+// These are lightweight copies of the kernel SPSC operations, operating on
+// the shared memory pages directly mapped into user address space.
+
+/// Returns the number of bytes available to read from the ring.
+fn spsc_available(base: u64) -> u64 {
+    let head = vol_read64(base + RING_HEAD_OFF);
+    let tail = vol_read64(base + RING_TAIL_OFF);
+    if head >= tail {
+        return head - tail;
+    }
+    // Wrapped: capacity - tail + head
+    let cap = vol_read64(base + RING_CAPACITY_OFF);
+    return cap - tail + head;
+}
+
+/// Returns the number of bytes available to write to the ring.
+fn spsc_free_space(base: u64) -> u64 {
+    let cap = vol_read64(base + RING_CAPACITY_OFF);
+    return cap - spsc_available(base) - 1;  // -1 to distinguish full from empty
+}
+
+/// Pop up to `count` bytes from ring into `dst`. Returns bytes popped.
+fn spsc_pop(base: u64, dst: u64, count: u64) -> u64 {
+    let avail = spsc_available(base);
+    if avail == 0 { return 0; }
+    let to_pop = if avail < count { avail } else { count };
+
+    let cap = vol_read64(base + RING_CAPACITY_OFF);
+    let tail = vol_read64(base + RING_TAIL_OFF);
+    let data = base + RING_DATA_OFF;
+
+    let start_idx = tail % cap;
+    let seg1_len = cap - start_idx;
+    let first = if to_pop < seg1_len { to_pop } else { seg1_len };
+
+    // Copy segment 1: from start_idx to min(end, capacity)
+    let mut i: u64 = 0;
+    while i < first {
+        *((dst + i) as &mut u8) = *((data + start_idx + i) as &u8);
+        i = i + 1;
+    }
+
+    // Copy segment 2: wrapped around to beginning of ring
+    if to_pop > first {
+        let second = to_pop - first;
+        let mut j: u64 = 0;
+        while j < second {
+            *((dst + first + j) as &mut u8) = *((data + j) as &u8);
+            j = j + 1;
+        }
+    }
+
+    // Update tail pointer
+    vol_write64(base + RING_TAIL_OFF, tail + to_pop);
+    return to_pop;
+}
+
+/// Push `count` bytes from `src` into ring. Returns bytes pushed.
+fn spsc_push(base: u64, src: u64, count: u64) -> u64 {
+    let free = spsc_free_space(base);
+    if free == 0 { return 0; }
+    let to_push = if count < free { count } else { free };
+
+    let cap = vol_read64(base + RING_CAPACITY_OFF);
+    let head = vol_read64(base + RING_HEAD_OFF);
+    let data = base + RING_DATA_OFF;
+
+    let start_idx = head % cap;
+    let seg1_len = cap - start_idx;
+    let first = if to_push < seg1_len { to_push } else { seg1_len };
+
+    // Copy segment 1
+    let mut i: u64 = 0;
+    while i < first {
+        *((data + start_idx + i) as &mut u8) = *((src + i) as &u8);
+        i = i + 1;
+    }
+
+    // Copy segment 2: wrapped
+    if to_push > first {
+        let second = to_push - first;
+        let mut j: u64 = 0;
+        while j < second {
+            *((data + j) as &mut u8) = *((src + first + j) as &u8);
+            j = j + 1;
+        }
+    }
+
+    // Update head pointer
+    vol_write64(base + RING_HEAD_OFF, head + to_push);
+    return to_push;
+}
+
+// =============================================================================
+// Socket Struct
+// =============================================================================
+pub struct Socket {
+    fd: u64,        // File descriptor assigned by NetD
+    rx_ring: u64,   // Virtual address of RX SPSC ring (NetD pushes, app pops)
+    tx_ring: u64,   // Virtual address of TX SPSC ring (app pushes, NetD pops)
+    port: u64,      // Bound port number
+    state: u64,     // 0=closed, 1=bound, 2=connected
+}
+
+const STATE_CLOSED: u64    = 0;
+const STATE_BOUND: u64     = 1;
+const STATE_CONNECTED: u64 = 2;
+
+// =============================================================================
+// VADDR Calculation — Deterministic from FD
+// =============================================================================
+fn rx_vaddr(fd: u64) -> u64 {
+    return socket_protocol.SOCKET_VADDR_BASE + (fd * socket_protocol.SOCKET_REGION_SIZE);
+}
+
+fn tx_vaddr(fd: u64) -> u64 {
+    return socket_protocol.SOCKET_VADDR_BASE
+         + (fd * socket_protocol.SOCKET_REGION_SIZE)
+         + socket_protocol.SOCKET_PAGE_SIZE;
+}
+
+// =============================================================================
+// Control Plane — Synchronous IPC to NetD
+// =============================================================================
+
+/// Bind a port. Sends CMD_BIND to NetD and blocks for response.
+/// On success, returns a Socket with deterministic VADDR rings.
+/// On failure, returns a Socket with state=CLOSED.
+pub fn bind(port: u64) -> Socket {
+    // Send: CMD_BIND, port, 0
+    syscall.ipc_send(socket_protocol.NETD_PID, socket_protocol.CMD_BIND, port, 0);
+
+    // Block until NetD replies
+    let sender = syscall.ipc_recv();
+
+    // ipc_recv returns sender_pid in RAX; the response payload is in
+    // the registers that were overwritten by the kernel:
+    //   After ipc_recv returns: RAX=sender, RDI=msg0, RSI=msg1, RDX=msg2
+    // In Salt, the extern fn returns RAX. The msg0/msg1/msg2 values are
+    // only accessible via inline assembly or a multi-return ABI.
+    // For now, we assume success if sender == NETD_PID.
+    // The FD is deterministically assigned as port % 256.
+    let fd = port % 256;
+
+    if sender == socket_protocol.NETD_PID {
+        return Socket {
+            fd: fd,
+            rx_ring: rx_vaddr(fd),
+            tx_ring: tx_vaddr(fd),
+            port: port,
+            state: STATE_BOUND,
+        };
+    }
+
+    // Error — return closed socket
+    return Socket {
+        fd: 0,
+        rx_ring: 0,
+        tx_ring: 0,
+        port: 0,
+        state: STATE_CLOSED,
+    };
+}
+
+/// Accept a connection on a bound socket. Blocks on ipc_recv until NetD
+/// completes the TCP 3-way handshake and maps SPSC rings via sys_shm_grant.
+/// Returns true if connection accepted, false on error.
+pub fn accept(sock: &mut Socket) -> bool {
+    if sock.state != STATE_BOUND {
+        return false;
+    }
+
+    // Send: CMD_ACCEPT, fd, 0
+    syscall.ipc_send(socket_protocol.NETD_PID, socket_protocol.CMD_ACCEPT, sock.fd, 0);
+
+    // Block until NetD replies (after TCP handshake + SHM grant)
+    let sender = syscall.ipc_recv();
+
+    if sender == socket_protocol.NETD_PID {
+        sock.state = STATE_CONNECTED;
+        return true;
+    }
+
+    return false;
+}
+
+/// Close a socket. Sends CMD_CLOSE to NetD.
+pub fn close(sock: &mut Socket) {
+    if sock.state != STATE_CLOSED {
+        syscall.ipc_send(socket_protocol.NETD_PID, socket_protocol.CMD_CLOSE, sock.fd, 0);
+        sock.state = STATE_CLOSED;
+    }
+}
+
+// =============================================================================
+// Data Plane — Zero Kernel Traps
+// =============================================================================
+// These functions operate ENTIRELY in user-space shared memory.
+// No syscall, no interrupt, no privilege transition.
+
+/// Read up to max_len bytes from the socket's RX ring into buffer.
+/// Returns the number of bytes read. ZERO SYSCALLS.
+pub fn read(sock: &Socket, buffer: u64, max_len: u64) -> u64 {
+    if sock.state != STATE_CONNECTED {
+        return 0;
+    }
+    return spsc_pop(sock.rx_ring, buffer, max_len);
+}
+
+/// Write len bytes from buffer into the socket's TX ring.
+/// Returns the number of bytes written. ZERO SYSCALLS.
+pub fn write(sock: &Socket, buffer: u64, len: u64) -> u64 {
+    if sock.state != STATE_CONNECTED {
+        return 0;
+    }
+    return spsc_push(sock.tx_ring, buffer, len);
+}

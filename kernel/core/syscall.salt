@@ -15,6 +15,7 @@ extern fn switch_cr3(pml4_phys: u64);
 extern fn idle_halt();
 extern fn invlpg_addr(vaddr: u64);
 extern fn set_syscall_kernel_rsp0(rsp0: u64);
+extern fn smp_cas_u64(ptr: u64, expected: u64, desired: u64) -> u64;
 
 // =============================================================================
 // User Pointer Validation
@@ -25,6 +26,7 @@ const PROC_FREE: u64   = 0;
 const PROC_READY: u64  = 1;
 const PROC_RUNNING: u64 = 2;
 const PROC_ZOMBIE: u64 = 3;
+const PROC_IPC_BLOCKED: u64 = 4;
 
 const PAGE_SIZE: u64 = 4096;
 const USER_PAGE_FLAGS: u64 = 0x7;  // PRESENT | WRITE | USER
@@ -70,6 +72,18 @@ pub fn handle_syscall(num: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     } else if num == 119 {
         sched_yield();
         return 0;
+    } else if num == 200 {
+        // SYS_IPC_SEND: arg0=target_pid, arg1=msg0, arg2=msg1
+        // NOTE: arg3 (msg2) arrives via R10 but handle_syscall only gets 3 args
+        // from the slow path. The fast-path in assembly handles the full 4-arg dispatch.
+        return sys_ipc_send(arg0, arg1, arg2, 0);
+    } else if num == 201 {
+        // SYS_IPC_RECV: block until message arrives
+        return sys_ipc_recv();
+    } else if num == 202 {
+        // SYS_SHM_GRANT: arg0=target_pid, arg1=src_vaddr, arg2=dst_vaddr
+        // Slow path doesn't receive R10 (num_pages), default to 1 page.
+        return sys_shm_grant(arg0, arg1, arg2, 1);
     }
     return 0;
 }
@@ -430,3 +444,224 @@ fn sys_mmap(length: u64, prot: u64) -> u64 {
 @no_mangle
 pub fn syscall_set_kernel_pml4(pml4: u64) { set_kernel_pml4(pml4); }
 
+// =============================================================================
+// IPC Payload Staging — Assembly Handoff
+// =============================================================================
+// The ipc_recv_msg0/1/2 variables are defined in syscall_entry_fast.S
+// (.data section, global linkage). Salt writes, assembly reads.
+// This extern fn stages all three words in one call.
+extern fn ipc_stage_payload(msg0: u64, msg1: u64, msg2: u64);
+
+// =============================================================================
+// sys_ipc_send — Fast-Path Register-Level IPC
+// =============================================================================
+// Delivers a 3-word message to the target process. If the target is
+// IPC_BLOCKED (waiting for a message), we store the payload in its PCB,
+// mark it READY, and immediately context-switch to it.
+//
+// If the target is not blocked, we still store the message (buffered)
+// and let the scheduler handle delivery on the next recv.
+//
+// Returns 0 on success, -1 on invalid target.
+// =============================================================================
+@no_mangle
+pub fn sys_ipc_send(target_pid: u64, msg0: u64, msg1: u64, msg2: u64) -> u64 {
+    let sender = process.current();
+
+    // Validate target
+    if target_pid >= MAX_PROCS {
+        serial.print("[ipc_send] REJECT: target out of range\n");
+        return 0 - 1; // -1
+    }
+    let target_state = process.get_state(target_pid);
+    if target_state == PROC_FREE {
+        serial.print("[ipc_send] REJECT: target pid=");
+        serial.print_u64(target_pid);
+        serial.print(" state=");
+        serial.print_u64(target_state);
+        serial.print("\n");
+        return 0 - 1;
+    }
+
+    // Store message in target's PCB
+    process.set_ipc_msg(target_pid, sender, msg0, msg1, msg2);
+
+    // If target is blocked on IPC recv, atomically unblock it and switch.
+    // SMP SAFETY: Use atomic CAS to prevent two cores from both seeing
+    // IPC_BLOCKED and double-switching to the same process.
+    if target_state == PROC_IPC_BLOCKED {
+        let state_addr = process.get_state_addr(target_pid);
+        let old = smp_cas_u64(state_addr, PROC_IPC_BLOCKED, PROC_READY);
+        if old == PROC_IPC_BLOCKED {
+            // WE won the race — switch to target
+            switch_to_process(sender, target_pid);
+        }
+        // Else: another core already unblocked it. Message is buffered.
+    }
+
+    return 0;
+}
+
+// =============================================================================
+// sys_ipc_recv — Block Until IPC Message Arrives
+// =============================================================================
+// Marks the current process as IPC_BLOCKED and yields the CPU.
+// When a sender targets this process, the kernel stores the payload in
+// the PCB's ipc_msg fields.
+//
+// Before returning, this function MUST stage the payload into the
+// ipc_recv_msg0/1/2 globals. The assembly handler loads those into
+// RDI/RSI/RDX before SYSRET, completing register-level delivery.
+//
+// Returns: sender_pid in RAX.
+// Post-condition: ipc_recv_msg0/1/2 contain the payload for assembly.
+// =============================================================================
+@no_mangle
+pub fn sys_ipc_recv() -> u64 {
+    let slot = process.current();
+
+    // Check if a message is already buffered
+    let buffered_sender = process.get_ipc_sender(slot);
+    if buffered_sender != 0 {
+        // Message already waiting — consume it immediately
+        // Stage payload to assembly-owned globals for register injection
+        ipc_stage_payload(
+            process.get_ipc_msg0(slot),
+            process.get_ipc_msg1(slot),
+            process.get_ipc_msg2(slot)
+        );
+        // Clear PCB to avoid re-delivery
+        process.set_ipc_msg(slot, 0, 0, 0, 0);
+        return buffered_sender;
+    }
+
+    // No message pending — block and yield
+    process.set_state(slot, PROC_IPC_BLOCKED);
+    sched_yield();
+
+    // ─── RESUME POINT ───
+    // A sender delivered a message to our PCB and called switch_to_process().
+    // We are now running again. Extract the payload.
+    let sender = process.get_ipc_sender(slot);
+
+    // Stage payload to assembly-owned globals for register injection
+    ipc_stage_payload(
+        process.get_ipc_msg0(slot),
+        process.get_ipc_msg1(slot),
+        process.get_ipc_msg2(slot)
+    );
+
+    // Clear PCB to avoid re-delivery on next recv
+    process.set_ipc_msg(slot, 0, 0, 0, 0);
+    return sender;
+}
+// =============================================================================
+// sys_shm_grant — Zero-Copy Shared Memory IPC
+// =============================================================================
+// Grants the target process read/write access to physical frames currently
+// mapped in the sender's address space. The kernel resolves each source
+// virtual page to its physical frame, then maps that same frame into the
+// target's page tables at the corresponding destination address.
+//
+// Both processes see the same physical transistors — true zero-copy.
+//
+// Syscall 202:
+//   RDI = target_pid   (which process to grant access to)
+//   RSI = src_vaddr    (caller's virtual address, must be page-aligned)
+//   RDX = dst_vaddr    (target's virtual address, must be page-aligned)
+//   R10 = num_pages    (number of contiguous 4KB pages to share)
+//
+// Returns: 0 on success, -1 on error
+//
+// Security: The sender is explicitly granting access — no global shared
+// memory namespace. The target's dst_vaddr must be unmapped (fresh region)
+// so no TLB shootdown is needed on the receiving core.
+// =============================================================================
+@no_mangle
+pub fn sys_shm_grant(target_pid: u64, src_vaddr: u64, dst_vaddr: u64, num_pages: u64) -> u64 {
+    let sender = process.current();
+
+    // 1. Target Validation
+    if target_pid >= MAX_PROCS {
+        return 0 - 1;
+    }
+    let target_state = process.get_state(target_pid);
+    if target_state == PROC_FREE {
+        return 0 - 1;
+    }
+
+    // 2. Alignment Enforcement
+    if (src_vaddr & 0xFFF) != 0 || (dst_vaddr & 0xFFF) != 0 {
+        return 0 - 1;
+    }
+
+    // 3. Bounds check on num_pages (max 16 pages = 64KB per grant)
+    if num_pages == 0 || num_pages > 16 {
+        return 0 - 1;
+    }
+
+    // 4. User-half enforcement — CRITICAL SECURITY CHECK
+    // Both src and dst address ranges must be strictly in the user half.
+    // A kernel-half src_vaddr would leak kernel physical frames.
+    // A kernel-half dst_vaddr would inject PTE_USER entries into kernel space.
+    // @invariant(num_pages <= 16)
+    let src_end = src_vaddr + (num_pages * PAGE_SIZE);
+    let dst_end = dst_vaddr + (num_pages * PAGE_SIZE);
+    if src_vaddr >= USER_ADDR_LIMIT || src_end > USER_ADDR_LIMIT {
+        serial.print("[shm_grant] REJECT: src in kernel half\n");
+        return 0 - 1;
+    }
+    if dst_vaddr >= USER_ADDR_LIMIT || dst_end > USER_ADDR_LIMIT {
+        serial.print("[shm_grant] REJECT: dst in kernel half\n");
+        return 0 - 1;
+    }
+    // Also guard against integer overflow wrapping src_end/dst_end below src/dst
+    if src_end < src_vaddr || dst_end < dst_vaddr {
+        return 0 - 1;
+    }
+
+    // 5. Get PML4s
+    let src_pml4 = process.get_pml4(sender);
+    if src_pml4 == 0 {
+        return 0 - 1;
+    }
+    let target_pml4 = process.get_pml4(target_pid);
+    if target_pml4 == 0 {
+        return 0 - 1;
+    }
+
+    // 6. Page Table Manipulation — map each page with rollback on failure
+    // @invariant(i >= 0)
+    // @invariant(i <= num_pages)
+    // @invariant(num_pages <= 16)
+    let mut i: u64 = 0;
+    while i < num_pages {
+        let curr_src = src_vaddr + (i * PAGE_SIZE);
+        let curr_dst = dst_vaddr + (i * PAGE_SIZE);
+
+        // A. Resolve the physical backing frame from the sender's CR3
+        let phys_frame = user_paging.translate_user_addr(src_pml4, curr_src);
+        if phys_frame == 0 {
+            // ROLLBACK: unmap pages 0..i that were already injected
+            let mut j: u64 = 0;
+            while j < i {
+                let rollback_dst = dst_vaddr + (j * PAGE_SIZE);
+                user_paging.unmap_user_page(target_pml4, rollback_dst);
+                j = j + 1;
+            }
+            return 0 - 1;
+        }
+
+        // B. Map that exact physical frame into the target's CR3
+        user_paging.map_user_page(
+            target_pml4,
+            curr_dst,
+            phys_frame,
+            user_paging.PTE_PRESENT | user_paging.PTE_USER | user_paging.PTE_WRITE
+        );
+
+        i = i + 1;
+    }
+
+    return 0;
+}

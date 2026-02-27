@@ -1,0 +1,61 @@
+// =============================================================================
+// user/lib/socket_protocol.salt
+// Socket IPC Protocol — Control Plane Command Dictionary
+// =============================================================================
+//
+// Strictly typed command/response constants shared between applications and
+// the NetD daemon. The control plane uses synchronous IPC (sys_ipc_send /
+// sys_ipc_recv) for connection lifecycle; the data plane uses zero-copy
+// SPSC rings via shared memory — no kernel traps.
+//
+// IPC Message Layout (3 register words per message):
+//   msg0 = command/response code
+//   msg1 = argument (port, fd, error code)
+//   msg2 = auxiliary (reserved for future use)
+// =============================================================================
+
+package user.lib.socket_protocol
+
+// =============================================================================
+// NetD Static PID
+// =============================================================================
+// NetD is spawned at boot as process slot 5. All socket operations route
+// IPC to this PID. This is a system constant — changing it requires a
+// coordinated update to process.salt spawn order.
+pub const NETD_PID: u64 = 5;
+
+// =============================================================================
+// Control Plane Commands (Application → NetD)
+// =============================================================================
+pub const CMD_BIND: u64   = 0x10;  // Bind a port: msg1 = port
+pub const CMD_ACCEPT: u64 = 0x11;  // Accept connection: msg1 = fd
+pub const CMD_CLOSE: u64  = 0x12;  // Close socket: msg1 = fd
+
+// =============================================================================
+// Control Plane Responses (NetD → Application)
+// =============================================================================
+pub const RESP_OK: u64    = 0x00;  // Success: msg1 = fd (or 0)
+pub const RESP_ERR: u64   = 0xFF;  // Error: msg1 = error code
+
+// =============================================================================
+// Error Codes
+// =============================================================================
+pub const ERR_PORT_IN_USE: u64  = 1;  // Requested port already bound
+pub const ERR_NO_FDS: u64       = 2;  // FD table exhausted
+pub const ERR_INVALID_FD: u64   = 3;  // FD not found in NetD's table
+pub const ERR_NOT_BOUND: u64    = 4;  // Socket not in BOUND state
+
+// =============================================================================
+// Data Plane Constants
+// =============================================================================
+// SPSC ring virtual address layout for user-space sockets.
+// Each socket FD maps to 2 contiguous 4KB pages:
+//   RX ring: SOCKET_VADDR_BASE + (fd * SOCKET_REGION_SIZE)
+//   TX ring: SOCKET_VADDR_BASE + (fd * SOCKET_REGION_SIZE) + 4096
+//
+// This deterministic layout means both the application and NetD agree on
+// virtual addresses without additional IPC — the FD number alone encodes
+// the mapping.
+pub const SOCKET_VADDR_BASE: u64   = 0x600000000000;  // 96 TB mark — far from heap/stack
+pub const SOCKET_REGION_SIZE: u64  = 8192;             // 2 pages per socket (RX + TX)
+pub const SOCKET_PAGE_SIZE: u64    = 4096;

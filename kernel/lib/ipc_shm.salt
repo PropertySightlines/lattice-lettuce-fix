@@ -1,0 +1,222 @@
+// =============================================================================
+// kernel/lib/ipc_shm.salt
+// Lock-Free SPSC Ring Buffer for Shared Memory IPC
+// =============================================================================
+//
+// Cache-line-isolated Single-Producer Single-Consumer ring buffer designed
+// to sit inside a shared 4KB physical page granted via sys_shm_grant.
+//
+// Layout (4096 bytes):
+//   Cache Line 0 (bytes 0-63):   Producer-owned: head, capacity
+//   Cache Line 1 (bytes 64-127): Consumer-owned: tail
+//   Bytes 128-4095:              Data ring (3968 bytes usable)
+//
+// By placing head and tail on separate 64-byte cache lines, two cores
+// can spin on their respective variables at L1-cache speed without
+// triggering false-sharing invalidation storms.
+//
+// Invariant: head >= tail, (head - tail) <= capacity
+// Empty: head == tail
+// Full:  (head - tail) == capacity
+// =============================================================================
+
+package kernel.lib.ipc_shm
+
+// =============================================================================
+// x86-64 TSO Safety
+// =============================================================================
+// SAFETY: This lock-free code relies on x86-64 Total Store Order (TSO):
+//   - Stores are never reordered with other stores (implicit store-release)
+//   - Loads are never reordered with other loads (implicit load-acquire)
+//   - A load following a store to the SAME address always sees the store
+// volatile_read/write prevents COMPILER reordering; TSO prevents CPU reordering.
+// On non-TSO architectures (AArch64, RISC-V), replace with
+// atomic_load_acquire / atomic_store_release.
+// @target(x86_64)
+// =============================================================================
+
+extern fn volatile_read_i64(addr: u64) -> i64;
+extern fn volatile_write_i64(addr: u64, val: i64);
+
+const PAGE_SIZE: u64 = 4096;
+const HEADER_SIZE: u64 = 128;  // 2 cache lines for head + tail
+pub const DATA_CAPACITY: u64 = 3968;  // PAGE_SIZE - HEADER_SIZE
+
+// Offsets within the shared page
+const HEAD_OFFSET: u64 = 0;       // u64 at byte 0 (cache line 0)
+const CAPACITY_OFFSET: u64 = 8;   // u64 at byte 8 (cache line 0)
+const TAIL_OFFSET: u64 = 64;      // u64 at byte 64 (cache line 1)
+const DATA_OFFSET: u64 = 128;     // byte[3968] at byte 128
+
+// =============================================================================
+// spsc_init — Format a page as an SPSC ring buffer
+// =============================================================================
+// Call exactly once by the producer after sys_shm_grant.
+// base_addr: virtual address of the shared page (must be page-aligned)
+// =============================================================================
+pub fn spsc_init(base_addr: u64) {
+    volatile_write_i64(base_addr + HEAD_OFFSET, 0);
+    volatile_write_i64(base_addr + CAPACITY_OFFSET, DATA_CAPACITY as i64);
+    volatile_write_i64(base_addr + TAIL_OFFSET, 0);
+
+    // Zero the data region
+    let mut i: u64 = 0;
+    while i < DATA_CAPACITY {
+        *((base_addr + DATA_OFFSET + i) as &mut u8) = 0;
+        i = i + 1;
+    }
+}
+
+// =============================================================================
+// spsc_push — Producer writes one byte to the ring
+// =============================================================================
+// Returns true if the byte was written, false if the ring is full.
+// =============================================================================
+pub fn spsc_push(base_addr: u64, byte: u8) -> bool {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+    let cap  = volatile_read_i64(base_addr + CAPACITY_OFFSET) as u64;
+
+    // Full?
+    if (head - tail) >= cap {
+        return false;
+    }
+
+    // Write data at head % capacity
+    let idx = head % cap;
+    // Defense-in-depth: clamp idx to prevent OOB write from corrupted capacity
+    // @invariant(idx < DATA_CAPACITY)
+    if idx >= DATA_CAPACITY {
+        return false;
+    }
+    *((base_addr + DATA_OFFSET + idx) as &mut u8) = byte;
+
+    // Advance head (store-release semantics via volatile + TSO)
+    volatile_write_i64(base_addr + HEAD_OFFSET, (head + 1) as i64);
+
+    return true;
+}
+
+// =============================================================================
+// spsc_pop — Consumer reads one byte from the ring
+// =============================================================================
+// Returns the byte value (0-255) on success, or -1 if empty.
+// =============================================================================
+pub fn spsc_pop(base_addr: u64) -> i64 {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+
+    // Empty?
+    if head == tail {
+        return 0 - 1;
+    }
+
+    let cap = volatile_read_i64(base_addr + CAPACITY_OFFSET) as u64;
+    let idx = tail % cap;
+    // Defense-in-depth: clamp idx to prevent OOB read from corrupted capacity
+    // @invariant(idx < DATA_CAPACITY)
+    if idx >= DATA_CAPACITY {
+        return 0 - 1;
+    }
+    let byte = *((base_addr + DATA_OFFSET + idx) as &u8);
+
+    // Advance tail (store-release semantics via volatile + TSO)
+    volatile_write_i64(base_addr + TAIL_OFFSET, (tail + 1) as i64);
+
+    return byte as i64;
+}
+
+extern fn fast_memcpy(dst: u64, src: u64, count: u64);
+
+// =============================================================================
+// spsc_push_bulk — Producer writes a block of bytes (ERMS-accelerated)
+// =============================================================================
+// Computes at most 2 contiguous copy segments to avoid per-byte modulo.
+// Each segment dispatches a single REP MOVSB via fast_memcpy — the CPU
+// uses internal 256-bit vector registers on Skylake+ (ERMS).
+// Returns number of bytes written (may be less than len if ring fills).
+// =============================================================================
+pub fn spsc_push_bulk(base_addr: u64, src: u64, len: u64) -> u64 {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+    let cap  = volatile_read_i64(base_addr + CAPACITY_OFFSET) as u64;
+
+    let avail = cap - (head - tail);
+    let count = if len < avail { len } else { avail };
+    if count == 0 {
+        return 0;
+    }
+
+    let start_idx = head % cap;
+    // Segment 1: contiguous bytes from start_idx to end of ring (or count)
+    let seg1_len = cap - start_idx;
+    let first = if count < seg1_len { count } else { seg1_len };
+
+    // Copy segment 1: ERMS rep movsb
+    fast_memcpy(base_addr + DATA_OFFSET + start_idx, src, first);
+
+    // Segment 2: wrap-around (if any remaining bytes)
+    let second = count - first;
+    if second > 0 {
+        fast_memcpy(base_addr + DATA_OFFSET, src + first, second);
+    }
+
+    // Single volatile store for entire batch
+    volatile_write_i64(base_addr + HEAD_OFFSET, (head + count) as i64);
+    return count;
+}
+
+// =============================================================================
+// spsc_pop_bulk — Consumer reads a block of bytes (ERMS-accelerated)
+// =============================================================================
+// Computes at most 2 contiguous copy segments to avoid per-byte modulo.
+// Returns number of bytes read (may be less than len if ring is emptied).
+// =============================================================================
+pub fn spsc_pop_bulk(base_addr: u64, dst: u64, len: u64) -> u64 {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+    let cap  = volatile_read_i64(base_addr + CAPACITY_OFFSET) as u64;
+
+    let avail = head - tail;
+    let count = if len < avail { len } else { avail };
+    if count == 0 {
+        return 0;
+    }
+
+    let start_idx = tail % cap;
+    // Segment 1: contiguous bytes from start_idx to end of ring (or count)
+    let seg1_len = cap - start_idx;
+    let first = if count < seg1_len { count } else { seg1_len };
+
+    // Copy segment 1: ERMS rep movsb
+    fast_memcpy(dst, base_addr + DATA_OFFSET + start_idx, first);
+
+    // Segment 2: wrap-around (if any remaining bytes)
+    let second = count - first;
+    if second > 0 {
+        fast_memcpy(dst + first, base_addr + DATA_OFFSET, second);
+    }
+
+    // Single volatile store for entire batch
+    volatile_write_i64(base_addr + TAIL_OFFSET, (tail + count) as i64);
+    return count;
+}
+
+// =============================================================================
+// spsc_available — Returns number of bytes available to read
+// =============================================================================
+pub fn spsc_available(base_addr: u64) -> u64 {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+    return head - tail;
+}
+
+// =============================================================================
+// spsc_free_space — Returns number of bytes available for writing
+// =============================================================================
+pub fn spsc_free_space(base_addr: u64) -> u64 {
+    let head = volatile_read_i64(base_addr + HEAD_OFFSET) as u64;
+    let tail = volatile_read_i64(base_addr + TAIL_OFFSET) as u64;
+    let cap  = volatile_read_i64(base_addr + CAPACITY_OFFSET) as u64;
+    return cap - (head - tail);
+}

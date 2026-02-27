@@ -29,10 +29,11 @@ const PAGE_SIZE: u64 = 4096;
 
 
 // Process states
-pub const PROC_FREE: u64    = 0;   // Slot is unused
-pub const PROC_READY: u64   = 1;   // Runnable, waiting for scheduler
-pub const PROC_RUNNING: u64 = 2;   // Currently executing
-pub const PROC_ZOMBIE: u64  = 3;   // Exited, awaiting cleanup
+pub const PROC_FREE: u64        = 0;   // Slot is unused
+pub const PROC_READY: u64       = 1;   // Runnable, waiting for scheduler
+pub const PROC_RUNNING: u64     = 2;   // Currently executing
+pub const PROC_ZOMBIE: u64      = 3;   // Exited, awaiting cleanup
+pub const PROC_IPC_BLOCKED: u64 = 4;   // Blocked on IPC receive
 
 // Kernel stack size per process: 1 page = 4KB
 // MUST be 1 page because alloc_kernel_stack uses pmm.alloc() which
@@ -57,6 +58,11 @@ pub struct Process {
     pub mmap_base: u64,         // Starting search address for anonymous mappings
     pub vma_list_head: u64,     // Pointer to first Vma struct (slab-allocated linked list)
     pub pcid: u64,              // PCID (12-bit, 1..4095) for TLB tagging
+    // --- IPC Fast-Path State ---
+    pub ipc_sender: u64,        // PID of sender (valid when state == IPC_BLOCKED was unblocked)
+    pub ipc_msg0: u64,          // IPC payload word 0
+    pub ipc_msg1: u64,          // IPC payload word 1
+    pub ipc_msg2: u64,          // IPC payload word 2
 }
 
 // =============================================================================
@@ -68,7 +74,8 @@ global PROC_TABLE: [Process; 16] = [Process {
     user_entry: 0, user_stack_top: 0,
     brk_base: 0, brk_current: 0,
     mmap_base: 0, vma_list_head: 0,
-    pcid: 0
+    pcid: 0,
+    ipc_sender: 0, ipc_msg0: 0, ipc_msg1: 0, ipc_msg2: 0
 }; 16];
 
 global CURRENT_PID: u64 = 0;
@@ -163,12 +170,22 @@ pub fn get_state(slot: u64) -> u64 {
     return PROC_TABLE[slot].state;
 }
 
+// get_state_addr — Returns the memory address of PROC_TABLE[slot].state
+// Required by atomic_cas_u64 for lock-free PCB state transitions on SMP.
+pub fn get_state_addr(slot: u64) -> u64 {
+    return (&PROC_TABLE[slot].state) as u64;
+}
+
 pub fn set_state(slot: u64, state: u64) {
     PROC_TABLE[slot].state = state;
 }
 
 pub fn get_pml4(slot: u64) -> u64 {
     return PROC_TABLE[slot].user_pml4;
+}
+
+pub fn set_pml4(slot: u64, pml4: u64) {
+    PROC_TABLE[slot].user_pml4 = pml4;
 }
 
 pub fn get_kernel_rsp(slot: u64) -> u64 {
@@ -279,3 +296,36 @@ pub fn process_get_pcid(slot: u64) -> u64 { return get_pcid(slot); }
 @no_mangle
 pub fn process_get_kernel_stack_top(slot: u64) -> u64 { return get_kernel_stack_top(slot); }
 
+// =============================================================================
+// IPC Fast-Path Accessors
+// =============================================================================
+// SMP Safety: Write msg0/1/2 BEFORE sender. The consumer checks ipc_sender
+// to determine if a message is present. On x86-64 TSO, stores are ordered,
+// so when the consumer sees sender != 0, msg0/1/2 are guaranteed visible.
+// On non-TSO architectures, replace the sender write with atomic_store_release.
+pub fn set_ipc_msg(slot: u64, sender: u64, msg0: u64, msg1: u64, msg2: u64) {
+    PROC_TABLE[slot].ipc_msg0 = msg0;
+    PROC_TABLE[slot].ipc_msg1 = msg1;
+    PROC_TABLE[slot].ipc_msg2 = msg2;
+    // Store-release: sender is the "published" flag. Must be written last.
+    PROC_TABLE[slot].ipc_sender = sender;
+}
+
+pub fn get_ipc_sender(slot: u64) -> u64 { return PROC_TABLE[slot].ipc_sender; }
+pub fn get_ipc_msg0(slot: u64) -> u64 { return PROC_TABLE[slot].ipc_msg0; }
+pub fn get_ipc_msg1(slot: u64) -> u64 { return PROC_TABLE[slot].ipc_msg1; }
+pub fn get_ipc_msg2(slot: u64) -> u64 { return PROC_TABLE[slot].ipc_msg2; }
+
+@no_mangle
+pub fn process_set_ipc_msg(slot: u64, sender: u64, msg0: u64, msg1: u64, msg2: u64) {
+    set_ipc_msg(slot, sender, msg0, msg1, msg2);
+}
+
+@no_mangle
+pub fn process_get_ipc_sender(slot: u64) -> u64 { return get_ipc_sender(slot); }
+@no_mangle
+pub fn process_get_ipc_msg0(slot: u64) -> u64 { return get_ipc_msg0(slot); }
+@no_mangle
+pub fn process_get_ipc_msg1(slot: u64) -> u64 { return get_ipc_msg1(slot); }
+@no_mangle
+pub fn process_get_ipc_msg2(slot: u64) -> u64 { return get_ipc_msg2(slot); }

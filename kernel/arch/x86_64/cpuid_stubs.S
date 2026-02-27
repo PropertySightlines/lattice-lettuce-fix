@@ -27,3 +27,27 @@ cpuid_hypervisor_id:
     mov rax, rbx
     pop rbx
     ret
+
+# cpuid_base_freq_mhz() -> u64
+# Returns EAX from CPUID leaf 0x16 (Processor Frequency Information)
+# EAX = Base frequency in MHz (e.g. 4000 for 4.0 GHz)
+# Returns 0 if leaf 0x16 is not supported.
+# Supported on Intel Skylake+ (including Xeon 8151 / z1d.metal).
+.global cpuid_base_freq_mhz
+cpuid_base_freq_mhz:
+    push rbx
+    # First check if leaf 0x16 is supported (max basic leaf >= 0x16)
+    xor eax, eax
+    cpuid               # EAX = max supported basic leaf
+    cmp eax, 0x16
+    jb .no_leaf16
+    mov eax, 0x16
+    cpuid
+    # EAX = base frequency in MHz
+    and rax, 0xFFFF     # only low 16 bits are defined
+    pop rbx
+    ret
+.no_leaf16:
+    xor eax, eax        # return 0 = unsupported
+    pop rbx
+    ret

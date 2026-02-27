@@ -1,0 +1,64 @@
+// manifest.salt
+// Defines the cohesive "Sovereign Distribution" state of the Lattice Platform.
+// Used by tooling to verify cross-component compatibility.
+
+struct LatticeManifest {
+    platform_version: String,
+    compiler: ComponentDef,
+    kernel: ComponentDef,
+    services: Array<ComponentDef>,
+    apps: Array<ComponentDef>,
+}
+
+struct ComponentDef {
+    name: String,
+    version: String,
+    milestone: String,
+}
+
+pub let CURRENT_MANIFEST = LatticeManifest {
+    platform_version: "0.9.0",
+    
+    compiler: ComponentDef {
+        name: "salt-front",
+        version: "0.7.0",
+        milestone: "Z3 Verification Stable & Multi-Dialect Codegen",
+    },
+    
+    kernel: ComponentDef {
+        name: "lattice-core",
+        version: "0.9.0",
+        milestone: "4-Core SMP, Preemptive Scheduler, Ring 3 Isolation",
+    },
+    
+    services: [
+        ComponentDef {
+            name: "netd",
+            version: "0.9.0",
+            milestone: "Ring 3 Daemon & Zero-Trap Sockets",
+        },
+        ComponentDef {
+            name: "lsp",
+            version: "0.1.0",
+            milestone: "Diagnostics & Completions Foundation",
+        }
+    ],
+    
+    apps: [
+        ComponentDef {
+            name: "basalt",
+            version: "0.3.0",
+            milestone: "LLM Inference Proof-of-Concept",
+        },
+        ComponentDef {
+            name: "facet",
+            version: "0.3.0",
+            milestone: "2D Compositor Proof-of-Concept",
+        },
+        ComponentDef {
+            name: "lettuce",
+            version: "0.1.0",
+            milestone: "234K ops/sec KV Store",
+        }
+    ]
+};

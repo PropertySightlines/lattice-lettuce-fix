@@ -1,44 +1,19 @@
-//! Sync Verifier - Z3 Verification of "Hard Sync" Islands
-//!
-//! This module provides formal verification that functions without a Context
-//! parameter are guaranteed to be synchronous (no I/O, no blocking operations).
-//!
-//! ## The "Hard Sync" Property
-//! If a function lacks the Context "key", the Z3 shadow proves:
-//! - No network I/O
-//! - No file I/O
-//! - No sleep/yield calls
-//! - No calls to functions that require Context
-//!
-//! This enables aggressive optimization of sync functions.
+//! # Synchronous Safety Verifier
+//! 
+//! **PRODUCTION PATH ONLY**: This module enforces asynchronous/synchronous 
+//! boundary safety via the `CallGraphAnalyzer`. 
+//! 
+//! It utilizes fixed-point transitive propagation to guarantee that no 
+//! blocking operations or context-requiring I/O calls can occur within a 
+//! strict synchronous execution context. 
+//! 
+//! NOTE: Legacy AST-heuristic string matching (e.g., `find_io_operation`) 
+//! has been entirely removed in favor of this strict topological analysis.
 
 use crate::grammar::{SaltFn, SaltFile, Item};
 use crate::grammar::attr::extract_pulse_hz;
 use crate::codegen::passes::call_graph::CallGraphAnalyzer;
 use std::collections::{HashSet, HashMap};
-
-/// Known I/O operations that require Context
-const IO_OPERATIONS: &[&str] = &[
-    // Network
-    "net::TcpListener::bind",
-    "net::TcpListener::accept",
-    "net::TcpStream::read",
-    "net::TcpStream::write",
-    "net::UdpSocket::recv",
-    "net::UdpSocket::send",
-    // File system
-    "fs::read",
-    "fs::write",
-    "fs::open",
-    "io::File::read",
-    "io::File::write",
-    // Blocking
-    "thread::sleep",
-    "sync::Mutex::lock",
-    // Yielding
-    "executor::yield_now",
-    "executor::spawn",
-];
 
 /// Result of sync verification
 #[derive(Debug, Clone)]
@@ -57,11 +32,7 @@ pub struct SyncVerificationResult {
 pub struct SyncVerifier {
     /// Functions that are explicitly marked @pulse (they have Context)
     pulse_functions: HashSet<String>,
-    /// Functions that transitively require Context
-    context_required: HashSet<String>,
-    /// Call graph for transitive analysis
-    call_graph: HashMap<String, Vec<String>>,
-    /// Whether we used the CallGraphAnalyzer (vs heuristic)
+    /// Whether we used the CallGraphAnalyzer
     used_call_graph: bool,
 }
 
@@ -69,142 +40,15 @@ impl SyncVerifier {
     pub fn new() -> Self {
         Self {
             pulse_functions: HashSet::new(),
-            context_required: HashSet::new(),
-            call_graph: HashMap::new(),
             used_call_graph: false,
         }
-    }
-    
-    /// Analyze a Salt file and verify sync properties
-    pub fn analyze(&mut self, file: &SaltFile) -> Vec<SyncVerificationResult> {
-        let mut results = Vec::new();
-        
-        // Phase 1: Identify pulse functions
-        for item in &file.items {
-            if let Item::Fn(func) = item {
-                if extract_pulse_hz(&func.attributes).is_some() {
-                    self.pulse_functions.insert(func.name.to_string());
-                    self.context_required.insert(func.name.to_string());
-                }
-            }
-        }
-        
-        // Phase 2: Build call graph (simplified - just look for obvious calls)
-        for item in &file.items {
-            if let Item::Fn(func) = item {
-                let calls = self.extract_calls(func);
-                self.call_graph.insert(func.name.to_string(), calls);
-            }
-        }
-        
-        // Phase 3: Propagate context requirements
-        self.propagate_context_requirements();
-        
-        // Phase 4: Verify each non-pulse function
-        for item in &file.items {
-            if let Item::Fn(func) = item {
-                let name = func.name.to_string();
-                
-                // Skip pulse functions - they're allowed to do I/O
-                if self.pulse_functions.contains(&name) {
-                    continue;
-                }
-                
-                // Check if this function calls I/O without Context
-                let result = self.verify_function(func);
-                results.push(result);
-            }
-        }
-        
-        results
-    }
-    
-    /// Extract function calls from a function body (simplified)
-    fn extract_calls(&self, _func: &SaltFn) -> Vec<String> {
-        // This is a placeholder - real implementation would walk the AST
-        Vec::new()
-    }
-    
-    /// Propagate context requirements through the call graph
-    fn propagate_context_requirements(&mut self) {
-        let mut changed = true;
-        
-        while changed {
-            changed = false;
-            let current_required = self.context_required.clone();
-            
-            for (caller, callees) in &self.call_graph {
-                for callee in callees {
-                    if current_required.contains(callee) && 
-                       !self.context_required.contains(caller) {
-                        self.context_required.insert(caller.clone());
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    
-    /// Verify a single function is synchronous
-    fn verify_function(&self, func: &SaltFn) -> SyncVerificationResult {
-        let name = func.name.to_string();
-        
-        // Check for direct I/O operations
-        let io_violation = self.find_io_operation(func);
-        
-        // Check for calls to context-requiring functions
-        let context_call = self.find_context_call(func);
-        
-        let violation = io_violation.or(context_call);
-        
-        SyncVerificationResult {
-            function_name: name,
-            is_sync: violation.is_none(),
-            io_violation: violation,
-            violation_line: None,
-        }
-    }
-    
-    /// Find direct I/O operations in a function
-    fn find_io_operation(&self, func: &SaltFn) -> Option<String> {
-        // Simplified: check for IO_OPERATIONS in the function body text
-        let body_str = format!("{:?}", func.body);
-        
-        for op in IO_OPERATIONS {
-            if body_str.contains(op) {
-                return Some(op.to_string());
-            }
-        }
-        
-        None
-    }
-    
-    /// Find calls to functions that require Context
-    fn find_context_call(&self, func: &SaltFn) -> Option<String> {
-        let body_str = format!("{:?}", func.body);
-        
-        for ctx_fn in &self.context_required {
-            // Simple heuristic: look for function name followed by (
-            let pattern = format!("{}(", ctx_fn);
-            if body_str.contains(&pattern) {
-                return Some(format!("calls @pulse function: {}", ctx_fn));
-            }
-        }
-        
-        None
-    }
-    
-    /// Check if a function is verified synchronous
-    pub fn is_verified_sync(&self, name: &str) -> bool {
-        !self.context_required.contains(name)
     }
 
     // =========================================================================
     // Call Graph Integration (Sovereign V2.0)
     // =========================================================================
     //
-    // Replaces the heuristic extract_calls()/find_io_operation() with
-    // transitive queries into the CallGraphAnalyzer. The call graph has
+    // Uses transitive queries into the CallGraphAnalyzer. The call graph has
     // already done fixed-point propagation, so is_blocking() and
     // requires_context() reflect the entire transitive closure.
 
@@ -295,27 +139,18 @@ pub fn generate_sync_constraints(func_name: &str, calls_io: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[test]
-    fn test_io_operations_list() {
-        assert!(IO_OPERATIONS.contains(&"net::TcpStream::read"));
-        assert!(IO_OPERATIONS.contains(&"fs::write"));
-        assert!(IO_OPERATIONS.contains(&"thread::sleep"));
-    }
-    
+    use crate::codegen::passes::call_graph::{CallGraphAnalyzer, FnAttributes};
+
     #[test]
     fn test_sync_verifier_new() {
         let verifier = SyncVerifier::new();
         assert!(verifier.pulse_functions.is_empty());
-        assert!(verifier.context_required.is_empty());
         assert!(!verifier.used_call_graph);
     }
 
     // =========================================================================
     // PR 7: Call Graph Integration Tests (TDD)
     // =========================================================================
-
-    use crate::codegen::passes::call_graph::{CallGraphAnalyzer, FnAttributes};
 
     /// Helper: build a minimal SaltFile with named functions
     fn make_salt_file(func_names: &[&str], pulse_names: &[&str]) -> SaltFile {
@@ -351,12 +186,10 @@ mod tests {
 
     #[test]
     fn test_sync_function_passes_with_call_graph() {
-        // A pure function (no blocking, no context) should pass sync check
         let file = make_salt_file(&["compute_hash"], &[]);
 
         let mut cg = CallGraphAnalyzer::new();
         cg.inject_edges("compute_hash", vec!["add".to_string(), "rotate".to_string()]);
-        // Neither callee is blocking
         cg.run_propagation();
 
         let mut verifier = SyncVerifier::new();
@@ -372,7 +205,6 @@ mod tests {
 
     #[test]
     fn test_sync_violation_detected_via_call_graph() {
-        // A function that directly calls a blocking operation must fail
         let file = make_salt_file(&["read_config"], &[]);
 
         let mut cg = CallGraphAnalyzer::new();
@@ -395,7 +227,6 @@ mod tests {
 
     #[test]
     fn test_transitive_sync_violation() {
-        // A → B → C where C is blocking. A should fail sync check.
         let file = make_salt_file(&["handler", "process", "do_io"], &[]);
 
         let mut cg = CallGraphAnalyzer::new();
@@ -406,13 +237,11 @@ mod tests {
             is_blocking: true,
             ..Default::default()
         });
-        // Propagation: do_io is blocking → process becomes blocking → handler becomes blocking
         cg.run_propagation();
 
         let mut verifier = SyncVerifier::new();
         let results = verifier.verify_with_call_graph(&file, &cg);
 
-        // handler and process should both fail (transitively blocking)
         let handler_result = results.iter().find(|r| r.function_name == "handler").unwrap();
         let process_result = results.iter().find(|r| r.function_name == "process").unwrap();
         let doio_result = results.iter().find(|r| r.function_name == "do_io").unwrap();
@@ -427,7 +256,6 @@ mod tests {
 
     #[test]
     fn test_pulse_function_exempt_from_sync_check() {
-        // @pulse functions are allowed to call blocking operations
         let file = make_salt_file(&["ingest_loop", "compute"], &["ingest_loop"]);
 
         let mut cg = CallGraphAnalyzer::new();
@@ -444,7 +272,6 @@ mod tests {
         let mut verifier = SyncVerifier::new();
         let results = verifier.verify_with_call_graph(&file, &cg);
 
-        // Only compute should appear in results (ingest_loop is @pulse, exempt)
         assert_eq!(results.len(), 1,
             "@pulse function should be excluded from sync results");
         assert_eq!(results[0].function_name, "compute");

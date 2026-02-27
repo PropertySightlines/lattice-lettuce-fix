@@ -291,6 +291,52 @@ pub fn translate_user_addr(pml4_phys: u64, vaddr: u64) -> u64 {
 }
 
 // =============================================================================
+// unmap_user_page -- Clear a single 4KB leaf PTE (read-only walk, no alloc)
+// =============================================================================
+// Walks PML4→PDPT→PD→PT and clears the leaf PTE to 0.
+// Does NOT free intermediate tables or the physical page.
+// Returns true if a mapping was cleared, false if already unmapped.
+// Used by sys_shm_grant rollback on partial mapping failure.
+// =============================================================================
+pub fn unmap_user_page(pml4_phys: u64, vaddr: u64) -> bool {
+    // Walk PML4
+    let pml4_virt = memory.phys_to_virt(memory.PhysAddr { val: pml4_phys }).val;
+    let pml4e = *((pml4_virt + (pml4_index(vaddr) * 8)) as &u64);
+    if (pml4e & PTE_PRESENT) == 0 {
+        return false;
+    }
+
+    // Walk PDP
+    let pdp_phys = pml4e & ADDR_MASK;
+    let pdp_virt = memory.phys_to_virt(memory.PhysAddr { val: pdp_phys }).val;
+    let pdpe = *((pdp_virt + (pdp_index(vaddr) * 8)) as &u64);
+    if (pdpe & PTE_PRESENT) == 0 {
+        return false;
+    }
+
+    // Walk PD
+    let pd_phys = pdpe & ADDR_MASK;
+    let pd_virt = memory.phys_to_virt(memory.PhysAddr { val: pd_phys }).val;
+    let pde = *((pd_virt + (pd_index(vaddr) * 8)) as &u64);
+    if (pde & PTE_PRESENT) == 0 {
+        return false;
+    }
+
+    // Walk PT — clear the leaf entry
+    let pt_phys = pde & ADDR_MASK;
+    let pt_virt = memory.phys_to_virt(memory.PhysAddr { val: pt_phys }).val;
+    let pt_entry_addr = pt_virt + (pt_index(vaddr) * 8);
+    let pte = *(pt_entry_addr as &u64);
+    if (pte & PTE_PRESENT) == 0 {
+        return false;
+    }
+
+    // Clear the PTE — page is no longer mapped
+    *(pt_entry_addr as &mut u64) = 0;
+    return true;
+}
+
+// =============================================================================
 // destroy_user_pml4 -- Free ALL user-half pages (data + page tables)
 // =============================================================================
 pub fn destroy_user_pml4(pml4_phys: u64) {
