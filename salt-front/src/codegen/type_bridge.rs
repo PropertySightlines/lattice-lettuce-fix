@@ -152,6 +152,9 @@ impl Type {
        
      // [SOVEREIGN V6] Vector Intrinsic Types
        // These are used for portable SIMD operations
+       if base == "Vector4f32" {
+           return Ok("vector<4xf32>".to_string());
+       }
        if base == "Vector8f32" {
            return Ok("vector<8xf32>".to_string());
        }
@@ -168,6 +171,14 @@ impl Type {
     // The named alias is the Single Source of Truth for struct memory layout.
     match self {
         Type::Struct(name) => {
+            // [SIMD] Intercept vector type aliases BEFORE struct alias resolution
+            match name.as_str() {
+                "Vector4f32"  => return Ok("vector<4xf32>".to_string()),
+                "Vector8f32"  => return Ok("vector<8xf32>".to_string()),
+                "Vector4f64"  => return Ok("vector<4xf64>".to_string()),
+                "Vector16f32" => return Ok("vector<16xf32>".to_string()),
+                _ => {}
+            }
             // [SOVEREIGN FIX] Look up the fully-qualified struct name from struct_registry
             // This ensures consistency between header alias declarations and body usage.
             // The registry stores structs with their full package-qualified names.
@@ -189,6 +200,16 @@ impl Type {
             return Ok(format!("!struct_{}", full_name));
         }
         Type::Concrete(base, args) => {
+            // [SIMD] Intercept vector type aliases BEFORE struct alias resolution
+            if args.is_empty() {
+                match base.as_str() {
+                    "Vector4f32"  => return Ok("vector<4xf32>".to_string()),
+                    "Vector8f32"  => return Ok("vector<8xf32>".to_string()),
+                    "Vector4f64"  => return Ok("vector<4xf64>".to_string()),
+                    "Vector16f32" => return Ok("vector<16xf32>".to_string()),
+                    _ => {}
+                }
+            }
             // [SOVEREIGN FIX] Look up the fully-qualified template name from struct_templates
             // This ensures consistency between header alias declarations and body usage.
             let full_base = {
@@ -544,6 +565,16 @@ pub fn promote_numeric(ctx: &mut LoweringContext, out: &mut String, var: &str, f
         },
         
         (Type::Reference(_, _), Type::Reference(_, _)) => return Ok(var.to_string()),
+        
+        // [SOVEREIGN ABI FIX] Large aggregates (>64 bytes) are returned as Reference(T)
+        // from struct field access (in emit_field) to prevent massive value copies. 
+        // If passed to a function that explicitly expects the value T itself, 
+        // we must emit the deferred llvm.load here.
+        (Type::Reference(inner_from, _), to) if inner_from.as_ref() == to => {
+            let mlir_to = to.to_mlir_type(ctx).map_err(|e| e)?;
+            out.push_str(&format!("    {} = llvm.load {} : !llvm.ptr -> {}\n", res, var, mlir_to));
+            return Ok(res);
+        },
         
         (Type::F32, Type::Bool) => {
              out.push_str("    %cst_0_f32 = arith.constant 0.0 : f32\n");
@@ -1097,6 +1128,14 @@ pub fn to_mlir_type(ctx: &mut LoweringContext, ty: &Type) -> Result<String, Stri
         Type::Usize => Ok("index".to_string()),
         Type::Unit => Ok("!llvm.void".to_string()),
         Type::Struct(name) => {
+            // [SIMD] Intercept vector type aliases BEFORE struct alias resolution
+            match name.as_str() {
+                "Vector4f32"  => return Ok("vector<4xf32>".to_string()),
+                "Vector8f32"  => return Ok("vector<8xf32>".to_string()),
+                "Vector4f64"  => return Ok("vector<4xf64>".to_string()),
+                "Vector16f32" => return Ok("vector<16xf32>".to_string()),
+                _ => {}
+            }
             // Check type_map for unresolved generic placeholders
             if let Some(concrete) = ctx.current_type_map().get(name).cloned() {
                 return to_mlir_type(ctx, &concrete);
@@ -1124,6 +1163,16 @@ pub fn to_mlir_type(ctx: &mut LoweringContext, ty: &Type) -> Result<String, Stri
             Ok(format!("!struct_{}", full_name))
         },
         Type::Concrete(name, args) => {
+            // [SIMD] Intercept vector type aliases BEFORE struct alias resolution
+            if args.is_empty() {
+                match name.as_str() {
+                    "Vector4f32"  => return Ok("vector<4xf32>".to_string()),
+                    "Vector8f32"  => return Ok("vector<8xf32>".to_string()),
+                    "Vector4f64"  => return Ok("vector<4xf64>".to_string()),
+                    "Vector16f32" => return Ok("vector<16xf32>".to_string()),
+                    _ => {}
+                }
+            }
             // [V25.7] De-escalated Type Fallback: Check if any arg is an unresolved Generic
             fn has_unresolved_generic(ty: &Type) -> bool {
                 match ty {

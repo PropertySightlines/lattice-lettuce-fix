@@ -92,10 +92,10 @@ pub fn mat_mul_vec(out: Ptr<f32>, a: Ptr<f32>, x: Ptr<f32>, m: i64, d: i64)
     requires d > 0
 {
     for i in 0..m {
-        let row = a.offset(i * d);
+        let row_offset: i64 = i * d;
         let mut sum: f32 = 0.0f32;
-        for k in 0..d {
-            sum = sum + row[k] * x[k];
+        for j in 0..d {
+            sum = sum + a[row_offset + j] * x[j];
         }
         out[i] = sum;
     }

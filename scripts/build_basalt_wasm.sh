@@ -5,7 +5,7 @@ set -euo pipefail
 # Basalt WASM Build Script
 # =============================================================================
 # Builds basalt.wasm from Salt sources through the full MLIR pipeline.
-# Output: basalt/wasm/dist/basalt.wasm (19KB, 6 exports)
+# Output: basalt/wasm/dist/basalt.wasm (22KB, 6 exports)
 #
 # Requirements: LLVM 18 (clang + wasm-ld), salt-front (release build)
 # =============================================================================
@@ -58,6 +58,7 @@ mlir-opt "$OUT_DIR/basalt.mlir" \
     --canonicalize \
     --cse \
     --convert-scf-to-cf \
+    --convert-vector-to-llvm \
     --convert-cf-to-llvm \
     --convert-arith-to-llvm \
     --convert-func-to-llvm \
@@ -73,16 +74,16 @@ mlir-translate --mlir-to-llvmir "$OUT_DIR/basalt.opt.mlir" -o "$OUT_DIR/basalt.l
 
 # 6. Compile to WASM objects
 echo "Compiling to WASM..."
-clang --target=wasm32-unknown-unknown -O3 -c "$OUT_DIR/basalt.ll" \
+clang --target=wasm32-unknown-unknown -O3 -msimd128 -c "$OUT_DIR/basalt.ll" \
     -o "$OUT_DIR/basalt_engine.o" -Wno-override-module
 
-clang --target=wasm32-unknown-unknown -O3 -fno-builtin -D__wasm__ -c \
+clang --target=wasm32-unknown-unknown -O3 -msimd128 -fno-builtin -D__wasm__ -c \
     "$PROJECT_ROOT/basalt/wasm/basalt_wasm.c" \
     -o "$OUT_DIR/basalt_bridge.o"
 
 # 7. Link WASM binary
 echo "Linking WASM..."
-wasm-ld --no-entry --export-dynamic --allow-undefined \
+wasm-ld --no-entry --export-dynamic \
     --import-memory \
     "$OUT_DIR/basalt_engine.o" \
     "$OUT_DIR/basalt_bridge.o" \

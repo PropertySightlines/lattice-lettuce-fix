@@ -20,12 +20,12 @@
 
 // ── Salt-compiled externs (linked from basalt.o) ─────────────────────────────
 
-extern void *basalt_engine_init(uint8_t *model_data, int64_t model_size);
-extern void basalt_engine_ingest_prompt(void *es_ptr, int64_t *tokens,
-                                        int64_t count);
-extern int64_t basalt_engine_generate_step(void *es_ptr);
-extern void basalt_engine_free(void *es_ptr);
-extern int64_t basalt_engine_get_config(void *es_ptr, int64_t param_id);
+extern void *main__basalt_engine_init(uint8_t *model_data, int64_t model_size);
+extern void main__basalt_engine_ingest_prompt(void *es_ptr, int64_t *tokens,
+                                              int64_t count);
+extern int64_t main__basalt_engine_generate_step(void *es_ptr);
+extern void main__basalt_engine_free(void *es_ptr);
+extern int64_t main__basalt_engine_get_config(void *es_ptr, int64_t param_id);
 
 // ── WASM memory management (bump allocator) ─────────────────────────────────
 
@@ -44,6 +44,27 @@ void *malloc(int64_t size) {
 }
 
 void free(void *ptr) { (void)ptr; }
+
+// ── memcpy / memset shims ───────────────────────────────────────────────────
+
+void *memcpy(void *dest, const void *src, unsigned long n) {
+  unsigned char *d = (unsigned char *)dest;
+  const unsigned char *s = (const unsigned char *)src;
+  for (unsigned long i = 0; i < n; i++)
+    d[i] = s[i];
+  return dest;
+}
+
+void *memset(void *dest, int val, unsigned long n) {
+  unsigned char *d = (unsigned char *)dest;
+  for (unsigned long i = 0; i < n; i++)
+    d[i] = (unsigned char)val;
+  return dest;
+}
+
+// ── Salt contract violation handler ─────────────────────────────────────────
+
+void __salt_contract_violation(void) { /* no-op in WASM */ }
 
 // ── Engine state (C-side storage — only engine pointer remains) ─────────────
 
@@ -222,7 +243,7 @@ WASM_EXPORT void *basalt_alloc(int64_t bytes) { return malloc(bytes); }
 // 2. Init engine from model data. Returns 0 on success, -1 on failure.
 WASM_EXPORT int32_t basalt_init(void *model_data, int64_t model_size) {
   g_prompt_count = 0;
-  g_engine_ptr = basalt_engine_init((uint8_t *)model_data, model_size);
+  g_engine_ptr = main__basalt_engine_init((uint8_t *)model_data, model_size);
   return g_engine_ptr ? 0 : -1;
 }
 
@@ -230,23 +251,28 @@ WASM_EXPORT int32_t basalt_init(void *model_data, int64_t model_size) {
 // ptr+count.
 //    Salt runs the entire prefill loop internally (1 boundary crossing).
 WASM_EXPORT void basalt_ingest_prompt(int64_t *tokens_ptr, int64_t count) {
-  basalt_engine_ingest_prompt(g_engine_ptr, tokens_ptr, count);
+  main__basalt_engine_ingest_prompt(g_engine_ptr, tokens_ptr, count);
 }
 
 // 4. One forward pass + sample. Returns token ID, or -1 on EOS/error.
 WASM_EXPORT int64_t basalt_generate_next(void) {
-  return basalt_engine_generate_step(g_engine_ptr);
+  return main__basalt_engine_generate_step(g_engine_ptr);
 }
 
 // 5. Unified config getter. param_id: 0=dim, 1=hidden_dim, 2=n_layers,
 //    3=n_heads, 4=n_kv_heads, 5=vocab_size, 6=seq_len. Returns -1 for invalid.
 WASM_EXPORT int64_t basalt_get_config(int64_t param_id) {
-  return basalt_engine_get_config(g_engine_ptr, param_id);
+  return main__basalt_engine_get_config(g_engine_ptr, param_id);
 }
 
 // 6. Burn it down.
 WASM_EXPORT void basalt_free(void) {
-  basalt_engine_free(g_engine_ptr);
+  main__basalt_engine_free(g_engine_ptr);
   g_engine_ptr = NULL;
   g_prompt_count = 0;
 }
+
+// 7. Reset context (multi-turn chat). Zeros KV cache, resets position.
+//    Keeps loaded model weights — no re-init needed.
+extern void main__basalt_engine_reset(void *);
+WASM_EXPORT void basalt_reset(void) { main__basalt_engine_reset(g_engine_ptr); }

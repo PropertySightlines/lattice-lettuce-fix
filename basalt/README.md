@@ -102,14 +102,14 @@ graph LR
 
 | Module | Lines | Responsibility | Key Functions |
 |:-------|------:|:---------------|:--------------|
-| [`main.salt`](src/main.salt) | 350 | Entry point: CLI arg parsing, RoPE precomputation, generation loop, **WASM step functions** | `main`, `run_inference`, `basalt_engine_init/prefill/generate_step/free` |
+| [`main.salt`](src/main.salt) | ~370 | Entry point: CLI arg parsing, RoPE precomputation, generation loop, **WASM step functions** | `main`, `run_inference`, `basalt_engine_init/reset/prefill/generate_step/free` |
 | [`transformer.salt`](src/transformer.salt) | 262 | Llama 2 architecture: struct definitions, multi-head attention, FFN, forward pass | `forward`, `Config`, `TransformerWeights`, `RunState` |
-| [`kernels.salt`](src/kernels.salt) | 238 | Z3-verified compute: RMS norm, softmax, tiled matrix multiply | `rmsnorm`, `softmax`, `mat_mul`, `mat_mul_vec` |
+| [`kernels.salt`](src/kernels.salt) | ~230 | Z3-verified compute: RMS norm, softmax, **SIMD-vectorized** tiled matrix multiply | `rmsnorm`, `softmax`, `mat_mul`, `mat_mul_vec` (v128 SIMD) |
 | [`sampler.salt`](src/sampler.salt) | ~80 | Token selection from logits | `sample_argmax`, `sample_token` |
 | [`tokenizer.salt`](src/tokenizer.salt) | 179 | BPE tokenizer: load, encode, decode (llama2.c format) | `load_tokenizer`, `bpe_encode`, `decode_token` |
 | [`model_loader.salt`](src/model_loader.salt) | ~100 | Binary weight parsing from `mmap`'d file | `load_config`, `get_weights` |
-| [`basalt_wasm.c`](wasm/basalt_wasm.c) | ~150 | C bridge runtime: WASM exports, I/O shims | `basalt_init`, `basalt_prefill`, `basalt_generate_next`, `basalt_free` |
-| [`engine-worker.js`](wasm/engine-worker.js) | ~210 | JS Web Worker: tokenizer, WASM bridge, streaming | `BPETokenizer`, `initEngine`, `generate` |
+| [`basalt_wasm.c`](wasm/basalt_wasm.c) | ~280 | C bridge runtime: 7 WASM exports, I/O shims | `basalt_init`, `basalt_ingest_prompt`, `basalt_generate_next`, `basalt_reset`, `basalt_free` |
+| [`engine-worker.js`](wasm/engine-worker.js) | ~160 | JS Web Worker: tokenizer, WASM bridge, streaming | `BPETokenizer`, `initEngine`, `generate` |
 
 ### Data Flow
 
@@ -144,12 +144,12 @@ sequenceDiagram
 
 ## Why It's Fast
 
-Salt's `for i in 0..N` loops compile through MLIR's `scf.for` dialect, then `clang -O3` auto-vectorizes the tight inner loops. Basalt exploits this with two manual optimizations:
+Salt's `for i in 0..N` loops compile through MLIR's `scf.for` dialect, then `clang -O3` auto-vectorizes the tight inner loops. Basalt exploits this with three tiers of optimization:
 
 | Technique | Where | Why |
 |:----------|:------|:----|
-| **4×4 tiled `mat_mul`** | `kernels.salt` | 16 scalar accumulators stay in registers, reducing memory traffic by 4× |
-| **Specialized `mat_mul_vec`** | `kernels.salt` | Matrix-vector multiply (the `n=1` case in Llama attention) uses 4-way unrolled accumulation for LLVM auto-vectorization |
+| **WASM SIMD v128 `mat_mul_vec`** | `kernels.salt` | The 95% hotpath uses explicit `v_load` → `v_fma` → `v_hsum` intrinsics. Salt emits MLIR `vector<4xf32>` ops; `-msimd128` lowers them to native WASM `v128.load` / `f32x4.mul` / `f32x4.add` (4 floats per cycle) |
+| **4×4 tiled `mat_mul`** | `kernels.salt` | General matrix multiply with 16 scalar accumulators in registers, reducing memory traffic by 4× |
 | **Zero-copy `mmap`** | `main.salt` | Model weights are memory-mapped directly from disk — no allocation, no deserialization boot cost |
 
 ### Compilation Pipeline
@@ -255,7 +255,7 @@ zsh scripts/run_test.sh basalt/tests/test_transformer.salt
 No toolchain required — grab the pre-built binary:
 
 ```bash
-basalt/wasm/dist/basalt.wasm    # 19KB inference engine
+basalt/wasm/dist/basalt.wasm    # 22KB inference engine
 basalt/wasm/engine-worker.js    # JS Web Worker
 ```
 
@@ -274,10 +274,10 @@ worker.onmessage = ({ data }) => {
 ```bash
 cargo build --release --manifest-path salt-front/Cargo.toml
 bash scripts/build_basalt_wasm.sh
-# Output: basalt/wasm/dist/basalt.wasm (19KB)
+# Output: basalt/wasm/dist/basalt.wasm (22KB)
 ```
 
-### 6-Export API
+### 7-Export API
 
 | Export | Signature | Purpose |
 |--------|-----------|--------|
@@ -287,14 +287,15 @@ bash scripts/build_basalt_wasm.sh
 | `basalt_generate_next` | `() → i64` | One forward + sample → token ID (-1 = EOS/done) |
 | `basalt_get_config` | `(param_id: i64) → i64` | Unified config getter (-1 = invalid ID) |
 | `basalt_free` | `()` | Burn the context down |
+| `basalt_reset` | `()` | Zero KV cache + reset position (multi-turn chat, keeps loaded weights) |
 
 ### Conversation Context
 
-The KV cache is **append-only** — no rewind or clear.
+The KV cache supports **reset without re-init** — enabling multi-turn chat without re-parsing model weights.
 
 | Scenario | How |
 |----------|-----|
-| Multi-turn chat | Re-encode entire history, call `basalt_free()` → `basalt_init()` |
+| Multi-turn chat | `basalt_reset()` → `basalt_ingest_prompt(new_history)` — clears KV cache, keeps weights |
 | Switch models | `worker.terminate()` → new Worker (only way to reclaim WASM memory) |
 
 ### Config Param IDs
@@ -325,6 +326,11 @@ sequenceDiagram
         JS->>JS: decode + render
     end
 
+    Note over JS: User starts new conversation
+    JS->>W: basalt_reset()
+    Note over W: KV cache zeroed, pos=0 (weights preserved)
+    JS->>W: basalt_ingest_prompt(new_tokens, count)
+
     JS->>W: basalt_free()
 ```
 
@@ -334,20 +340,29 @@ sequenceDiagram
 - **Bulk prefill.** `basalt_ingest_prompt` runs the entire prefill loop inside WASM (1 boundary crossing instead of N).
 - **JS owns the loop.** `generate_next()` per token, yielding to event loop between calls for UI responsiveness.
 
-### Performance Roadmap
+### The Road to 1B Parameters (The "Boss Fight")
 
-| Tier | Technique | Expected Speedup | Requires |
-|------|-----------|-----------------|----------|
-| **1** | Cache-blocking / loop unrolling | 1.5–2× | Salt stdlib changes only |
-| **2** | WASM SIMD v128 (`f32x4`) | 2–3× | Compiler: new vector types + Z3 alignment proofs |
-| **3** | WebGPU orchestration (WGSL shaders) | 10–50× | Compiler: opaque GPU buffer FFI |
-| **4** | SharedArrayBuffer threading | 2–4× | Compiler: atomics + Z3 concurrency tracking |
+Supporting a modern 1B parameter model (like Llama 3.2 1B or TinyLlama 1.1B) introduces fundamental architectural constraints that require ascending the optimization tiers:
+
+1. **The WASM 4GB Memory Wall**: WebAssembly32 has a hard 4GB memory limit. A 1B model with raw `f32` weights requires ~4GB, meaning it will instantly OOM the browser tab upon loading.
+2. **Weight Quantization (Mandatory)**: To fit a 1B model into WASM, Basalt must implement **int8 or q4_0 quantization** (e.g., GGUF formats). This shrinks weights to ~1GB and avoids the memory wall, requiring Salt kernels to dequantize weights on the fly during matrix multiplication.
+3. **WebGPU (Tier 3)**: Even with WASM SIMD (Tier 2), pushing 1B parameters through a single-threaded CPU will yield unusable token generation rates (10-20 seconds per token). Sustained 1B inference demands Tier 3 WebGPU to keep weights in VRAM and execute massive parallel kernels.
+
+### Performance & Capability Roadmap
+
+| Tier | Technique | Capability Unlocked | Status |
+|------|-----------|---------------------|--------|
+| **1** | Cache-blocking / Loop unrolling | 1.5–2× native speedup | ✅ Done |
+| **2** | WASM SIMD v128 (`f32x4`) | 2–3× WASM speedup | ✅ Done — `v_load`/`v_fma`/`v_hsum` intrinsics + `-msimd128` |
+| **2.5** | **Weight Quantization (`q8_0`)** | **Bypass 4GB WASM limit** | ⬜ Dequantization kernels in Salt |
+| **3** | **WebGPU Orchestration** | **Real-time 1B Inference** | ⬜ Compiler: opaque GPU buffer FFI, WGSL shaders |
+| **4** | SharedArrayBuffer threading | Multi-core CPU fallback | ⬜ Compiler: atomics + Z3 concurrency tracking |
 
 ---
 
 ## Status
 
-- [x] `kernels.salt` — rmsnorm, softmax, tiled mat_mul, mat_mul_vec (Z3-verified)
+- [x] `kernels.salt` — rmsnorm, softmax, tiled mat_mul, **SIMD `mat_mul_vec`** (Z3-verified)
 - [x] `sampler.salt` — argmax, temperature sampling
 - [x] `transformer.salt` — Config, TransformerWeights, RunState, full forward pass
 - [x] `model_loader.salt` — binary config/weight parsing from mmap
@@ -355,8 +370,9 @@ sequenceDiagram
 - [x] `main.salt` — CLI, mmap, RoPE, generation loop, decoded output
 - [x] Build pipeline (`build_basalt.sh`, `build_basalt_wasm.sh`)
 - [x] Test suite (4 test files, TDD)
-- [x] WASM API: C bridge + Salt engine + JS worker + pre-built binary (19KB)
+- [x] WASM API: C bridge + Salt engine + JS worker + pre-built binary
+- [x] Multi-turn chat (`basalt_reset` — KV cache clear without re-init)
+- [x] WASM SIMD v128 kernel optimization (Tier 2) — `v_load`/`v_fma`/`v_hsum` intrinsics
 - [ ] Top-p / temperature sampling in generation loop
-- [ ] Multi-turn chat template support
-- [ ] WASM SIMD v128 kernel optimization (Tier 2)
+- [ ] Weight quantization (q8_0) for 1B models (Tier 2.5)
 

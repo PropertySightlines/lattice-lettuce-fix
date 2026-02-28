@@ -691,7 +691,7 @@ impl<'a, 'ctx, 'b> CallSiteResolver<'a, 'ctx, 'b> {
         // V2.2 Shadow Reduction: Register-resident tensor updates
         name == "update_tensor" || name == "fma_update" ||
         // [SOVEREIGN V3] ML Intrinsics
-        name == "matmul" || name.starts_with("matmul_into") || name == "update_weights" || name == "v_fma" || name == "v_add" || name == "v_mul" || name == "v_max" || name == "v_sum" || name == "v_hsum" || name == "v_relu" || name == "v_broadcast" ||
+        name == "matmul" || name.starts_with("matmul_into") || name == "update_weights" || name == "v_fma" || name == "v_add" || name == "v_mul" || name == "v_max" || name == "v_sum" || name == "v_hsum" || name == "v_relu" || name == "v_broadcast" || name == "v_load" || name == "v_store" ||
         name == "__internal_dispatch_matmul" || name == "__internal_fma_update" ||
         name == "mmap_view" || name == "cast_view" ||
         name.contains("macos_syscall") ||

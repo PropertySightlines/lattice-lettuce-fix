@@ -655,6 +655,47 @@ impl<'a, 'ctx> LoweringContext<'a, 'ctx> {
                 return Ok(Some(("".to_string(), Type::Unit)));
             }
 
+            // =================================================================
+            // [WASM SIMD] v_load(ptr, offset) -> Vector4f32
+            // Contiguous 128-bit load: ptr[offset..offset+4] as vector<4xf32>
+            // LLVM lowers this to WASM v128.load (single instruction)
+            // =================================================================
+            "v_load" => {
+                 if args.len() != 2 { return Err("v_load expects 2 arguments: (ptr, offset)".to_string()); }
+                 let (ptr_val, _) = emit_expr(self, out, &args[0], local_vars, None)?;
+                 let (offset_val, _) = emit_expr(self, out, &args[1], local_vars, Some(&Type::I64))?;
+
+                 // GEP to ptr + offset (in f32 elements)
+                 let gep = format!("%vload_gep_{}", self.next_id());
+                 out.push_str(&format!("    {} = llvm.getelementptr inbounds {}[{}] : (!llvm.ptr, i64) -> !llvm.ptr, f32\n", gep, ptr_val, offset_val));
+
+                 // Contiguous vector load: 4 × f32 = 128 bits = v128
+                 let res = format!("%vload_{}", self.next_id());
+                 out.push_str(&format!("    {} = llvm.load {} : !llvm.ptr -> vector<4xf32>\n", res, gep));
+
+                 return Ok(Some((res, Type::Concrete("Vector4f32".to_string(), vec![]))));
+            }
+            // =================================================================
+            // [WASM SIMD] v_store(ptr, offset, vec)
+            // Contiguous 128-bit store: vec -> ptr[offset..offset+4]
+            // LLVM lowers this to WASM v128.store (single instruction)
+            // =================================================================
+            "v_store" => {
+                 if args.len() != 3 { return Err("v_store expects 3 arguments: (ptr, offset, vec)".to_string()); }
+                 let (ptr_val, _) = emit_expr(self, out, &args[0], local_vars, None)?;
+                 let (offset_val, _) = emit_expr(self, out, &args[1], local_vars, Some(&Type::I64))?;
+                 let (vec_val, _) = emit_expr(self, out, &args[2], local_vars, None)?;
+
+                 // GEP to ptr + offset (in f32 elements)
+                 let gep = format!("%vstore_gep_{}", self.next_id());
+                 out.push_str(&format!("    {} = llvm.getelementptr inbounds {}[{}] : (!llvm.ptr, i64) -> !llvm.ptr, f32\n", gep, ptr_val, offset_val));
+
+                 // Contiguous vector store: 4 × f32 = 128 bits = v128
+                 out.push_str(&format!("    llvm.store {}, {} : vector<4xf32>, !llvm.ptr\n", vec_val, gep));
+
+                 return Ok(Some(("".to_string(), Type::Unit)));
+            }
+
             "v_mul" => {
                  if args.len() != 2 { return Err("v_mul expects 2 arguments".to_string()); }
                  let (a, ty_a) = emit_expr(self, out, &args[0], local_vars, None)?;

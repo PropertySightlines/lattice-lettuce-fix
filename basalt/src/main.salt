@@ -213,6 +213,19 @@ fn main() -> i32 {
         tok_path = salt_get_argv(2);
     }
     
+    // ── Prevent DCE for WASM exports ────────────────────────────────────────
+    // These are never called (argc = 999), but referencing them ensures
+    // the compiler and DCE passes keep them alive for the WASM build.
+    if argc == 999 {
+        let es = basalt_engine_init(0 as Ptr<u8>, 0);
+        basalt_engine_ingest_prompt(es, 0 as Ptr<i64>, 0);
+        let _t = basalt_engine_generate_step(es);
+        let _c = basalt_engine_get_config(es, 0);
+        basalt_engine_reset(es);
+        basalt_engine_free(es);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+    
     return run_inference(model_path, tok_path);
 }
 
@@ -232,113 +245,130 @@ fn main() -> i32 {
 struct EngineState {
     config: Config,
     weights: TransformerWeights,
-    state: RunState
+    state: RunState,
+    pos: i64,
+    token: i64,
+    initialized: i32,
 }
 
-var POS: i64 = 0;
-var TOKEN: i64 = 1;
-var INITIALIZED: i32 = 0;
-
-pub fn basalt_engine_init(model_data: Ptr<u8>, model_size: i64) -> Ptr<u8> {
-    let es = malloc(264) as Ptr<EngineState>;
-
+pub fn basalt_engine_init(model_data: Ptr<u8>, model_size: i64) -> Ptr<EngineState> {
     let cfg = load_config(model_data);
     let mut w = get_weights(model_data, cfg);
     let rope_w = build_freq_cis(cfg);
     w.freq_cis_real = rope_w.freq_cis_real;
     w.freq_cis_imag = rope_w.freq_cis_imag;
-
-    es.config = cfg;
-    es.weights = w;
-    es.state = alloc_run_state(cfg);
-
-    POS = 0;
-    TOKEN = 1;
-    INITIALIZED = 1;
-
-    return es as Ptr<u8>;
+    
+    let es_ptr = malloc(1024) as Ptr<EngineState>;
+    
+    es_ptr.config = cfg;
+    es_ptr.weights = w;
+    es_ptr.state = alloc_run_state(cfg);
+    es_ptr.pos = 0;
+    es_ptr.token = 1;
+    es_ptr.initialized = 1;
+    
+    return es_ptr;
 }
 
-pub fn basalt_engine_prefill(es_ptr: Ptr<u8>, token_id: i64) {
-    if (es_ptr as i64) == 0 { return; }
-    let es = es_ptr as Ptr<EngineState>;
+// ── Unified config getter ───────────────────────────────────────────────────
 
-    forward(es.config, es.weights, es.state, TOKEN, POS);
-    TOKEN = token_id;
-    POS = POS + 1;
+pub fn basalt_engine_get_config(es_ptr: Ptr<EngineState>, param_id: i64) -> i64 {
+    if es_ptr.initialized == 0 { return -1; }
+    let cfg = es_ptr.config;
+    
+    if param_id == 0 { return cfg.dim; }
+    if param_id == 1 { return cfg.hidden_dim; }
+    if param_id == 2 { return cfg.n_layers; }
+    if param_id == 3 { return cfg.n_heads; }
+    if param_id == 4 { return cfg.n_kv_heads; }
+    if param_id == 5 { return cfg.vocab_size; }
+    if param_id == 6 { return cfg.seq_len; }
+    return -1;
 }
 
-pub fn basalt_engine_generate_step(es_ptr: Ptr<u8>) -> i64 {
-    if (es_ptr as i64) == 0 { return -1; }
-    let es = es_ptr as Ptr<EngineState>;
+// ── Step functions ──────────────────────────────────────────────────────────
 
-    if POS >= es.config.seq_len { return -1; }
+pub fn basalt_engine_prefill(es_ptr: Ptr<EngineState>, token_id: i64) {
+    if es_ptr.initialized == 0 { return; }
 
-    forward(es.config, es.weights, es.state, TOKEN, POS);
-    let next = sample_argmax(es.state.logits, es.config.vocab_size);
-    TOKEN = next;
-    POS = POS + 1;
+    forward(es_ptr.config, es_ptr.weights, es_ptr.state, es_ptr.token, es_ptr.pos);
+    es_ptr.token = token_id;
+    es_ptr.pos = es_ptr.pos + 1;
+}
+
+pub fn basalt_engine_generate_step(es_ptr: Ptr<EngineState>) -> i64 {
+    if es_ptr.initialized == 0 { return -1; }
+    
+    let cfg = es_ptr.config;
+    if es_ptr.pos >= cfg.seq_len { return -1; }
+
+    forward(cfg, es_ptr.weights, es_ptr.state, es_ptr.token, es_ptr.pos);
+    let next = sample_argmax(es_ptr.state.logits, cfg.vocab_size);
+    es_ptr.token = next;
+    es_ptr.pos = es_ptr.pos + 1;
 
     return next;
 }
 
-pub fn basalt_engine_free(es_ptr: Ptr<u8>) {
-    if (es_ptr as i64) == 0 { return; }
-    let es = es_ptr as Ptr<EngineState>;
+pub fn basalt_engine_free(es_ptr: Ptr<EngineState>) {
+    if es_ptr.initialized == 0 { return; }
+    free_run_state(es_ptr.state);
+    free(es_ptr as Ptr<u8>);
+    es_ptr.initialized = 0;
+}
 
-    free_run_state(es.state);
-    free(es_ptr);
-    INITIALIZED = 0;
+// ── Reset (multi-turn chat: clear KV cache, keep weights) ──────────────────
+
+pub fn basalt_engine_reset(es_ptr: Ptr<EngineState>) {
+    if es_ptr.initialized == 0 { return; }
+    let cfg = es_ptr.config;
+    let kv_dim: i64 = (cfg.dim * cfg.n_kv_heads) / cfg.n_heads;
+    let cache_size: i64 = cfg.n_layers * cfg.seq_len * kv_dim;
+
+    // Extract local pointers to avoid chained field access in loop
+    let kc: Ptr<f32> = es_ptr.state.key_cache;
+    let vc: Ptr<f32> = es_ptr.state.value_cache;
+
+    for i in 0..cache_size {
+        kc[i] = 0.0f32;
+        vc[i] = 0.0f32;
+    }
+
+    es_ptr.pos = 0;
+    es_ptr.token = 1;
 }
 
 // ── Bulk prefill (1 boundary crossing for entire prompt) ────────────────────
 
-pub fn basalt_engine_ingest_prompt(es_ptr: Ptr<u8>, tokens_ptr: Ptr<i64>, count: i64) {
-    if (es_ptr as i64) == 0 { return; }
+pub fn basalt_engine_ingest_prompt(es_ptr: Ptr<EngineState>, tokens_ptr: Ptr<i64>, count: i64) {
+    if es_ptr.initialized == 0 { return; }
     if count <= 0 { return; }
-    let es = es_ptr as Ptr<EngineState>;
+
+    let cfg = es_ptr.config;
 
     for i in 0..count {
-        if POS >= es.config.seq_len { return; }
-        forward(es.config, es.weights, es.state, TOKEN, POS);
-        TOKEN = tokens_ptr[i];
-        POS = POS + 1;
+        if es_ptr.pos >= cfg.seq_len { return; }
+        forward(cfg, es_ptr.weights, es_ptr.state, es_ptr.token, es_ptr.pos);
+        es_ptr.token = tokens_ptr[i];
+        es_ptr.pos = es_ptr.pos + 1;
     }
-}
-
-// ── Unified config getter ───────────────────────────────────────────────────
-// param_id: 0=dim, 1=hidden_dim, 2=n_layers, 3=n_heads,
-//           4=n_kv_heads, 5=vocab_size, 6=seq_len
-
-pub fn basalt_engine_get_config(es_ptr: Ptr<u8>, param_id: i64) -> i64 {
-    if (es_ptr as i64) == 0 { return -1; }
-    let es = es_ptr as Ptr<EngineState>;
-
-    if param_id == 0 { return es.config.dim; }
-    if param_id == 1 { return es.config.hidden_dim; }
-    if param_id == 2 { return es.config.n_layers; }
-    if param_id == 3 { return es.config.n_heads; }
-    if param_id == 4 { return es.config.n_kv_heads; }
-    if param_id == 5 { return es.config.vocab_size; }
-    if param_id == 6 { return es.config.seq_len; }
-    return -1;
 }
 
 // ── Legacy getters (kept for native build compatibility) ─────────────────────
 
-pub fn basalt_engine_get_dim(es_ptr: Ptr<u8>) -> i64 {
+pub fn basalt_engine_get_dim(es_ptr: Ptr<EngineState>) -> i64 {
     return basalt_engine_get_config(es_ptr, 0);
 }
 
-pub fn basalt_engine_get_vocab_size(es_ptr: Ptr<u8>) -> i64 {
+pub fn basalt_engine_get_vocab_size(es_ptr: Ptr<EngineState>) -> i64 {
     return basalt_engine_get_config(es_ptr, 5);
 }
 
-pub fn basalt_engine_get_seq_len(es_ptr: Ptr<u8>) -> i64 {
+pub fn basalt_engine_get_seq_len(es_ptr: Ptr<EngineState>) -> i64 {
     return basalt_engine_get_config(es_ptr, 6);
 }
 
-pub fn basalt_engine_get_n_layers(es_ptr: Ptr<u8>) -> i64 {
+pub fn basalt_engine_get_n_layers(es_ptr: Ptr<EngineState>) -> i64 {
     return basalt_engine_get_config(es_ptr, 2);
 }
 

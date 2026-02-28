@@ -463,23 +463,26 @@ fn detect_vector_reduction_pattern(
             _ => continue,
         };
         
-        if func_name != "vector_fma" {
+        if func_name != "vector_fma" && func_name != "v_fma" {
             continue;
         }
         
         // vector_fma(a, b, acc) - third arg must be the same accumulator
+        // v_fma(acc, a, b) - first arg must be the same accumulator
         if call.args.len() != 3 {
             continue;
         }
         
-        let third_arg_is_acc = match &call.args[2] {
+        let acc_arg_idx = if func_name == "v_fma" { 0 } else { 2 };
+        
+        let acc_arg_is_acc = match &call.args[acc_arg_idx] {
             syn::Expr::Path(p) if p.path.segments.len() == 1 => {
                 p.path.segments[0].ident.to_string() == acc_name
             }
             _ => false,
         };
         
-        if !third_arg_is_acc {
+        if !acc_arg_is_acc {
             continue;
         }
         
@@ -494,6 +497,8 @@ fn detect_vector_reduction_pattern(
         // Must be a vector type
         let is_vector_type = matches!(ty, 
             Type::Concrete(name, _) if name.starts_with("Vector")
+        ) || matches!(ty,
+            Type::Struct(name) if name.starts_with("Vector")
         );
         
         if !is_vector_type {
@@ -616,9 +621,14 @@ fn emit_affine_for_reduction(
     let mlir_ty = match &reduction.ty {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
+        Type::Concrete(name, _) if name == "Vector4f32" => "vector<4xf32>".to_string(),
         Type::Concrete(name, _) if name == "Vector8f32" => "vector<8xf32>".to_string(),
         Type::Concrete(name, _) if name == "Vector4f64" => "vector<4xf64>".to_string(),
         Type::Concrete(name, _) if name == "Vector16f32" => "vector<16xf32>".to_string(),
+        Type::Struct(name) if name == "Vector4f32" => "vector<4xf32>".to_string(),
+        Type::Struct(name) if name == "Vector8f32" => "vector<8xf32>".to_string(),
+        Type::Struct(name) if name == "Vector4f64" => "vector<4xf64>".to_string(),
+        Type::Struct(name) if name == "Vector16f32" => "vector<16xf32>".to_string(),
         _ => return Err(format!("Reduction accumulator must be f32, f64, or Vector type, got {:?}", reduction.ty)),
     };
     
@@ -779,9 +789,14 @@ fn emit_scf_for_runtime_reduction(
     let mlir_ty = match &reduction.ty {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
+        Type::Concrete(name, _) if name == "Vector4f32" => "vector<4xf32>".to_string(),
         Type::Concrete(name, _) if name == "Vector8f32" => "vector<8xf32>".to_string(),
         Type::Concrete(name, _) if name == "Vector4f64" => "vector<4xf64>".to_string(),
         Type::Concrete(name, _) if name == "Vector16f32" => "vector<16xf32>".to_string(),
+        Type::Struct(name) if name == "Vector4f32" => "vector<4xf32>".to_string(),
+        Type::Struct(name) if name == "Vector8f32" => "vector<8xf32>".to_string(),
+        Type::Struct(name) if name == "Vector4f64" => "vector<4xf64>".to_string(),
+        Type::Struct(name) if name == "Vector16f32" => "vector<16xf32>".to_string(),
         _ => return Err(format!("V7.4 Reduction accumulator must be f32, f64, or Vector type, got {:?}", reduction.ty)),
     };
     

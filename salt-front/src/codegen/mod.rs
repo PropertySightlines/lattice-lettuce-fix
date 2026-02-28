@@ -95,7 +95,11 @@ mod tests_malloc_arg_escape;
 #[cfg(test)]
 mod tests_static_mut;
 #[cfg(test)]
+mod tests_struct_ref_pass;
+#[cfg(test)]
 mod tests_nested_ptr_access;
+#[cfg(test)]
+mod tests_simd_v128;
 use crate::grammar::{SaltFile, Item, SaltFn, SaltImpl, ExternFnDecl, SaltConcept, SaltTrait};
 use crate::codegen::context::{CodegenContext, LocalKind, GenericContextGuard};
 use crate::codegen::type_bridge::{resolve_type, resolve_codegen_type};

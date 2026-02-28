@@ -1,31 +1,17 @@
 // =============================================================================
-// Basalt Engine Worker — Brutalist 6-Export WASM Bridge
+// Basalt Engine Worker — v0.4.0 Clean WASM Bridge
 // =============================================================================
-//
-// Web Worker that wraps the 6 WASM exports into an async message API.
-// JS owns: BPE tokenization, string decoding, UI rendering.
+// JS owns: BPE tokenization, string decoding, Memory allocation
 // WASM owns: math (forward passes, sampling, RoPE).
-//
-// Messages IN:
-//   { type: 'LOAD_MODEL', modelUrl, tokenizerUrl }
-//   { type: 'RUN_PROMPT', prompt, maxNewTokens }
-//   { type: 'STOP' }
-//
-// Messages OUT:
-//   { type: 'STATUS', message }
-//   { type: 'READY', config: { dim, hidden_dim, ... } }
-//   { type: 'TOKEN', tokenId, text }
-//   { type: 'DONE', totalTokens, elapsedMs }
-//   { type: 'ERROR', message }
-//
-// =============================================================================
 
 let wasm = null;
-let vocab = null;        // Map<string, number> — BPE encode
-let vocabDecode = null;  // Map<number, string> — BPE decode
+let vocab = null;
+let vocabDecode = null;
 let running = false;
+let memory = null;
+let promptBufferPtr = 0; // Reusable buffer for prompt tokens
 
-// ── BPE Tokenizer (JS-side, O(1) hashmap lookups) ───────────────────────────
+// ── BPE Tokenizer ───────────────────────────────────────────────────────────
 
 async function loadTokenizer(url) {
     const response = await fetch(url);
@@ -47,31 +33,20 @@ async function loadTokenizer(url) {
         vocab.set(text, i);
         vocabDecode.set(i, text);
     }
-
-    return { vocabSize, maxTokenLen };
 }
 
 function encodePrompt(text) {
-    // Simple BPE: character-level fallback + greedy merge
     const tokens = [];
-
-    // Start with character-level tokenization
     const chars = [...text];
-    const pieces = chars.map(c => {
-        const id = vocab.get(c);
-        return id !== undefined ? id : 0; // UNK
-    });
+    const pieces = chars.map(c => vocab.get(c) ?? 0);
 
-    // BOS token
-    tokens.push(1);
+    tokens.push(1); // BOS
 
-    // Greedy merge pass
     let i = 0;
     while (i < chars.length) {
         let bestLen = 1;
         let bestId = pieces[i];
 
-        // Try progressively longer substrings
         for (let len = 2; len <= Math.min(20, chars.length - i); len++) {
             const substr = chars.slice(i, i + len).join('');
             const id = vocab.get(substr);
@@ -80,95 +55,78 @@ function encodePrompt(text) {
                 bestId = id;
             }
         }
-
         tokens.push(bestId);
         i += bestLen;
     }
-
     return tokens;
-}
-
-function decodeToken(id) {
-    return vocabDecode?.get(id) ?? `<${id}>`;
 }
 
 // ── WASM Lifecycle ──────────────────────────────────────────────────────────
 
 async function loadModel(modelUrl, tokenizerUrl) {
-    postMessage({ type: 'STATUS', message: 'Loading model...' });
+    postMessage({ type: 'STATUS', message: 'Loading model & tokenizer...' });
 
-    // 1. Fetch model binary
-    const modelResponse = await fetch(modelUrl);
-    const modelBytes = new Uint8Array(await modelResponse.arrayBuffer());
+    const [modelResp, _] = await Promise.all([
+        fetch(modelUrl),
+        tokenizerUrl ? loadTokenizer(tokenizerUrl) : Promise.resolve()
+    ]);
 
-    // 2. Load tokenizer (optional)
-    if (tokenizerUrl) {
-        postMessage({ type: 'STATUS', message: 'Loading tokenizer...' });
-        await loadTokenizer(tokenizerUrl);
-    }
+    const modelBytes = new Uint8Array(await modelResp.arrayBuffer());
 
-    // 3. Instantiate WASM
-    postMessage({ type: 'STATUS', message: 'Initializing WASM...' });
+    // 1. Create a large enough Memory object (163MB model needs ~3000 pages)
+    // 256 pages = 16MB. We allocate 10000 pages (~640MB) to be safe for 15M param models.
+    memory = new WebAssembly.Memory({ initial: 10000, maximum: 10000 });
+
     const importObject = {
         env: {
+            memory: memory,
             log_status: (ptr, len) => {
-                const bytes = new Uint8Array(wasm.exports.memory.buffer, ptr, len);
+                const bytes = new Uint8Array(memory.buffer, ptr, len);
                 const text = new TextDecoder().decode(bytes);
                 console.log('[basalt]', text);
             }
         }
     };
 
+    postMessage({ type: 'STATUS', message: 'Initializing WASM...' });
     const wasmResponse = await fetch('/basalt.wasm');
     const wasmModule = await WebAssembly.instantiateStreaming(wasmResponse, importObject);
     wasm = wasmModule.instance;
 
-    // 4. Copy model into WASM memory
-    const modelPtr = wasm.exports.basalt_alloc(modelBytes.byteLength);
-    new Uint8Array(wasm.exports.memory.buffer, modelPtr, modelBytes.byteLength)
-        .set(modelBytes);
+    // 2. Copy model into WASM memory
+    const modelPtr = Number(wasm.exports.basalt_alloc(BigInt(modelBytes.byteLength)));
+    new Uint8Array(memory.buffer, modelPtr, modelBytes.byteLength).set(modelBytes);
 
-    // 5. Initialize engine
-    const status = wasm.exports.basalt_init(modelPtr, modelBytes.byteLength);
-    if (status !== 0) {
-        throw new Error('basalt_init failed (bad model file?)');
-    }
+    // 3. Initialize engine
+    const status = wasm.exports.basalt_init(modelPtr, BigInt(modelBytes.byteLength));
+    if (status !== 0) throw new Error('basalt_init failed');
 
-    // 6. Read config via unified getter
-    const config = {
-        dim: Number(wasm.exports.basalt_get_config(0n)),
-        hidden_dim: Number(wasm.exports.basalt_get_config(1n)),
-        n_layers: Number(wasm.exports.basalt_get_config(2n)),
-        n_heads: Number(wasm.exports.basalt_get_config(3n)),
-        n_kv_heads: Number(wasm.exports.basalt_get_config(4n)),
-        vocab_size: Number(wasm.exports.basalt_get_config(5n)),
-        seq_len: Number(wasm.exports.basalt_get_config(6n)),
-    };
+    // 4. Pre-allocate a 4KB reusable prompt buffer (8 bytes per token * 512 tokens max)
+    // Avoids calling basalt_alloc on every prompt.
+    promptBufferPtr = Number(wasm.exports.basalt_alloc(4096n));
 
-    postMessage({ type: 'READY', config });
+    postMessage({ type: 'READY' });
 }
 
 async function runPrompt(prompt, maxNewTokens = 128) {
     if (!wasm) throw new Error('Model not loaded');
     running = true;
 
-    // 1. Tokenize (JS-side, O(1) hashmap)
+    postMessage({ type: 'STATUS', message: 'Tokenizing prompt...' });
     const tokens = encodePrompt(prompt);
-    postMessage({ type: 'STATUS', message: `Prefilling ${tokens.length} tokens...` });
 
-    // 2. Write tokens into WASM memory (bulk)
-    const tokensPtr = wasm.exports.basalt_alloc(tokens.length * 8);
-    const tokensView = new BigInt64Array(
-        wasm.exports.memory.buffer, tokensPtr, tokens.length
-    );
-    for (let i = 0; i < tokens.length; i++) {
+    // Write tokens into the pre-allocated reusable buffer
+    const maxTokensBuffer = 4096 / 8; // 512
+    const tokenCount = Math.min(tokens.length, maxTokensBuffer);
+
+    const tokensView = new BigInt64Array(memory.buffer, promptBufferPtr, tokenCount);
+    for (let i = 0; i < tokenCount; i++) {
         tokensView[i] = BigInt(tokens[i]);
     }
 
-    // 3. Bulk ingest — 1 boundary crossing for entire prompt
-    wasm.exports.basalt_ingest_prompt(tokensPtr, BigInt(tokens.length));
+    postMessage({ type: 'STATUS', message: `Prefilling ${tokenCount} tokens...` });
+    wasm.exports.basalt_ingest_prompt(promptBufferPtr, BigInt(tokenCount));
 
-    // 4. Generate loop
     postMessage({ type: 'STATUS', message: 'Generating...' });
     const startMs = performance.now();
     let totalTokens = 0;
@@ -177,11 +135,14 @@ async function runPrompt(prompt, maxNewTokens = 128) {
         if (!running) break;
 
         const tokenId = Number(wasm.exports.basalt_generate_next());
-        if (tokenId < 0) break; // EOS or seq_len hit
+        if (tokenId < 0) break; // EOS
 
         totalTokens++;
-        const text = decodeToken(tokenId);
+        const text = vocabDecode?.get(tokenId) ?? `<${tokenId}>`;
         postMessage({ type: 'TOKEN', tokenId, text });
+
+        // Yield to event loop every N tokens for responsiveness
+        if (step % 4 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     const elapsedMs = performance.now() - startMs;
@@ -189,22 +150,17 @@ async function runPrompt(prompt, maxNewTokens = 128) {
     running = false;
 }
 
-// ── Message Handler ─────────────────────────────────────────────────────────
-
 self.onmessage = async (e) => {
     try {
-        switch (e.data.type) {
-            case 'LOAD_MODEL':
-                await loadModel(e.data.modelUrl, e.data.tokenizerUrl);
-                break;
-            case 'RUN_PROMPT':
-                await runPrompt(e.data.prompt, e.data.maxNewTokens);
-                break;
-            case 'STOP':
-                running = false;
-                break;
+        if (e.data.type === 'LOAD_MODEL') await loadModel(e.data.modelUrl, e.data.tokenizerUrl);
+        else if (e.data.type === 'RUN_PROMPT') await runPrompt(e.data.prompt, e.data.maxNewTokens);
+        else if (e.data.type === 'STOP') running = false;
+        else if (e.data.type === 'RESET') {
+            if (wasm) wasm.exports.basalt_reset();
+            postMessage({ type: 'STATUS', message: 'Context reset (KV cache cleared)' });
         }
     } catch (err) {
+        console.error(err);
         postMessage({ type: 'ERROR', message: err.message });
     }
 };

@@ -311,9 +311,29 @@ impl Type {
             Type::Bool => "i1".to_string(),
             Type::Usize => "index".to_string(),
             Type::Unit => "!llvm.void".to_string(),
-            Type::Struct(name) => format!("!struct_{}", name),
+            Type::Struct(name) => {
+                // [SIMD] Vector type aliases → MLIR vector types
+                match name.as_str() {
+                    "Vector4f32"  => return "vector<4xf32>".to_string(),
+                    "Vector8f32"  => return "vector<8xf32>".to_string(),
+                    "Vector4f64"  => return "vector<4xf64>".to_string(),
+                    "Vector16f32" => return "vector<16xf32>".to_string(),
+                    _ => {}
+                }
+                format!("!struct_{}", name)
+            }
             Type::Enum(name) => format!("!enum_{}", name),
-            Type::Concrete(name, _) => format!("!struct_{}", self.mangle_suffix()),
+            Type::Concrete(name, _) => {
+                // [SIMD] Vector type aliases → MLIR vector types
+                match name.as_str() {
+                    "Vector4f32"  => return "vector<4xf32>".to_string(),
+                    "Vector8f32"  => return "vector<8xf32>".to_string(),
+                    "Vector4f64"  => return "vector<4xf64>".to_string(),
+                    "Vector16f32" => return "vector<16xf32>".to_string(),
+                    _ => {}
+                }
+                format!("!struct_{}", self.mangle_suffix())
+            }
             Type::Array(inner, len, _) => format!("!llvm.array<{} x {}>", len, inner.to_mlir_type_simple()),
             Type::Tuple(elems) => {
                 if elems.is_empty() { return "!llvm.void".to_string(); }
@@ -332,6 +352,19 @@ impl Type {
         if *self == Type::Bool { return "i8".to_string(); }
         if self.k_is_ptr_type() || matches!(self, Type::Reference(_, _)) {
             return "!llvm.ptr".to_string();
+        }
+        // [SIMD] Vector type aliases → MLIR vector types (bypass struct_ path)
+        match self {
+            Type::Struct(name) | Type::Concrete(name, _) => {
+                match name.as_str() {
+                    "Vector4f32"  => return "vector<4xf32>".to_string(),
+                    "Vector8f32"  => return "vector<8xf32>".to_string(),
+                    "Vector4f64"  => return "vector<4xf64>".to_string(),
+                    "Vector16f32" => return "vector<16xf32>".to_string(),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
         self.to_mlir_type_simple()
     }
@@ -796,6 +829,30 @@ mod tests {
         // This is the bug we're catching - Struct("K") should NOT be in final mangled names
         let ty = Type::Struct("K".to_string());
         assert_eq!(ty.mangle_suffix(), "K", "Struct('K') mangles to 'K' - but this should be blocked by Generic Wall");
+    }
+
+    // -------------------------------------------------------------------------
+    // [TDD] Test: Vector4f32 emits vector<4xf32>, NOT !struct_Vector4f32
+    // -------------------------------------------------------------------------
+    #[test]
+    fn test_vector4f32_struct_emits_mlir_vector_type() {
+        let ty = Type::Struct("Vector4f32".to_string());
+        assert_eq!(ty.to_mlir_type_simple(), "vector<4xf32>",
+            "Type::Struct(Vector4f32) must emit vector<4xf32>, not !struct_Vector4f32");
+    }
+
+    #[test]
+    fn test_vector4f32_concrete_emits_mlir_vector_type() {
+        let ty = Type::Concrete("Vector4f32".to_string(), vec![]);
+        assert_eq!(ty.to_mlir_type_simple(), "vector<4xf32>",
+            "Type::Concrete(Vector4f32) must emit vector<4xf32>, not !struct_Vector4f32");
+    }
+
+    #[test]
+    fn test_vector4f32_storage_type_emits_vector() {
+        let ty = Type::Struct("Vector4f32".to_string());
+        assert_eq!(ty.to_mlir_storage_type_simple(), "vector<4xf32>",
+            "Storage type for Vector4f32 must be vector<4xf32>");
     }
 
     // -------------------------------------------------------------------------
