@@ -590,3 +590,31 @@ void salt_closedir(int64_t handle) {
     closedir((DIR *)handle);
   }
 }
+
+// =============================================================================
+// BASALT WASM STUBS — Native-mode no-ops
+// =============================================================================
+// main.salt declares these externs for WASM step functions.
+// In native builds, they're unused stubs so the linker is happy.
+
+// Prompt token bridge (JS → Salt, no-op in native mode)
+int64_t salt_get_prompt_count(void) { return 0; }
+int64_t salt_get_prompt_token(int64_t idx) {
+  (void)idx;
+  return 0;
+}
+
+// Engine state scalars (C-side storage for WASM, no-op in native mode)
+static void *__basalt_engine_ptr = NULL;
+static int64_t __basalt_pos = 0;
+static int64_t __basalt_token = 1;
+static int32_t __basalt_initialized = 0;
+
+void wasm_set_engine_ptr(void *ptr) { __basalt_engine_ptr = ptr; }
+void *wasm_get_engine_ptr(void) { return __basalt_engine_ptr; }
+void wasm_set_pos(int64_t pos) { __basalt_pos = pos; }
+int64_t wasm_get_pos(void) { return __basalt_pos; }
+void wasm_set_token(int64_t tok) { __basalt_token = tok; }
+int64_t wasm_get_token(void) { return __basalt_token; }
+void wasm_set_initialized(int32_t v) { __basalt_initialized = v; }
+int32_t wasm_get_initialized(void) { return __basalt_initialized; }

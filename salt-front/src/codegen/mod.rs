@@ -88,6 +88,14 @@ mod tests_kernel_unsafe;
 mod tests_proof_hint;
 #[cfg(test)]
 mod tests_postcondition;
+#[cfg(test)]
+mod tests_ptr_null_comparison;
+#[cfg(test)]
+mod tests_malloc_arg_escape;
+#[cfg(test)]
+mod tests_static_mut;
+#[cfg(test)]
+mod tests_nested_ptr_access;
 use crate::grammar::{SaltFile, Item, SaltFn, SaltImpl, ExternFnDecl, SaltConcept, SaltTrait};
 use crate::codegen::context::{CodegenContext, LocalKind, GenericContextGuard};
 use crate::codegen::type_bridge::{resolve_type, resolve_codegen_type};

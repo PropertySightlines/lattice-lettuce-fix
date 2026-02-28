@@ -1125,15 +1125,7 @@ pub fn emit_lvalue(ctx: &mut LoweringContext, out: &mut String, expr: &syn::Expr
         },
         syn::Expr::Field(f) => {
              let (base_addr, base_ty, kind) = emit_lvalue(ctx, out, &f.base, local_vars)?;
-             
-             if base_ty.k_is_ptr_type() {
-                 if let syn::Member::Named(id) = &f.member {
-                     // Ptr struct has { inner: &T, size: i64 } - handle inner field access
-                     if id.to_string() == "inner" {
-                         return Ok((base_addr, crate::types::Type::I64, kind));
-                     }
-                 }
-             }
+
              
              match base_ty {
                   crate::types::Type::Struct(ref sn) | crate::types::Type::Concrete(ref sn, _) => {

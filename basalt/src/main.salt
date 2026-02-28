@@ -88,7 +88,6 @@ fn mmap_file(path: Ptr<u8>) -> Ptr<u8> {
         close(fd);
         return 0 as Ptr<u8>;
     }
-    // Don't close fd — mmap needs it alive on some systems
     return data;
 }
 
@@ -135,19 +134,15 @@ fn run_inference(model_path: Ptr<u8>, tok_path: Ptr<u8>) -> i32 {
         return 1;
     }
 
-    // Load Config
     let cfg = load_config(model_data);
     println("Config: dim={}, layers={}, heads={}, vocab={}", cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size);
     
-    // Load Weights
     let mut w = get_weights(model_data, cfg);
     
-    // Setup RoPE
     let rope_w = build_freq_cis(cfg);
     w.freq_cis_real = rope_w.freq_cis_real;
     w.freq_cis_imag = rope_w.freq_cis_imag;
     
-    // Load Tokenizer (optional)
     let tok_data = mmap_file(tok_path);
     let has_tok = (tok_data as i64) != 0;
     let mut tok = Tokenizer {
@@ -160,28 +155,24 @@ fn run_inference(model_path: Ptr<u8>, tok_path: Ptr<u8>) -> i32 {
         println("Tokenizer loaded ({} entries).", tok.vocab_size);
     }
     
-    // ── Pre-tokenized prompt (set by JS via basalt_set_prompt_tokens) ──
     let n_prompt_tokens = salt_get_prompt_count();
     println("Prompt tokens: {}", n_prompt_tokens);
 
-    // ── Inference ──
     let state = alloc_run_state(cfg);
     let steps: i64 = cfg.seq_len;
     
     println("Generating {} tokens...", steps);
-    let mut token: i64 = 1; // BOS
+    let mut token: i64 = 1;
     let mut pos: i64 = 0;
     
     let t_start = salt_clock_now();
 
-    // Phase 1: Prefill — process pre-tokenized prompt through the transformer
     for pi in 0..n_prompt_tokens {
         forward(cfg, w, state, token, pos);
         token = salt_get_prompt_token(pi);
         pos = pos + 1;
     }
 
-    // Phase 2: Generation — sample and output new tokens
     for gp in pos..steps {
         forward(cfg, w, state, token, gp);
         token = sample_argmax(state.logits, cfg.vocab_size);
@@ -208,7 +199,7 @@ fn run_inference(model_path: Ptr<u8>, tok_path: Ptr<u8>) -> i32 {
 }
 
 fn main() -> i32 {
-    println("Basalt v0.3.0 (Llama 2 Inference)");
+    println("Basalt v0.4.1 (Llama 2 Inference)");
     
     let argc = salt_get_argc();
     if argc < 2 {
@@ -217,7 +208,6 @@ fn main() -> i32 {
     
     let model_path = salt_get_argv(1);
     
-    // Optional tokenizer path (arg 2)
     let mut tok_path: Ptr<u8> = 0 as Ptr<u8>;
     if argc >= 3 {
         tok_path = salt_get_argv(2);
@@ -225,3 +215,130 @@ fn main() -> i32 {
     
     return run_inference(model_path, tok_path);
 }
+
+// =============================================================================
+// WASM Engine API — Brutalist 6+1 Exports
+// =============================================================================
+//
+// Direct struct access enabled by Salt compiler fixes:
+//   - `var` globals replace C accessor functions
+//   - `Ptr<EngineState>` replaces flat Ptr<i64> buffer
+//   - Nested struct field access (es.config.dim) replaces serialize/deserialize
+//
+// =============================================================================
+
+// ── Engine State ────────────────────────────────────────────────────────────
+
+struct EngineState {
+    config: Config,
+    weights: TransformerWeights,
+    state: RunState
+}
+
+var POS: i64 = 0;
+var TOKEN: i64 = 1;
+var INITIALIZED: i32 = 0;
+
+pub fn basalt_engine_init(model_data: Ptr<u8>, model_size: i64) -> Ptr<u8> {
+    let es = malloc(264) as Ptr<EngineState>;
+
+    let cfg = load_config(model_data);
+    let mut w = get_weights(model_data, cfg);
+    let rope_w = build_freq_cis(cfg);
+    w.freq_cis_real = rope_w.freq_cis_real;
+    w.freq_cis_imag = rope_w.freq_cis_imag;
+
+    es.config = cfg;
+    es.weights = w;
+    es.state = alloc_run_state(cfg);
+
+    POS = 0;
+    TOKEN = 1;
+    INITIALIZED = 1;
+
+    return es as Ptr<u8>;
+}
+
+pub fn basalt_engine_prefill(es_ptr: Ptr<u8>, token_id: i64) {
+    if (es_ptr as i64) == 0 { return; }
+    let es = es_ptr as Ptr<EngineState>;
+
+    forward(es.config, es.weights, es.state, TOKEN, POS);
+    TOKEN = token_id;
+    POS = POS + 1;
+}
+
+pub fn basalt_engine_generate_step(es_ptr: Ptr<u8>) -> i64 {
+    if (es_ptr as i64) == 0 { return -1; }
+    let es = es_ptr as Ptr<EngineState>;
+
+    if POS >= es.config.seq_len { return -1; }
+
+    forward(es.config, es.weights, es.state, TOKEN, POS);
+    let next = sample_argmax(es.state.logits, es.config.vocab_size);
+    TOKEN = next;
+    POS = POS + 1;
+
+    return next;
+}
+
+pub fn basalt_engine_free(es_ptr: Ptr<u8>) {
+    if (es_ptr as i64) == 0 { return; }
+    let es = es_ptr as Ptr<EngineState>;
+
+    free_run_state(es.state);
+    free(es_ptr);
+    INITIALIZED = 0;
+}
+
+// ── Bulk prefill (1 boundary crossing for entire prompt) ────────────────────
+
+pub fn basalt_engine_ingest_prompt(es_ptr: Ptr<u8>, tokens_ptr: Ptr<i64>, count: i64) {
+    if (es_ptr as i64) == 0 { return; }
+    if count <= 0 { return; }
+    let es = es_ptr as Ptr<EngineState>;
+
+    for i in 0..count {
+        if POS >= es.config.seq_len { return; }
+        forward(es.config, es.weights, es.state, TOKEN, POS);
+        TOKEN = tokens_ptr[i];
+        POS = POS + 1;
+    }
+}
+
+// ── Unified config getter ───────────────────────────────────────────────────
+// param_id: 0=dim, 1=hidden_dim, 2=n_layers, 3=n_heads,
+//           4=n_kv_heads, 5=vocab_size, 6=seq_len
+
+pub fn basalt_engine_get_config(es_ptr: Ptr<u8>, param_id: i64) -> i64 {
+    if (es_ptr as i64) == 0 { return -1; }
+    let es = es_ptr as Ptr<EngineState>;
+
+    if param_id == 0 { return es.config.dim; }
+    if param_id == 1 { return es.config.hidden_dim; }
+    if param_id == 2 { return es.config.n_layers; }
+    if param_id == 3 { return es.config.n_heads; }
+    if param_id == 4 { return es.config.n_kv_heads; }
+    if param_id == 5 { return es.config.vocab_size; }
+    if param_id == 6 { return es.config.seq_len; }
+    return -1;
+}
+
+// ── Legacy getters (kept for native build compatibility) ─────────────────────
+
+pub fn basalt_engine_get_dim(es_ptr: Ptr<u8>) -> i64 {
+    return basalt_engine_get_config(es_ptr, 0);
+}
+
+pub fn basalt_engine_get_vocab_size(es_ptr: Ptr<u8>) -> i64 {
+    return basalt_engine_get_config(es_ptr, 5);
+}
+
+pub fn basalt_engine_get_seq_len(es_ptr: Ptr<u8>) -> i64 {
+    return basalt_engine_get_config(es_ptr, 6);
+}
+
+pub fn basalt_engine_get_n_layers(es_ptr: Ptr<u8>) -> i64 {
+    return basalt_engine_get_config(es_ptr, 2);
+}
+

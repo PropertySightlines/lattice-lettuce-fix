@@ -1,6 +1,6 @@
 # 🧠 Basalt — Llama 2 Inference in Salt
 
-**A ~600-line LLM inference engine** that compiles to native code through Salt's MLIR pipeline. Runs [Karpathy's TinyLlama](https://github.com/karpathy/llama2.c) models with BPE tokenization, zero-copy `mmap` weight loading, and Z3-verified compute kernels.
+**A ~600-line LLM inference engine** that compiles to native code through Salt's MLIR pipeline — and to **WASM for browser-side inference**. Runs [Karpathy's TinyLlama](https://github.com/karpathy/llama2.c) models with BPE tokenization, zero-copy weight loading, and Z3-verified compute kernels.
 
 **C-parity performance** on `stories15M.bin` (~870 tok/s, matching `clang -O3 -ffast-math -march=native` on Apple M4).
 
@@ -28,7 +28,7 @@ bash scripts/build_basalt.sh
 This will compile Basalt and run it in **mock mode** (no model file). Expected output:
 
 ```
-Basalt v0.3.0 (Llama 2 Inference)
+Basalt v0.4.0 (Llama 2 Inference)
 Running in MOCK mode (no model file provided).
 Sampled token: 0
 ```
@@ -50,7 +50,7 @@ mv dummy.bin tokenizer.bin /tmp/salt_build/
 Expected output:
 
 ```
-Basalt v0.3.0 (Llama 2 Inference)
+Basalt v0.4.0 (Llama 2 Inference)
 Loading model...
 Config: dim=64, layers=2, heads=4, vocab=256
 Tokenizer loaded (256 entries).
@@ -95,18 +95,21 @@ graph LR
     A --> D["sampler.salt<br/><i>argmax · top-p</i>"]
     A --> E["tokenizer.salt<br/><i>BPE encode/decode</i>"]
     A --> F["model_loader.salt<br/><i>mmap · config parse</i>"]
+    A --> G["basalt_wasm.c<br/><i>WASM exports · shims</i>"]
 ```
 
 ### Module Reference
 
 | Module | Lines | Responsibility | Key Functions |
 |:-------|------:|:---------------|:--------------|
-| [`main.salt`](src/main.salt) | 200 | Entry point: CLI arg parsing, RoPE precomputation, generation loop | `main`, `run_inference`, `run_mock`, `build_freq_cis` |
+| [`main.salt`](src/main.salt) | 350 | Entry point: CLI arg parsing, RoPE precomputation, generation loop, **WASM step functions** | `main`, `run_inference`, `basalt_engine_init/prefill/generate_step/free` |
 | [`transformer.salt`](src/transformer.salt) | 262 | Llama 2 architecture: struct definitions, multi-head attention, FFN, forward pass | `forward`, `Config`, `TransformerWeights`, `RunState` |
 | [`kernels.salt`](src/kernels.salt) | 238 | Z3-verified compute: RMS norm, softmax, tiled matrix multiply | `rmsnorm`, `softmax`, `mat_mul`, `mat_mul_vec` |
 | [`sampler.salt`](src/sampler.salt) | ~80 | Token selection from logits | `sample_argmax`, `sample_token` |
 | [`tokenizer.salt`](src/tokenizer.salt) | 179 | BPE tokenizer: load, encode, decode (llama2.c format) | `load_tokenizer`, `bpe_encode`, `decode_token` |
 | [`model_loader.salt`](src/model_loader.salt) | ~100 | Binary weight parsing from `mmap`'d file | `load_config`, `get_weights` |
+| [`basalt_wasm.c`](wasm/basalt_wasm.c) | ~150 | C bridge runtime: WASM exports, I/O shims | `basalt_init`, `basalt_prefill`, `basalt_generate_next`, `basalt_free` |
+| [`engine-worker.js`](wasm/engine-worker.js) | ~210 | JS Web Worker: tokenizer, WASM bridge, streaming | `BPETokenizer`, `initEngine`, `generate` |
 
 ### Data Flow
 
@@ -245,39 +248,68 @@ zsh scripts/run_test.sh basalt/tests/test_transformer.salt
 | [`test_tokenizer.salt`](tests/test_tokenizer.salt) | BPE encode/decode with a 7-token hand-built vocabulary; covers merges, single-byte fallback, round-trip |
 | [`test_transformer.salt`](tests/test_transformer.salt) | Forward pass with controlled weights; verifies attention + FFN + residual connections |
 
+## WASM API (v0.4.0) — Brutalist 6-Export Pipeline
+
+Basalt compiles to WASM for browser-side LLM inference. JS is the I/O layer; WASM is the math sandbox. Minimize boundary crossings at all costs.
+
+### API
+
+| Export | Signature | Purpose |
+|--------|-----------|--------|
+| `basalt_alloc` | `(bytes: i64) → ptr` | Allocate WASM linear memory for model |
+| `basalt_init` | `(ptr, size: i64) → i32` | Parse config, alloc state, build RoPE (0=ok, -1=fail) |
+| `basalt_ingest_prompt` | `(tokens_ptr, count: i64)` | Bulk prefill (1 boundary crossing for entire prompt) |
+| `basalt_generate_next` | `() → i64` | One forward + sample → token ID (-1 = EOS/done) |
+| `basalt_get_config` | `(param_id: i64) → i64` | Unified config getter (-1 = invalid ID) |
+| `basalt_free` | `()` | Burn the context down |
+
+### Config Param IDs
+
+| ID | Field | ID | Field |
+|----|-------|----|-------|
+| 0 | dim | 4 | n_kv_heads |
+| 1 | hidden_dim | 5 | vocab_size |
+| 2 | n_layers | 6 | seq_len |
+| 3 | n_heads | | |
+
+### Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant JS as engine-worker.js
+    participant W as WASM (basalt.wasm)
+
+    JS->>JS: BPE tokenize (O(1) hashmap)
+    JS->>W: basalt_alloc(size)
+    JS->>W: basalt_init(model_ptr, size)
+    JS->>W: basalt_ingest_prompt(tokens_ptr, count)
+    Note over W: Full prefill loop runs inside WASM
+
+    loop Generate (until EOS or max)
+        JS->>W: basalt_generate_next()
+        W-->>JS: token ID (or -1)
+        JS->>JS: decode + render
+    end
+
+    JS->>W: basalt_free()
+```
+
+### Key Design Decisions
+
+- **JS owns BPE.** WASM emits integers, JS decodes via vocab hashmap. No string allocation in Salt/C.
+- **Bulk prefill.** `basalt_ingest_prompt` runs the entire prefill loop inside WASM (1 boundary crossing instead of N).
+- **JS owns the loop.** `generate_next()` per token, yielding to event loop between calls for UI responsiveness.
+
+### Performance Roadmap
+
+| Tier | Technique | Expected Speedup | Requires |
+|------|-----------|-----------------|----------|
+| **1** | Cache-blocking / loop unrolling | 1.5–2× | Salt stdlib changes only |
+| **2** | WASM SIMD v128 (`f32x4`) | 2–3× | Compiler: new vector types + Z3 alignment proofs |
+| **3** | WebGPU orchestration (WGSL shaders) | 10–50× | Compiler: opaque GPU buffer FFI |
+| **4** | SharedArrayBuffer threading | 2–4× | Compiler: atomics + Z3 concurrency tracking |
+
 ---
-
-## File Layout
-
-```
-basalt/
-├── salt.toml                # sp package manifest (name, version, entry)
-├── models/                  # Binary weight files (git-ignored)
-│   ├── stories15M.bin       # Karpathy's TinyLlama weights (60 MB)
-│   └── tokenizer.bin        # Llama 2 BPE vocabulary (500 KB)
-├── src/
-│   ├── main.salt            # CLI, mmap, RoPE, generation loop
-│   ├── transformer.salt     # Llama 2 config, weights, multi-head attention, forward pass
-│   ├── kernels.salt         # Z3-verified: rmsnorm, softmax, tiled mat_mul, mat_mul_vec
-│   ├── sampler.salt         # Argmax and temperature sampling
-│   ├── tokenizer.salt       # BPE tokenizer: load, encode, decode
-│   └── model_loader.salt    # Binary config/weight parsing from mmap'd file
-└── tests/
-    ├── test_kernels.salt    # Golden-value kernel tests
-    ├── test_sampler.salt    # Probability distribution tests
-    ├── test_tokenizer.salt  # BPE round-trip tests
-    └── test_transformer.salt # Forward pass integration tests
-```
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|:--------|:------|:----|
-| `error: Entry point 'main' not found` | Compiler not recognizing `fn main` in concatenated build | Verify `salt-front` is built from latest source: `./scripts/build.sh` |
-| `ld: symbol(s) not found: _main` | `fn main` emitted as `@main__main` (private) | Rebuild compiler — this bug is fixed in `codegen/mod.rs` (entry point guard) |
-| `A: unbound variable` | Running `run_test.sh` with `bash` instead of `zsh` | Use `zsh scripts/run_test.sh ...` |
-| `mlir-opt: command not found` | LLVM 18 not on PATH | `export PATH=/opt/homebrew/opt/llvm@18/bin:$PATH` |
-| Nonsense output from dummy model | Expected — random weights produce random tokens | Use `stories15M.bin` for real text generation |
 
 ## Status
 
@@ -289,6 +321,8 @@ basalt/
 - [x] `main.salt` — CLI, mmap, RoPE, generation loop, decoded output
 - [x] Build pipeline (`build_basalt.sh`)
 - [x] Test suite (4 test files, TDD)
+- [x] WASM API: C bridge + Salt step functions + JS worker
 - [ ] Top-p / temperature sampling in generation loop
 - [ ] Multi-turn chat template support
-- [ ] Benchmark vs. llama2.c on stories15M
+- [ ] WASM SIMD v128 kernel optimization
+

@@ -404,6 +404,16 @@ pub fn emit_call(ctx: &mut LoweringContext, out: &mut String, c: &syn::ExprCall,
                  *ctx.pending_malloc_result = Some(res_val.clone());
              }
 
+             // [ESCAPE ANALYSIS V5.2] Mark malloc'd pointers as escaped when passed
+             // as function arguments. A pointer passed to another function has its
+             // ownership shared/transferred — it's not a leak.
+             // This fixes the Basalt WASM pattern:
+             //   let tokens = malloc(n * 8);
+             //   ingest_prompt(es, tokens, n);  // tokens escapes via argument
+             for arg_expr in c.args.iter() {
+                 super::mark_expression_escaped(ctx, arg_expr);
+             }
+
              // [SALT MEMORY MODEL] Pointer State Interception
              // Detect constructors that produce known pointer states:
              // - Ptr::empty() → Empty state
