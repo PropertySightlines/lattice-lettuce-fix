@@ -28,7 +28,7 @@ bash scripts/build_basalt.sh
 This will compile Basalt and run it in **mock mode** (no model file). Expected output:
 
 ```
-Basalt v0.4.0 (Llama 2 Inference)
+Basalt v0.4.1 (Llama 2 Inference)
 Running in MOCK mode (no model file provided).
 Sampled token: 0
 ```
@@ -50,7 +50,7 @@ mv dummy.bin tokenizer.bin /tmp/salt_build/
 Expected output:
 
 ```
-Basalt v0.4.0 (Llama 2 Inference)
+Basalt v0.4.1 (Llama 2 Inference)
 Loading model...
 Config: dim=64, layers=2, heads=4, vocab=256
 Tokenizer loaded (256 entries).
@@ -248,11 +248,36 @@ zsh scripts/run_test.sh basalt/tests/test_transformer.salt
 | [`test_tokenizer.salt`](tests/test_tokenizer.salt) | BPE encode/decode with a 7-token hand-built vocabulary; covers merges, single-byte fallback, round-trip |
 | [`test_transformer.salt`](tests/test_transformer.salt) | Forward pass with controlled weights; verifies attention + FFN + residual connections |
 
-## WASM API (v0.4.0) — Brutalist 6-Export Pipeline
+## WASM — Browser-Side Inference
 
-Basalt compiles to WASM for browser-side LLM inference. JS is the I/O layer; WASM is the math sandbox. Minimize boundary crossings at all costs.
+### Quickstart (Pre-built Binary)
 
-### API
+No toolchain required — grab the pre-built binary:
+
+```bash
+basalt/wasm/dist/basalt.wasm    # 19KB inference engine
+basalt/wasm/engine-worker.js    # JS Web Worker
+```
+
+```javascript
+const worker = new Worker('/engine-worker.js');
+worker.postMessage({ type: 'LOAD_MODEL', modelUrl: '/model.bin', tokenizerUrl: '/tokenizer.bin' });
+worker.postMessage({ type: 'RUN_PROMPT', prompt: 'Once upon a time', maxNewTokens: 256 });
+worker.onmessage = ({ data }) => {
+    if (data.type === 'TOKEN') process.stdout.write(data.text);
+    if (data.type === 'DONE')  console.log(`${data.totalTokens} tokens in ${data.elapsedMs}ms`);
+};
+```
+
+### Build WASM from Source
+
+```bash
+cargo build --release --manifest-path salt-front/Cargo.toml
+bash scripts/build_basalt_wasm.sh
+# Output: basalt/wasm/dist/basalt.wasm (19KB)
+```
+
+### 6-Export API
 
 | Export | Signature | Purpose |
 |--------|-----------|--------|
@@ -262,6 +287,15 @@ Basalt compiles to WASM for browser-side LLM inference. JS is the I/O layer; WAS
 | `basalt_generate_next` | `() → i64` | One forward + sample → token ID (-1 = EOS/done) |
 | `basalt_get_config` | `(param_id: i64) → i64` | Unified config getter (-1 = invalid ID) |
 | `basalt_free` | `()` | Burn the context down |
+
+### Conversation Context
+
+The KV cache is **append-only** — no rewind or clear.
+
+| Scenario | How |
+|----------|-----|
+| Multi-turn chat | Re-encode entire history, call `basalt_free()` → `basalt_init()` |
+| Switch models | `worker.terminate()` → new Worker (only way to reclaim WASM memory) |
 
 ### Config Param IDs
 
@@ -319,10 +353,10 @@ sequenceDiagram
 - [x] `model_loader.salt` — binary config/weight parsing from mmap
 - [x] `tokenizer.salt` — BPE load, encode, decode (llama2.c format)
 - [x] `main.salt` — CLI, mmap, RoPE, generation loop, decoded output
-- [x] Build pipeline (`build_basalt.sh`)
+- [x] Build pipeline (`build_basalt.sh`, `build_basalt_wasm.sh`)
 - [x] Test suite (4 test files, TDD)
-- [x] WASM API: C bridge + Salt step functions + JS worker
+- [x] WASM API: C bridge + Salt engine + JS worker + pre-built binary (19KB)
 - [ ] Top-p / temperature sampling in generation loop
 - [ ] Multi-turn chat template support
-- [ ] WASM SIMD v128 kernel optimization
+- [ ] WASM SIMD v128 kernel optimization (Tier 2)
 
