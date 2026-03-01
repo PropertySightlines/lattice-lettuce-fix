@@ -359,16 +359,12 @@ void Z3VerifyPass::runOnOperation() {
         }
       }
 
-      if (auto verify = dyn_cast<salt::VerifyCheckOp>(op)) {
+      if (auto verify = dyn_cast<salt::VerifyOp>(op)) {
         if (verify.getKind() == "borrow_check") {
-          for (Value arg : verify.getArgs()) {
-            active_borrows.push_back(translateValue(arg, ctx, sorts, scopeMap));
-          }
+          active_borrows.push_back(translateValue(verify.getCondition(), ctx, sorts, scopeMap));
         } else if (verify.getKind() == "consume") {
           // Track the consumed operand if present
-          if (verify.getArgs().size() >= 2) {
-            consumedValues.insert(verify.getArgs()[1]);
-          }
+          consumedValues.insert(verify.getCondition());
         }
       }
       if (auto load = dyn_cast<LLVM::LoadOp>(op)) {

@@ -97,11 +97,10 @@ int emitObjectFile(llvm::Module &llvmModule,
                    const std::string &outputFilename) {
   // 1. Setup Target Triple
   auto tripleStr = llvm::sys::getDefaultTargetTriple();
-  llvm::Triple triple(tripleStr);
-  llvmModule.setTargetTriple(triple);
+  llvmModule.setTargetTriple(tripleStr);
 
   std::string error;
-  auto target = llvm::TargetRegistry::lookupTarget(triple.str(), error);
+  auto target = llvm::TargetRegistry::lookupTarget(tripleStr, error);
   if (!target) {
     llvm::errs() << "Target Lookup Failed: " << error << "\n";
     return 1;
@@ -113,7 +112,7 @@ int emitObjectFile(llvm::Module &llvmModule,
   llvm::TargetOptions opt;
   auto rm = std::optional<llvm::Reloc::Model>();
   auto targetMachine =
-      target->createTargetMachine(triple, cpu, features, opt, rm);
+      target->createTargetMachine(tripleStr, cpu, features, opt, rm);
 
   // 3. Configure Data Layout
   llvmModule.setDataLayout(targetMachine->createDataLayout());
@@ -131,6 +130,7 @@ int emitObjectFile(llvm::Module &llvmModule,
   auto fileType = llvm::CodeGenFileType::ObjectFile;
 
   // Add TLI and TTI (inherited from original implementation)
+  llvm::Triple triple(tripleStr);
   llvm::TargetLibraryInfoImpl tlii(triple);
   pass.add(new llvm::TargetLibraryInfoWrapperPass(tlii));
   pass.add(llvm::createTargetTransformInfoWrapperPass(
@@ -184,7 +184,7 @@ void buildLoweringPipeline(mlir::PassManager &pm, mlir::ModuleOp module) {
     // B. "Bufferize" (Tensor -> MemRef)
     pm.addPass(mlir::bufferization::createEmptyTensorToAllocTensorPass());
 
-    mlir::bufferization::OneShotBufferizePassOptions bufferizationOpts;
+    mlir::bufferization::OneShotBufferizationOptions bufferizationOpts;
     bufferizationOpts.bufferizeFunctionBoundaries = true;
     bufferizationOpts.allowUnknownOps = true;
     pm.addPass(
@@ -204,7 +204,7 @@ void buildLoweringPipeline(mlir::PassManager &pm, mlir::ModuleOp module) {
   }
 
   // 5. Standard Lowering (scf/cf/arith/math/memref to LLVM)
-  pm.addPass(mlir::createSCFToControlFlowPass());
+  pm.addPass(mlir::createConvertSCFToCFPass());
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());
   pm.addPass(mlir::createConvertMathToLLVMPass());
