@@ -2,7 +2,7 @@
 
 **Date:** March 1, 2026  
 **Phase:** Phase 1 - Foundation  
-**Status:** ✅ Hello World Working
+**Status:** ✅ HTTP Client Implemented
 
 ---
 
@@ -10,7 +10,7 @@
 
 SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq free tier constraints. The project implements observational memory with Lettuce as the memory backend.
 
-**Current Status:** Phase 1 foundation is working - hello world binary compiles and runs successfully.
+**Current Status:** Phase 1 foundation progressing - HTTP client for Cerebras API implemented.
 
 ---
 
@@ -23,7 +23,8 @@ SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq
 | **Memory Manager** | ✅ Implemented | Inline in main.salt | 30k/40k token thresholds |
 | **Lettuce Client** | ✅ Implemented | `src/lettuce_client.salt` | SET/GET/DEL commands, RESP protocol |
 | **Tools** | ✅ Implemented | `src/tools.salt` | read/write/edit/bash stubs |
-| **HTTP Client** | ❌ Not started | - | Need for Cerebras API calls |
+| **HTTP Client** | ✅ Implemented | `src/http_client.salt` | POST request building, response parsing |
+| **Cerebras API** | ⚠️ Stub | `src/main.salt` | HTTP works, needs HTTPS |
 | **TUI** | ❌ Not started | - | Terminal input/output loop |
 | **Agent Loop** | ❌ Not started | - | Core agent logic |
 
@@ -119,7 +120,7 @@ fn route(recv_buf: Ptr<u8>, n: i64, send_buf: Ptr<u8>) -> i64 {
 - [x] Get "hello world" Salt binary compiling
 - [x] Study Lettuce source (memory backend)
 - [ ] Minimal TUI: read line, print line
-- [ ] Single hardcoded Cerebras API call
+- [x] Single hardcoded Cerebras API call (stub)
 - [ ] Parse response, print it
 - [x] Add one tool: `bash` (stub implemented)
 - [ ] Tool call round-trip working
@@ -157,23 +158,33 @@ saltpi/
 
 ## Next Steps (Immediate)
 
-1. **HTTP Client Implementation**
-   - Use `std.http.client` pattern from salt-front
-   - Implement Cerebras API call
-   - Parse response headers for rate limits
+1. **HTTPS Support** (Critical)
+   - Current HTTP client only supports HTTP
+   - Cerebras/Groq require HTTPS (port 443)
+   - Need TLS/SSL wrapper or use https:// URL
 
-2. **TUI Implementation**
+2. **JSON Response Parsing**
+   - Parse Cerebras API JSON response
+   - Extract `choices[0].message.content`
+   - Handle error responses
+
+3. **Rate Limit Header Parsing**
+   - Extract `x-ratelimit-*` headers from response
+   - Update RateLimiter with remaining quota
+   - Implement sleep state when limits approached
+
+4. **TUI Implementation**
    - Minimal input/output loop
    - Read user prompt from stdin
    - Print assistant response to stdout
 
-3. **Tool Implementation**
+5. **Tool Implementation**
    - Complete `tool_read()` with file I/O
    - Complete `tool_write()` with file creation
    - Complete `tool_edit()` with diff parsing
    - Complete `tool_bash()` with process execution
 
-4. **Agent Loop**
+6. **Agent Loop**
    - Integrate HTTP client, TUI, tools
    - Handle tool call parsing
    - Maintain conversation history
