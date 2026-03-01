@@ -163,3 +163,17 @@ fail_semantic_*.salt
 
 # Basalt benchmark cache
 .bench_basalt/
+
+# ─── Salt cache files ───────────────────────────────────────────────────────
+.salt_cache/
+*.salt_cache/
+
+# ─── CMake build outputs ────────────────────────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# ─── Bazel build outputs ────────────────────────────────────────────────────
+bazel-bin/
+bazel-testlogs/
