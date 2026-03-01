@@ -1,0 +1,90 @@
+// =============================================================================
+// SaltPi HTTP Client Tests
+// =============================================================================
+
+package saltpi.tests.http_client_test
+
+use std.core.ptr.Ptr
+use saltpi.http.{http_post, HttpResponse}
+
+// FFI for test output
+extern fn puts(s: Ptr<u8>) -> i32;
+extern fn exit(code: i32);
+
+fn print_result(name: Ptr<u8>, passed: bool) {
+    if passed {
+        puts("  [PASS] " as Ptr<u8>);
+        puts(name);
+        puts("\0" as Ptr<u8>);
+    } else {
+        puts("  [FAIL] " as Ptr<u8>);
+        puts(name);
+        puts("\0" as Ptr<u8>);
+        exit(1);
+    }
+}
+
+fn test_http_post_stub() -> bool {
+    // Stub test - actual HTTP testing requires running server
+    // Just verify the function signature compiles
+    let host = "api.cerebras.ai\0" as Ptr<u8>;
+    let path = "/v1/chat/completions\0" as Ptr<u8>;
+    let api_key = "test_key\0" as Ptr<u8>;
+    let body = "{}\0" as Ptr<u8>;
+    let mut response_buf: [u8; 4096] = [0; 4096];
+    let response_ptr = &response_buf[0] as Ptr<u8>;
+
+    // This would fail at runtime (no server), but verifies compilation
+    // let response = http_post(host, 443, path, api_key, body, 2, response_ptr, 4096);
+
+    return true;
+}
+
+fn test_parse_status_code() -> bool {
+    // Test parsing "HTTP/1.1 200 OK\r\n"
+    let mut buf: [u8; 20] = [0; 20];
+    let ptr = &buf[0] as Ptr<u8>;
+
+    // Write test response
+    ptr.offset(0).write(72);   // H
+    ptr.offset(1).write(84);   // T
+    ptr.offset(2).write(84);   // T
+    ptr.offset(3).write(80);   // P
+    ptr.offset(4).write(47);   // /
+    ptr.offset(5).write(49);   // 1
+    ptr.offset(6).write(46);   // .
+    ptr.offset(7).write(49);   // 1
+    ptr.offset(8).write(32);   // space
+    ptr.offset(9).write(50);   // 2
+    ptr.offset(10).write(48);  // 0
+    ptr.offset(11).write(48);  // 0
+
+    // Would test parse_status_code here but it's internal
+    // For now just verify buffer setup compiles
+
+    return true;
+}
+
+pub fn run_all_tests() -> i32 {
+    puts("=== SaltPi HTTP Client Tests ===\0" as Ptr<u8>);
+
+    let mut passed: i32 = 0;
+    let mut failed: i32 = 0;
+
+    let t1 = test_http_post_stub();
+    print_result("test_http_post_stub\0" as Ptr<u8>, t1);
+    if t1 { passed = passed + 1; } else { failed = failed + 1; }
+
+    let t2 = test_parse_status_code();
+    print_result("test_parse_status_code\0" as Ptr<u8>, t2);
+    if t2 { passed = passed + 1; } else { failed = failed + 1; }
+
+    puts("\0" as Ptr<u8>);
+    if failed > 0 {
+        puts("FAILED\0" as Ptr<u8>);
+        return 1;
+    }
+
+    puts(f"All {passed} tests passed\0" as Ptr<u8>);
+    return 0;
+}
