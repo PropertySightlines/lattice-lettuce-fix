@@ -21,7 +21,7 @@ Successfully ported the Lattice project to Linux with the following accomplishme
 - ✅ **Lettuce server fixed** — Redis-compatible server now works (`redis-cli ping` → `PONG`)
 - ✅ **Basalt validated** — LLM inference engine builds and runs
 - ✅ **Facet validated** — Raster tests pass (14/14), Tiger demo renders
-- ⚠️ **Kernel build progressing** — One blocker (`is_kvm` undefined variable)
+- ✅ **Kernel builds successfully** — `is_kvm` fix applied, QEMU boot pending
 - ✅ **Benchmarks pass** — Salt performs ≤ C in head-to-head comparisons
 
 ---
@@ -48,7 +48,7 @@ Architecture:    x86_64-pc-linux-gnu
 | **Lettuce** | ✅ Fixed | Stack frame bug resolved, `redis-cli ping` → `PONG` |
 | **Basalt** | ✅ Works | LLM inference engine, ~870 tok/s expected |
 | **Facet** | ✅ Works | Raster tests pass (14/14), Tiger demo renders |
-| **Kernel** | ⚠️ Blocked | `is_kvm` undefined variable (code bug, not port issue) |
+| **Kernel** | ✅ Builds | `is_kvm` fixed, 373KB ELF, QEMU boot requires installation |
 | **Benchmarks** | ✅ Pass | Salt ≤ C in head-to-head comparisons |
 
 ---
@@ -251,7 +251,54 @@ OVERVIEW: Salt Optimizer & Backend
 
 ---
 
-## Bug #3: Build Script macOS Assumptions
+## Bug #3: Kernel `is_kvm` Use-Before-Declare
+
+### Symptom
+Kernel build fails with "Undefined variable or constant: is_kvm" error.
+
+### Root Cause
+In `kernel/benchmarks/netd_bench.salt`, the `is_kvm` variable was **used before it was declared**:
+
+```salt
+// Line 750 - USES is_kvm BEFORE it exists!
+let rx_count: u64 = if is_kvm { 10000 } else { 100 };
+
+// ... lines 751-755 ...
+
+// Line 756 - Declaration happens TOO LATE
+let is_kvm = get_bench_divisor() == 1;
+```
+
+### Fix
+**File:** `kernel/benchmarks/netd_bench.salt`
+
+Moved the declaration before its first use:
+
+```salt
+// DETECT: KVM vs TCG before using is_kvm
+let is_kvm = get_bench_divisor() == 1;
+
+let rx_count: u64 = if is_kvm { 10000 } else { 100 };  // 100 on TCG to avoid hang
+```
+
+### Verification
+```bash
+$ python3 tools/runner_qemu.py build
+BUILD SUCCESS: qemu_build/kernel.elf
+
+$ ls -lh qemu_build/kernel.elf
+-rwxrwxr-x 1 property.sightlines property.sightlines 365K kernel.elf
+
+$ file qemu_build/kernel.elf
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, not stripped
+```
+
+### Commit
+**Commit:** [`0296158`](https://github.com/PropertySightlines/lattice-lettuce-fix/commit/0296158) — "fix(kernel): Move is_kvm declaration before first use in netd_bench"
+
+---
+
+## Bug #4: Build Script macOS Assumptions
 
 ### Symptom
 `benchmark.sh` and `run_test.sh` fail on Linux due to hardcoded macOS paths and commands.
@@ -348,15 +395,15 @@ time ./fib_salt
 
 The following items require maintainer input:
 
-1. **`is_kvm` undefined variable** in `kernel/benchmarks/netd_bench.salt` — Where is this variable supposed to be defined? The code uses it before definition (lines 750, 822) and defines it later (line 756).
+1. **LLVM version preference:** Should the project standardize on LLVM 18 vs 19 for salt-opt? Current fixes target LLVM 19.
 
-2. **LLVM version preference:** Should the project standardize on LLVM 18 vs 19 for salt-opt? Current fixes target LLVM 19.
+2. **Release salt-front requires Z3 verification** — Is debug build acceptable for kernel compilation? Debug build supports `--no-verify` flag which bypasses Z3 timeouts on complex kernels.
 
-3. **Release salt-front requires Z3 verification** — Is debug build acceptable for kernel compilation? Debug build supports `--no-verify` flag which bypasses Z3 timeouts on complex kernels.
+3. **Should Homebrew paths be made configurable?** Currently scripts hardcode `/opt/homebrew/opt/llvm@18/bin/clang`. Should this be environment-variable configurable or auto-detected?
 
-4. **Should Homebrew paths be made configurable?** Currently scripts hardcode `/opt/homebrew/opt/llvm@18/bin/clang`. Should this be environment-variable configurable or auto-detected?
+4. **Stack frame bug long-term fix:** The Lettuce fix is a workaround. Should the Salt compiler's stack frame calculation be audited and fixed properly?
 
-5. **Stack frame bug long-term fix:** The Lettuce fix is a workaround. Should the Salt compiler's stack frame calculation be audited and fixed properly?
+5. **QEMU boot testing:** Requires `qemu-system-x86` installation. Should this be added to CI/CD requirements?
 
 ---
 
@@ -401,6 +448,12 @@ The following items require maintainer input:
 | `lettuce/src/server.salt` | Variable reordering to fix stack corruption |
 | `salt-front/runtime.c` | Format specifier fix (`%lld` → `%ld` on Linux) |
 
+### Kernel
+
+| File | Change |
+|------|--------|
+| `kernel/benchmarks/netd_bench.salt` | Move `is_kvm` declaration before first use |
+
 ### Build Scripts
 
 | File | Change |
@@ -417,6 +470,7 @@ The following items require maintainer input:
 | `docs/LINUX_STATUS_REPORT.md` | Created — Linux status overview |
 | `LINUX_PORT.md` | Created — Comprehensive porting guide |
 | `docs/DEBUGGING_ANALYSIS.md` | Created — Debugging reference |
+| `GITHUB_ISSUE_REPORT.md` | Created — This issue report |
 
 ---
 
