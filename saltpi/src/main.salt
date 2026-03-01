@@ -12,16 +12,19 @@ fn main() -> i32 {
     puts("Lightspeed coding agent\0" as Ptr<u8>);
     puts("------------------------------------------\0" as Ptr<u8>);
     puts("Phase 1: Foundation\0" as Ptr<u8>);
-    puts("Status: HTTPS client with TLS implemented\0" as Ptr<u8>);
     puts("\0" as Ptr<u8>);
-    puts("Components:\0" as Ptr<u8>);
-    puts("  - HTTPS client: implemented (TLS via OpenSSL)\0" as Ptr<u8>);
-    puts("  - Rate limiter: implemented\0" as Ptr<u8>);
-    puts("  - Memory manager: implemented\0" as Ptr<u8>);
-    puts("  - Lettuce client: implemented\0" as Ptr<u8>);
-    puts("  - Tools: stubs implemented\0" as Ptr<u8>);
+    puts("Components implemented:\0" as Ptr<u8>);
+    puts("  - HTTPS client with TLS (OpenSSL)\0" as Ptr<u8>);
+    puts("  - Lettuce client (Redis backend)\0" as Ptr<u8>);
+    puts("  - Rate limiter\0" as Ptr<u8>);
+    puts("  - Memory manager\0" as Ptr<u8>);
+    puts("  - Tools (read/write/edit/bash stubs)\0" as Ptr<u8>);
     puts("\0" as Ptr<u8>);
-    puts("Next: JSON parsing, TUI, agent loop\0" as Ptr<u8>);
+    puts("Next steps:\0" as Ptr<u8>);
+    puts("  - Environment config (API keys)\0" as Ptr<u8>);
+    puts("  - JSON parsing (Cerebras/Groq responses)\0" as Ptr<u8>);
+    puts("  - TUI (terminal input/output)\0" as Ptr<u8>);
+    puts("  - Agent loop integration\0" as Ptr<u8>);
     
     return 0;
 }
