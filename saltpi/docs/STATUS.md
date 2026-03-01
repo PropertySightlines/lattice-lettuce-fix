@@ -2,7 +2,7 @@
 
 **Date:** March 1, 2026  
 **Phase:** Phase 1 - Foundation  
-**Status:** ✅ Consolidated Working Build
+**Status:** ✅ Minimal Working Build
 
 ---
 
@@ -10,7 +10,7 @@
 
 SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq free tier constraints. The project implements observational memory with Lettuce as the memory backend.
 
-**Current Status:** Phase 1 foundation consolidated - working build with core components. Modules (config, provider, json_parser) need re-implementation with proper Salt module patterns.
+**Current Status:** Phase 1 foundation - minimal working build with inline config/provider. Module linking requires specific Salt project structure (under investigation).
 
 ---
 
@@ -19,16 +19,47 @@ SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq
 | Component | Status | Location | Notes |
 |-----------|--------|----------|-------|
 | **Hello World** | ✅ Working | `src/main.salt` | Basic binary compiles and runs |
-| **Rate Limiter** | ✅ Implemented | `src/rate_limiter.salt` | Cerebras/Groq tracking |
-| **Memory Manager** | ✅ Implemented | Inline | 30k/40k token thresholds |
-| **Lettuce Client** | ✅ Implemented | `src/lettuce_client.salt` | SET/GET/DEL, RESP protocol |
-| **Tools** | ✅ Stubs | `src/tools.salt` | read/write/edit/bash |
-| **HTTPS Client** | ✅ Implemented | `src/main.salt` | TLS via OpenSSL FFI |
-| **Config (env vars)** | ⚠️ Removed | - | Needs re-implementation |
-| **JSON Parser** | ⚠️ Removed | - | Needs re-implementation |
-| **Provider Module** | ⚠️ Removed | - | Needs re-implementation |
+| **Config (inline)** | ✅ Working | `src/main.salt` | Uses `std.env.env.get_env` |
+| **Provider (inline)** | ✅ Working | `src/main.salt` | Cerebras/Groq config structs |
+| **HTTPS Client** | ⚠️ Removed | - | Was in main.salt |
+| **JSON Parser** | ⚠️ Removed | - | Module linking issue |
+| **Lettuce Client** | ⚠️ Removed | - | Module linking issue |
+| **Rate Limiter** | ⚠️ Removed | - | Module linking issue |
+| **Tools** | ⚠️ Removed | - | Module linking issue |
 | **TUI** | ❌ Not started | - | Terminal input/output |
 | **Agent Loop** | ❌ Not started | - | Core agent logic |
+
+---
+
+## Salt Module Pattern Findings
+
+**Working Pattern (Lettuce):**
+```
+lettuce/
+├── Salt.toml  # name = "lettuce", entry = "src/server.salt"
+├── src/server.salt  # entry point, package main
+├── store.salt  # package lettuce.store (at ROOT)
+└── resp.salt  # package lettuce.resp (at ROOT)
+```
+
+**Import in entry point:**
+```salt
+use lettuce.store.{execute, ExecResult}
+```
+
+**SaltPi Attempt (module linking issue):**
+```
+saltpi/
+├── Salt.toml  # name = "saltpi", entry = "src/main.salt"
+├── src/main.salt  # entry point, package main
+├── config.salt  # package saltpi.config (at ROOT)
+├── json.salt  # package saltpi.json (at ROOT)
+└── provider.salt  # package saltpi.provider (at ROOT)
+```
+
+**Error:** `Undefined function or symbol: 'saltpi__config__get_default_provider'`
+
+**Current Workaround:** Inline all functions in `src/main.salt` (single-file approach)
 
 ---
 
