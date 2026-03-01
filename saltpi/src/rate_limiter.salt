@@ -1,0 +1,338 @@
+// =============================================================================
+// SALTPI — Rate Limiter with Sleep State
+// =============================================================================
+// Tracks API rate limits from Cerebras/Groq response headers and implements
+// sleep mode for background compaction when limits are approached.
+//
+// Response headers tracked:
+//   - x-ratelimit-remaining-requests-day
+//   - x-ratelimit-remaining-tokens-minute
+//   - x-ratelimit-reset-requests
+//   - x-ratelimit-reset-tokens
+//
+// Provides:
+//   - RateLimiter::new() - Create new rate limiter
+//   - RateLimiter::update_from_headers() - Parse response headers
+//   - RateLimiter::can_request() - Check if request is allowed
+//   - RateLimiter::enter_sleep() - Enter sleep mode for compaction
+//   - RateLimiter::exit_sleep() - Exit sleep mode
+// =============================================================================
+
+package saltpi.rate_limiter
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+
+// ============================================================================
+// Rate Limiter State
+// ============================================================================
+
+pub struct RateLimiter {
+    requests_remaining_day: i64,
+    tokens_remaining_minute: i64,
+    reset_seconds_day: i64,
+    reset_seconds_minute: i64,
+    is_sleeping: bool,
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Thresholds for entering sleep mode
+const REQUESTS_SLEEP_THRESHOLD: i64 = 100;
+const TOKENS_SLEEP_THRESHOLD: i64 = 1000;
+
+// Default values when headers not present
+const DEFAULT_REQUESTS_DAY: i64 = 14400;      // Cerebras free tier daily limit
+const DEFAULT_TOKENS_MINUTE: i64 = 30000;     // Cerebras free tier per-minute limit
+const DEFAULT_RESET_SECONDS: i64 = 86400;     // 24 hours in seconds
+
+// ============================================================================
+// Constructor
+// ============================================================================
+
+/// Create a new RateLimiter with default values.
+pub fn RateLimiter::new() -> RateLimiter {
+    return RateLimiter {
+        requests_remaining_day: DEFAULT_REQUESTS_DAY,
+        tokens_remaining_minute: DEFAULT_TOKENS_MINUTE,
+        reset_seconds_day: DEFAULT_RESET_SECONDS,
+        reset_seconds_minute: 60,
+        is_sleeping: false,
+    };
+}
+
+// ============================================================================
+// Header Parsing Helpers
+// ============================================================================
+
+/// Find the value for a header name in the headers string.
+/// Returns StringView pointing to the value, or empty if not found.
+fn find_header_value(headers: StringView, header_name: Ptr<u8>, name_len: i64) -> StringView {
+    let headers_len = headers.length();
+    let headers_ptr = headers.ptr;
+
+    // Search for header name followed by ": "
+    let mut i: i64 = 0;
+    while i < headers_len - name_len - 2 {
+        // Check if header name matches at position i
+        let mut match_found = true;
+        let mut j: i64 = 0;
+        while j < name_len {
+            if headers_ptr.offset(i + j).read() != header_name.offset(j).read() {
+                match_found = false;
+                break;
+            }
+            j = j + 1;
+        }
+
+        // Check for ": " after the name
+        if match_found {
+            if headers_ptr.offset(i + name_len).read() == 58 &&  // ':'
+               headers_ptr.offset(i + name_len + 1).read() == 32 { // ' '
+                // Found it! Return value from after ": " to end of line
+                let value_start = i + name_len + 2;
+                let mut value_end = value_start;
+                while value_end < headers_len {
+                    let b = headers_ptr.offset(value_end).read();
+                    if b == 13 || b == 10 {  // \r or \n
+                        break;
+                    }
+                    value_end = value_end + 1;
+                }
+                return StringView::from_raw(headers_ptr.offset(value_start), value_end - value_start);
+            }
+        }
+
+        // Move to next line
+        while i < headers_len && headers_ptr.offset(i).read() != 10 {
+            i = i + 1;
+        }
+        i = i + 1;  // Skip the newline
+    }
+
+    return StringView::empty();
+}
+
+/// Parse an integer from a StringView, handling decimal and "s" suffix (e.g., "7.66s").
+fn parse_int_from_view(input: StringView) -> i64 {
+    let len = input.length();
+    if len == 0 {
+        return 0;
+    }
+
+    let mut result: i64 = 0;
+    let mut i: i64 = 0;
+
+    // Skip leading whitespace
+    while i < len {
+        let b = input.byte_at(i);
+        if b != 32 && b != 9 {  // space or tab
+            break;
+        }
+        i = i + 1;
+    }
+
+    // Parse integer part
+    while i < len {
+        let b = input.byte_at(i) as i64;
+        if b >= 48 && b <= 57 {  // '0' to '9'
+            result = result * 10 + (b - 48);
+        } else if b == 46 {  // '.' - skip decimal part
+            // Skip until non-digit
+            i = i + 1;
+            while i < len {
+                let b2 = input.byte_at(i) as i64;
+                if b2 < 48 || b2 > 57 {
+                    break;
+                }
+                i = i + 1;
+            }
+            continue;
+        } else if b == 115 {  // 's' suffix (seconds)
+            break;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Header Name Constants
+// ============================================================================
+
+// "x-ratelimit-remaining-requests-day" (34 characters)
+static HEADER_REQUESTS_DAY: [u8; 34] = [
+    120, 45, 114, 97, 116, 101, 108, 105, 109, 105, 116, 45, 114, 101, 109, 97,
+    105, 110, 105, 110, 103, 45, 114, 101, 113, 117, 101, 115, 116, 115, 45, 100, 97, 121
+];
+
+// "x-ratelimit-remaining-tokens-minute" (33 characters)
+static HEADER_TOKENS_MINUTE: [u8; 33] = [
+    120, 45, 114, 97, 116, 101, 108, 105, 109, 105, 116, 45, 114, 101, 109, 97,
+    105, 110, 105, 110, 103, 45, 116, 111, 107, 101, 110, 115, 45, 109, 105, 110, 117, 116, 101
+];
+
+// "x-ratelimit-reset-requests" (26 characters)
+static HEADER_RESET_REQUESTS: [u8; 26] = [
+    120, 45, 114, 97, 116, 101, 108, 105, 109, 105, 116, 45, 114, 101, 115, 101,
+    116, 45, 114, 101, 113, 117, 101, 115, 116, 115
+];
+
+// "x-ratelimit-reset-tokens" (24 characters)
+static HEADER_RESET_TOKENS: [u8; 24] = [
+    120, 45, 114, 97, 116, 101, 108, 105, 109, 105, 116, 45, 114, 101, 115, 101,
+    116, 45, 116, 111, 107, 101, 110, 115
+];
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Update rate limiter state from HTTP response headers.
+/// Parses x-ratelimit-* headers and updates internal counters.
+///
+/// Header format expected:
+///   "x-ratelimit-remaining-requests-day: 14370\r\n"
+///   "x-ratelimit-reset-tokens: 7.66s\r\n"
+pub fn RateLimiter::update_from_headers(&mut self, headers: StringView) {
+    let headers_ptr = headers.ptr;
+
+    // Parse x-ratelimit-remaining-requests-day
+    let requests_day_val = find_header_value(
+        headers,
+        HEADER_REQUESTS_DAY.as_ptr(),
+        34
+    );
+    if !requests_day_val.is_empty() {
+        self.requests_remaining_day = parse_int_from_view(requests_day_val);
+    }
+
+    // Parse x-ratelimit-remaining-tokens-minute
+    let tokens_minute_val = find_header_value(
+        headers,
+        HEADER_TOKENS_MINUTE.as_ptr(),
+        33
+    );
+    if !tokens_minute_val.is_empty() {
+        self.tokens_remaining_minute = parse_int_from_view(tokens_minute_val);
+    }
+
+    // Parse x-ratelimit-reset-requests
+    let reset_requests_val = find_header_value(
+        headers,
+        HEADER_RESET_REQUESTS.as_ptr(),
+        26
+    );
+    if !reset_requests_val.is_empty() {
+        self.reset_seconds_day = parse_int_from_view(reset_requests_val);
+    }
+
+    // Parse x-ratelimit-reset-tokens
+    let reset_tokens_val = find_header_value(
+        headers,
+        HEADER_RESET_TOKENS.as_ptr(),
+        24
+    );
+    if !reset_tokens_val.is_empty() {
+        self.reset_seconds_minute = parse_int_from_view(reset_tokens_val);
+    }
+}
+
+/// Check if a new request can be made.
+/// Returns false if rate limit is exhausted or if in sleep mode.
+pub fn RateLimiter::can_request(&self) -> bool {
+    // Cannot request while sleeping
+    if self.is_sleeping {
+        return false;
+    }
+
+    // Check if we've exhausted daily requests
+    if self.requests_remaining_day <= 0 {
+        return false;
+    }
+
+    // Check if we've exhausted per-minute tokens
+    if self.tokens_remaining_minute <= 0 {
+        return false;
+    }
+
+    return true;
+}
+
+/// Enter sleep mode for background compaction.
+/// Should be called when rate limits are approaching threshold.
+pub fn RateLimiter::enter_sleep(&mut self, seconds: i64) {
+    self.is_sleeping = true;
+    self.reset_seconds_day = seconds;
+    // During sleep, background compaction can occur
+}
+
+/// Exit sleep mode and resume normal operation.
+pub fn RateLimiter::exit_sleep(&mut self) {
+    self.is_sleeping = false;
+}
+
+// ============================================================================
+// Additional Utility Functions
+// ============================================================================
+
+/// Check if rate limits are approaching threshold and sleep should be entered.
+pub fn RateLimiter::should_enter_sleep(&self) -> bool {
+    if self.is_sleeping {
+        return false;
+    }
+
+    // Enter sleep if either limit is below threshold
+    if self.requests_remaining_day < REQUESTS_SLEEP_THRESHOLD {
+        return true;
+    }
+
+    if self.tokens_remaining_minute < TOKENS_SLEEP_THRESHOLD {
+        return true;
+    }
+
+    return false;
+}
+
+/// Get remaining requests for the day.
+pub fn RateLimiter::get_requests_remaining(&self) -> i64 {
+    return self.requests_remaining_day;
+}
+
+/// Get remaining tokens for the minute.
+pub fn RateLimiter::get_tokens_remaining(&self) -> i64 {
+    return self.tokens_remaining_minute;
+}
+
+/// Get seconds until daily reset.
+pub fn RateLimiter::get_reset_seconds_day(&self) -> i64 {
+    return self.reset_seconds_day;
+}
+
+/// Get seconds until minute reset.
+pub fn RateLimiter::get_reset_seconds_minute(&self) -> i64 {
+    return self.reset_seconds_minute;
+}
+
+/// Check if currently in sleep mode.
+pub fn RateLimiter::is_sleeping(&self) -> bool {
+    return self.is_sleeping;
+}
+
+/// Decrement request counters after making a request.
+pub fn RateLimiter::consume_request(&mut self, tokens_used: i64) {
+    if self.requests_remaining_day > 0 {
+        self.requests_remaining_day = self.requests_remaining_day - 1;
+    }
+    if self.tokens_remaining_minute > 0 {
+        self.tokens_remaining_minute = self.tokens_remaining_minute - tokens_used;
+        if self.tokens_remaining_minute < 0 {
+            self.tokens_remaining_minute = 0;
+        }
+    }
+}

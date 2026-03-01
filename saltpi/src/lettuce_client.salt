@@ -1,0 +1,442 @@
+// =============================================================================
+// SALTPI — Lettuce Client Wrapper
+// =============================================================================
+// Redis-compatible client for Lettuce memory backend using RESP protocol.
+//
+// Provides:
+//   - lettuce_connect() -> Connect to Lettuce server on localhost:6379
+//   - lettuce_set(key, value) -> SET command
+//   - lettuce_get(key) -> GET command  
+//   - lettuce_del(key) -> DEL command
+//   - lettuce_close(fd) -> Close connection
+// =============================================================================
+
+package saltpi.lettuce_client
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+use lettuce.resp
+
+// ============================================================================
+// FFI — TCP Client Functions (from std.http.client pattern)
+// ============================================================================
+
+extern fn http_tcp_connect(host: Ptr<u8>, port: i32) -> i32;
+extern fn http_recv(fd: i32, buf: Ptr<u8>, len: i64) -> i64;
+extern fn http_send(fd: i32, buf: Ptr<u8>, len: i64) -> i64;
+extern fn http_close(fd: i32) -> i32;
+extern fn memcpy(dst: Ptr<u8>, src: Ptr<u8>, n: i64) -> Ptr<u8>;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const LETTUCE_HOST: [u8; 10] = [108, 111, 99, 97, 108, 104, 111, 115, 116, 0]; // "localhost\0"
+const LETTUCE_PORT: i32 = 6379;
+const RECV_BUFFER_SIZE: i64 = 4096;
+
+// ============================================================================
+// Connection Management
+// ============================================================================
+
+/// Connect to Lettuce server on localhost:6379.
+/// Returns file descriptor on success, -1 on failure.
+pub fn lettuce_connect() -> i32 {
+    let host_ptr = LETTUCE_HOST.as_ptr();
+    let fd = http_tcp_connect(host_ptr, LETTUCE_PORT);
+    return fd;
+}
+
+/// Close a Lettuce connection.
+pub fn lettuce_close(fd: i32) {
+    http_close(fd);
+}
+
+// ============================================================================
+// RESP Command Builders
+// ============================================================================
+
+/// Write a bulk string to buffer.
+/// Format: $<len>\r\n<data>\r\n
+/// Returns bytes written.
+fn write_resp_bulk_string(buf: Ptr<u8>, data: Ptr<u8>, data_len: i64) -> i64 {
+    let mut pos: i64 = 0;
+    
+    // Write '$'
+    buf.offset(pos).write(36);
+    pos = pos + 1;
+    
+    // Write length as string
+    let len_str = write_i64_as_string(buf.offset(pos), data_len);
+    pos = pos + len_str;
+    
+    // Write '\r\n'
+    buf.offset(pos).write(13);
+    buf.offset(pos + 1).write(10);
+    pos = pos + 2;
+    
+    // Write data
+    memcpy(buf.offset(pos), data, data_len);
+    pos = pos + data_len;
+    
+    // Write '\r\n'
+    buf.offset(pos).write(13);
+    buf.offset(pos + 1).write(10);
+    pos = pos + 2;
+    
+    return pos;
+}
+
+/// Write i64 as ASCII string to buffer.
+/// Returns number of bytes written.
+fn write_i64_as_string(buf: Ptr<u8>, val: i64) -> i64 {
+    if val == 0 {
+        buf.write(48); // '0'
+        return 1;
+    }
+    
+    let mut v = val;
+    let mut neg = false;
+    if v < 0 {
+        neg = true;
+        v = 0 - v;
+    }
+    
+    // Write digits in reverse into temp buffer
+    let mut tmp: [u8; 20] = [0; 20];
+    let mut count: i64 = 0;
+    while v > 0 {
+        tmp[count] = ((v % 10) + 48) as u8;
+        v = v / 10;
+        count = count + 1;
+    }
+    
+    let mut pos: i64 = 0;
+    if neg {
+        buf.write(45); // '-'
+        pos = 1;
+    }
+    
+    // Reverse copy
+    let mut i = count - 1;
+    while i >= 0 {
+        buf.offset(pos).write(tmp[i]);
+        pos = pos + 1;
+        i = i - 1;
+    }
+    
+    return pos;
+}
+
+/// Build a RESP array command.
+/// Format: *<count>\r\n<elements>...
+/// Returns bytes written.
+fn build_resp_array(buf: Ptr<u8>, elements: Ptr<Ptr<u8>>, elem_lens: Ptr<i64>, count: i64) -> i64 {
+    let mut pos: i64 = 0;
+    
+    // Write '*' and array count
+    buf.offset(pos).write(42);
+    pos = pos + 1;
+    
+    let len_str = write_i64_as_string(buf.offset(pos), count);
+    pos = pos + len_str;
+    
+    // Write '\r\n'
+    buf.offset(pos).write(13);
+    buf.offset(pos + 1).write(10);
+    pos = pos + 2;
+    
+    // Write each element as bulk string
+    let mut i: i64 = 0;
+    while i < count {
+        let elem_ptr = elements.offset(i).read();
+        let elem_len = elem_lens.offset(i).read();
+        pos = pos + write_resp_bulk_string(buf.offset(pos), elem_ptr, elem_len);
+        i = i + 1;
+    }
+    
+    return pos;
+}
+
+// ============================================================================
+// String Length Helper
+// ============================================================================
+
+/// Get length of null-terminated string.
+fn strlen(s: Ptr<u8>) -> i64 {
+    let mut len: i64 = 0;
+    while s.offset(len).read() != 0 {
+        len = len + 1;
+    }
+    return len;
+}
+
+// ============================================================================
+// Response Parsing
+// ============================================================================
+
+/// Parse RESP response and check if it's OK/simple string.
+/// Returns true if response is +OK or similar success.
+fn parse_ok_response(buf: Ptr<u8>, bytes_read: i64) -> bool {
+    if bytes_read < 5 {
+        return false;
+    }
+    
+    // Check for +OK\r\n
+    if buf.read() == 43 { // '+'
+        // Check for "OK"
+        if buf.offset(1).read() == 79 && buf.offset(2).read() == 75 {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/// Parse RESP bulk string response and return the value.
+/// Returns pointer to value within buffer, or 0 if null/not found.
+fn parse_bulk_string_response(buf: Ptr<u8>, bytes_read: i64, out_len: Ptr<i64>) -> Ptr<u8> {
+    if bytes_read < 5 {
+        out_len.write(0);
+        return 0 as Ptr<u8>;
+    }
+    
+    let prefix = buf.read();
+    
+    // Check for null bulk string: $-1\r\n
+    if prefix == 36 { // '$'
+        if buf.offset(1).read() == 45 && buf.offset(2).read() == 49 { // "-1"
+            out_len.write(0);
+            return 0 as Ptr<u8>;
+        }
+        
+        // Parse length
+        let mut len_start: i64 = 1;
+        let mut len_end: i64 = 1;
+        while len_end < bytes_read && buf.offset(len_end).read() != 13 {
+            len_end = len_end + 1;
+        }
+        
+        let mut str_len: i64 = 0;
+        let mut i = len_start;
+        while i < len_end {
+            let b = buf.offset(i).read() as i64;
+            str_len = str_len * 10 + (b - 48);
+            i = i + 1;
+        }
+        
+        out_len.write(str_len);
+        
+        // Data starts after \r\n following the length
+        let data_start = len_end + 2;
+        return buf.offset(data_start);
+    }
+    
+    out_len.write(0);
+    return 0 as Ptr<u8>;
+}
+
+/// Parse integer response (for DEL command).
+/// Returns the integer value.
+fn parse_integer_response(buf: Ptr<u8>, bytes_read: i64) -> i64 {
+    if bytes_read < 4 {
+        return -1;
+    }
+    
+    let prefix = buf.read();
+    if prefix != 58 { // ':'
+        return -1;
+    }
+    
+    // Parse integer
+    let mut val: i64 = 0;
+    let mut neg = false;
+    let mut i: i64 = 1;
+    
+    if buf.offset(i).read() == 45 { // '-'
+        neg = true;
+        i = i + 1;
+    }
+    
+    while i < bytes_read {
+        let b = buf.offset(i).read() as i64;
+        if b < 48 || b > 57 {
+            break;
+        }
+        val = val * 10 + (b - 48);
+        i = i + 1;
+    }
+    
+    if neg {
+        return 0 - val;
+    }
+    return val;
+}
+
+// ============================================================================
+// Lettuce Commands
+// ============================================================================
+
+/// SET key value
+/// Returns true on success, false on failure.
+pub fn lettuce_set(key: Ptr<u8>, value: Ptr<u8>) -> bool {
+    let fd = lettuce_connect();
+    if fd < 0 {
+        return false;
+    }
+    
+    let key_len = strlen(key);
+    let val_len = strlen(value);
+    
+    // Build command: *3\r\n$3\r\nSET\r\n$<key_len>\r\n<key>\r\n$<val_len>\r\n<value>\r\n
+    let mut cmd_buf: [u8; 1024] = [0; 1024];
+    let cmd_ptr = cmd_buf.as_ptr();
+    
+    // Element pointers and lengths
+    let set_str: [u8; 3] = [83, 69, 84]; // "SET"
+    
+    let mut elements: [Ptr<u8>; 3] = [0 as Ptr<u8>; 3];
+    elements[0] = set_str.as_ptr();
+    elements[1] = key;
+    elements[2] = value;
+    
+    let mut elem_lens: [i64; 3] = [0; 3];
+    elem_lens[0] = 3;
+    elem_lens[1] = key_len;
+    elem_lens[2] = val_len;
+    
+    let cmd_len = build_resp_array(cmd_ptr, elements.as_ptr(), elem_lens.as_ptr(), 3);
+    
+    // Send command
+    let sent = http_send(fd, cmd_ptr, cmd_len);
+    if sent != cmd_len {
+        lettuce_close(fd);
+        return false;
+    }
+    
+    // Receive response
+    let mut resp_buf: [u8; 256] = [0; 256];
+    let resp_ptr = resp_buf.as_ptr();
+    let bytes_read = http_recv(fd, resp_ptr, 256);
+    
+    lettuce_close(fd);
+    
+    if bytes_read <= 0 {
+        return false;
+    }
+    
+    return parse_ok_response(resp_ptr, bytes_read);
+}
+
+/// GET key
+/// Returns pointer to value (stored in static buffer), or 0 if not found.
+/// Note: The returned pointer is valid until the next call to lettuce_get.
+static mut GET_RESULT_BUF: [u8; 4096] = [0; 4096];
+
+pub fn lettuce_get(key: Ptr<u8>) -> Ptr<u8> {
+    let fd = lettuce_connect();
+    if fd < 0 {
+        return 0 as Ptr<u8>;
+    }
+    
+    let key_len = strlen(key);
+    
+    // Build command: *2\r\n$3\r\nGET\r\n$<key_len>\r\n<key>\r\n
+    let mut cmd_buf: [u8; 512] = [0; 512];
+    let cmd_ptr = cmd_buf.as_ptr();
+    
+    let get_str: [u8; 3] = [71, 69, 84]; // "GET"
+    
+    let mut elements: [Ptr<u8>; 2] = [0 as Ptr<u8>; 2];
+    elements[0] = get_str.as_ptr();
+    elements[1] = key;
+    
+    let mut elem_lens: [i64; 2] = [0; 2];
+    elem_lens[0] = 3;
+    elem_lens[1] = key_len;
+    
+    let cmd_len = build_resp_array(cmd_ptr, elements.as_ptr(), elem_lens.as_ptr(), 2);
+    
+    // Send command
+    let sent = http_send(fd, cmd_ptr, cmd_len);
+    if sent != cmd_len {
+        lettuce_close(fd);
+        return 0 as Ptr<u8>;
+    }
+    
+    // Receive response
+    let mut resp_buf: [u8; 4096] = [0; 4096];
+    let resp_ptr = resp_buf.as_ptr();
+    let bytes_read = http_recv(fd, resp_ptr, 4096);
+    
+    lettuce_close(fd);
+    
+    if bytes_read <= 0 {
+        return 0 as Ptr<u8>;
+    }
+    
+    // Parse bulk string response
+    let mut val_len: i64 = 0;
+    let val_ptr = parse_bulk_string_response(resp_ptr, bytes_read, &val_len);
+    
+    if val_ptr == 0 as Ptr<u8> || val_len <= 0 {
+        return 0 as Ptr<u8>;
+    }
+    
+    // Copy to static result buffer and null-terminate
+    unsafe {
+        memcpy(GET_RESULT_BUF.as_ptr(), val_ptr, val_len);
+        GET_RESULT_BUF.as_ptr().offset(val_len).write(0);
+    }
+    
+    return unsafe { GET_RESULT_BUF.as_ptr() };
+}
+
+/// DEL key
+/// Returns true if key was deleted, false otherwise.
+pub fn lettuce_del(key: Ptr<u8>) -> bool {
+    let fd = lettuce_connect();
+    if fd < 0 {
+        return false;
+    }
+    
+    let key_len = strlen(key);
+    
+    // Build command: *2\r\n$3\r\nDEL\r\n$<key_len>\r\n<key>\r\n
+    let mut cmd_buf: [u8; 512] = [0; 512];
+    let cmd_ptr = cmd_buf.as_ptr();
+    
+    let del_str: [u8; 3] = [68, 69, 76]; // "DEL"
+    
+    let mut elements: [Ptr<u8>; 2] = [0 as Ptr<u8>; 2];
+    elements[0] = del_str.as_ptr();
+    elements[1] = key;
+    
+    let mut elem_lens: [i64; 2] = [0; 2];
+    elem_lens[0] = 3;
+    elem_lens[1] = key_len;
+    
+    let cmd_len = build_resp_array(cmd_ptr, elements.as_ptr(), elem_lens.as_ptr(), 2);
+    
+    // Send command
+    let sent = http_send(fd, cmd_ptr, cmd_len);
+    if sent != cmd_len {
+        lettuce_close(fd);
+        return false;
+    }
+    
+    // Receive response
+    let mut resp_buf: [u8; 64] = [0; 64];
+    let resp_ptr = resp_buf.as_ptr();
+    let bytes_read = http_recv(fd, resp_ptr, 64);
+    
+    lettuce_close(fd);
+    
+    if bytes_read <= 0 {
+        return false;
+    }
+    
+    // DEL returns integer: number of keys deleted
+    let count = parse_integer_response(resp_ptr, bytes_read);
+    return count > 0;
+}

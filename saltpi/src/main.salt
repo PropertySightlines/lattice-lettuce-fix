@@ -1,0 +1,25 @@
+// =============================================================================
+// SaltPi — Lightspeed Coding Agent
+// =============================================================================
+// Minimal coding agent in Salt, optimized for Cerebras/Groq free tier limits.
+// =============================================================================
+
+package main
+
+use std.core.ptr.Ptr
+
+// FFI declarations
+extern fn puts(s: Ptr<u8>) -> i32;
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() -> i32 {
+    puts("SaltPi v0.1.0\0" as Ptr<u8>);
+    puts("Lightspeed coding agent for Cerebras/Groq\0" as Ptr<u8>);
+    puts("------------------------------------------\0" as Ptr<u8>);
+    puts("Phase 1: Foundation\0" as Ptr<u8>);
+    puts("Status: Hello World working!\0" as Ptr<u8>);
+    return 0;
+}

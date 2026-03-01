@@ -1,0 +1,5 @@
+[package]
+name = "saltpi"
+version = "0.1.0"
+description = "SaltPi — Lightspeed coding agent for Cerebras/Groq free tier"
+entry = "src/main.salt"

@@ -1,0 +1,221 @@
+// =============================================================================
+// SALTPI — Lettuce Client Tests
+// =============================================================================
+// Tests for the Lettuce client wrapper.
+//
+// Run with a Lettuce server running on localhost:6379
+// =============================================================================
+
+package saltpi.tests.lettuce_test
+
+use std.core.ptr.Ptr
+use std.core.str.StringView
+use saltpi.lettuce_client
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+/// Print a string to stdout (using external C printf)
+extern fn printf(fmt: Ptr<u8>, ...) -> i32;
+
+fn print_line(msg: Ptr<u8>) {
+    let fmt: [u8; 12] = [37, 115, 10, 0]; // "%s\n\0"
+    printf(fmt.as_ptr(), msg);
+}
+
+fn print_int(msg: Ptr<u8>, val: i32) {
+    let fmt: [u8; 15] = [37, 115, 58, 32, 37, 100, 10, 0]; // "%s: %d\n\0"
+    printf(fmt.as_ptr(), msg, val);
+}
+
+fn print_result(test_name: Ptr<u8>, passed: bool) {
+    if passed {
+        let pass_fmt: [u8; 22] = [91, 80, 65, 83, 83, 93, 32, 37, 115, 10, 0]; // "[PASS] %s\n\0"
+        printf(pass_fmt.as_ptr(), test_name);
+    } else {
+        let fail_fmt: [u8; 23] = [91, 70, 65, 73, 76, 93, 32, 37, 115, 10, 0]; // "[FAIL] %s\n\0"
+        printf(fail_fmt.as_ptr(), test_name);
+    }
+}
+
+/// Get length of null-terminated string.
+fn strlen(s: Ptr<u8>) -> i64 {
+    let mut len: i64 = 0;
+    while s.offset(len).read() != 0 {
+        len = len + 1;
+    }
+    return len;
+}
+
+/// Compare two strings.
+fn strcmp(a: Ptr<u8>, b: Ptr<u8>) -> i32 {
+    let mut i: i64 = 0;
+    loop {
+        let ca = a.offset(i).read();
+        let cb = b.offset(i).read();
+        if ca != cb {
+            return (ca as i32) - (cb as i32);
+        }
+        if ca == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+/// Test: Connect to Lettuce server
+fn test_connect() -> bool {
+    let fd = lettuce_client::lettuce_connect();
+    if fd < 0 {
+        return false;
+    }
+    lettuce_client::lettuce_close(fd);
+    return true;
+}
+
+/// Test: SET and GET a value
+fn test_set_get() -> bool {
+    let key: [u8; 8] = [116, 101, 115, 116, 107, 101, 121, 0]; // "testkey\0"
+    let value: [u8; 14] = [116, 101, 115, 116, 118, 97, 108, 117, 101, 49, 50, 51, 0, 0]; // "testvalue123\0\0"
+    
+    // SET
+    let set_ok = lettuce_client::lettuce_set(key.as_ptr(), value.as_ptr());
+    if !set_ok {
+        return false;
+    }
+    
+    // GET
+    let result = lettuce_client::lettuce_get(key.as_ptr());
+    if result == 0 as Ptr<u8> {
+        return false;
+    }
+    
+    // Verify value
+    if strcmp(result, value.as_ptr()) != 0 {
+        return false;
+    }
+    
+    return true;
+}
+
+/// Test: GET non-existent key
+fn test_get_missing() -> bool {
+    let key: [u8; 15] = [110, 111, 116, 101, 120, 105, 115, 116, 107, 101, 121, 0, 0, 0, 0]; // "notexistkey\0\0\0\0"
+    
+    let result = lettuce_client::lettuce_get(key.as_ptr());
+    
+    // Should return null for missing key
+    return result == 0 as Ptr<u8>;
+}
+
+/// Test: SET and DEL
+fn test_set_del() -> bool {
+    let key: [u8; 7] = [100, 101, 108, 107, 101, 121, 0]; // "delkey\0"
+    let value: [u8; 10] = [116, 101, 109, 112, 118, 97, 108, 117, 101, 0]; // "tempvalue\0"
+    
+    // SET
+    let set_ok = lettuce_client::lettuce_set(key.as_ptr(), value.as_ptr());
+    if !set_ok {
+        return false;
+    }
+    
+    // Verify it exists
+    let result = lettuce_client::lettuce_get(key.as_ptr());
+    if result == 0 as Ptr<u8> {
+        return false;
+    }
+    
+    // DEL
+    let del_ok = lettuce_client::lettuce_del(key.as_ptr());
+    if !del_ok {
+        return false;
+    }
+    
+    // Verify it's gone
+    let result2 = lettuce_client::lettuce_get(key.as_ptr());
+    return result2 == 0 as Ptr<u8>;
+}
+
+/// Test: Overwrite existing key
+fn test_overwrite() -> bool {
+    let key: [u8; 7] = [111, 118, 101, 114, 107, 101, 121, 0]; // "overkey\0"
+    let value1: [u8; 10] = [118, 97, 108, 117, 101, 49, 49, 49, 0, 0]; // "value111\0\0"
+    let value2: [u8; 10] = [118, 97, 108, 117, 101, 50, 50, 50, 0, 0]; // "value222\0\0"
+    
+    // SET first value
+    let set1_ok = lettuce_client::lettuce_set(key.as_ptr(), value1.as_ptr());
+    if !set1_ok {
+        return false;
+    }
+    
+    // SET second value (overwrite)
+    let set2_ok = lettuce_client::lettuce_set(key.as_ptr(), value2.as_ptr());
+    if !set2_ok {
+        return false;
+    }
+    
+    // GET should return second value
+    let result = lettuce_client::lettuce_get(key.as_ptr());
+    if result == 0 as Ptr<u8> {
+        return false;
+    }
+    
+    return strcmp(result, value2.as_ptr()) == 0;
+}
+
+// ============================================================================
+// Main Test Runner
+// ============================================================================
+
+pub fn run_all_tests() -> i32 {
+    let mut passed: i32 = 0;
+    let mut failed: i32 = 0;
+    
+    print_line("========================================");
+    print_line("Lettuce Client Tests");
+    print_line("========================================");
+    print_line("");
+    
+    // Test 1: Connect
+    let t1 = test_connect();
+    print_result("test_connect", t1);
+    if t1 { passed = passed + 1; } else { failed = failed + 1; }
+    
+    // Test 2: SET and GET
+    let t2 = test_set_get();
+    print_result("test_set_get", t2);
+    if t2 { passed = passed + 1; } else { failed = failed + 1; }
+    
+    // Test 3: GET missing key
+    let t3 = test_get_missing();
+    print_result("test_get_missing", t3);
+    if t3 { passed = passed + 1; } else { failed = failed + 1; }
+    
+    // Test 4: SET and DEL
+    let t4 = test_set_del();
+    print_result("test_set_del", t4);
+    if t4 { passed = passed + 1; } else { failed = failed + 1; }
+    
+    // Test 5: Overwrite
+    let t5 = test_overwrite();
+    print_result("test_overwrite", t5);
+    if t5 { passed = passed + 1; } else { failed = failed + 1; }
+    
+    print_line("");
+    print_line("========================================");
+    
+    let pass_fmt: [u8; 20] = [80, 97, 115, 115, 101, 100, 58, 32, 37, 100, 47, 37, 100, 10, 0]; // "Passed: %d/%d\n\0"
+    printf(pass_fmt.as_ptr(), passed, passed + failed);
+    
+    print_line("========================================");
+    
+    if failed > 0 {
+        return 1;
+    }
+    return 0;
+}
