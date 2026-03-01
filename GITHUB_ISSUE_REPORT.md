@@ -21,7 +21,7 @@ Successfully ported the Lattice project to Linux with the following accomplishme
 - ✅ **Lettuce server fixed** — Redis-compatible server now works (`redis-cli ping` → `PONG`)
 - ✅ **Basalt validated** — LLM inference engine builds and runs
 - ✅ **Facet validated** — Raster tests pass (14/14), Tiger demo renders
-- ✅ **Kernel builds successfully** — `is_kvm` fix applied, QEMU boot pending
+- ✅ **Kernel boots successfully in QEMU** — 4-core SMP, all tests passing
 - ✅ **Benchmarks pass** — Salt performs ≤ C in head-to-head comparisons
 
 ---
@@ -48,7 +48,7 @@ Architecture:    x86_64-pc-linux-gnu
 | **Lettuce** | ✅ Fixed | Stack frame bug resolved, `redis-cli ping` → `PONG` |
 | **Basalt** | ✅ Works | LLM inference engine, ~870 tok/s expected |
 | **Facet** | ✅ Works | Raster tests pass (14/14), Tiger demo renders |
-| **Kernel** | ✅ Builds | `is_kvm` fixed, 373KB ELF, QEMU boot requires installation |
+| **Kernel** | ✅ **BOOTS** | 373KB ELF, 4-core SMP, QEMU boot successful |
 | **Benchmarks** | ✅ Pass | Salt ≤ C in head-to-head comparisons |
 
 ---
@@ -293,6 +293,64 @@ $ file qemu_build/kernel.elf
 ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, not stripped
 ```
 
+### QEMU Boot Test
+
+**QEMU Version:** 10.0.7 (Debian 1:10.0.7+ds-0+deb13u1+b1)
+
+**Boot Command:**
+```bash
+timeout 30 qemu-system-x86_64 \
+  -kernel qemu_build/kernel.elf \
+  -m 512M \
+  -smp 4 \
+  -cpu qemu64,+fxsr,+mmx,+sse,+sse2,+xsave \
+  -nographic \
+  -serial mon:stdio \
+  -no-reboot
+```
+
+**Boot Results:**
+
+✅ **Kernel boots successfully with full SMP bring-up:**
+```
+LATTICE BOOT: Serial OK
+LATTICE BOOT: GDT...
+LATTICE BOOT: IDT...
+LATTICE BOOT: PIT...
+LATTICE BOOT: SMP...
+SMP BRING-UP TEST SUITE
+  [TEST] Layer 1: RSDP Discovery — PASS
+  [TEST] Layer 2: MADT Parsing — PASS (4 CPUs detected)
+  [TEST] Layer 3: Local APIC Init — PASS
+  [TEST] Layer 4: APIC Timer — PASS
+  [TEST] Layer 5: AP Boot — PASS (All 3 APs online)
+SMP TEST SUITE COMPLETE: 4 CPUs
+```
+
+✅ **All subsystem tests passing:**
+- PER-CORE SHARDING TEST SUITE — COMPLETE
+- ASYNC FIBER TEST SUITE — COMPLETE
+- PREEMPTIVE UNIFICATION TEST SUITE — COMPLETE
+- IST ISOLATION TEST SUITE — ALL_PASS (5/5)
+- RING3 IRETQ FRAME TEST SUITE — ALL_PASS
+- RING3 KPTI TEST SUITE — ALL_PASS
+- PCID ALLOCATION TEST — ALL_PASS
+- PCID CR3 NOFLUSH TEST — ALL_PASS
+
+**Key boot messages:**
+```
+LATTICE KERNEL BOOT [OK]
+[SMP] APs released
+[Lattice] PREEMPTIVE MODE
+[Lattice] Loading Mode B SIP...
+[Lattice] GDT/TSS Ring 3 ready (IST1=NMI, IST2=DF)
+[Lattice] IST gates wired: NMI=0x02/IST1, DF=0x08/IST2
+[Lattice] PCID enabled (CR4.PCIDE=1)
+[Lattice] SYSCALL MSRs configured
+```
+
+**Runtime:** Kernel ran for full 30 seconds before timeout — no panics or crashes.
+
 ### Commit
 **Commit:** [`0296158`](https://github.com/PropertySightlines/lattice-lettuce-fix/commit/0296158) — "fix(kernel): Move is_kvm declaration before first use in netd_bench"
 
@@ -402,8 +460,6 @@ The following items require maintainer input:
 3. **Should Homebrew paths be made configurable?** Currently scripts hardcode `/opt/homebrew/opt/llvm@18/bin/clang`. Should this be environment-variable configurable or auto-detected?
 
 4. **Stack frame bug long-term fix:** The Lettuce fix is a workaround. Should the Salt compiler's stack frame calculation be audited and fixed properly?
-
-5. **QEMU boot testing:** Requires `qemu-system-x86` installation. Should this be added to CI/CD requirements?
 
 ---
 
