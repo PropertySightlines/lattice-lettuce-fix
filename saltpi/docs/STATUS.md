@@ -2,7 +2,7 @@
 
 **Date:** March 1, 2026  
 **Phase:** Phase 1 - Foundation  
-**Status:** ✅ HTTPS Client with TLS Implemented
+**Status:** ✅ Consolidated Working Build
 
 ---
 
@@ -10,7 +10,7 @@
 
 SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq free tier constraints. The project implements observational memory with Lettuce as the memory backend.
 
-**Current Status:** Phase 1 foundation progressing - HTTPS client with TLS (OpenSSL) implemented and working.
+**Current Status:** Phase 1 foundation consolidated - working build with core components. Modules (config, provider, json_parser) need re-implementation with proper Salt module patterns.
 
 ---
 
@@ -19,13 +19,15 @@ SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq
 | Component | Status | Location | Notes |
 |-----------|--------|----------|-------|
 | **Hello World** | ✅ Working | `src/main.salt` | Basic binary compiles and runs |
-| **Rate Limiter** | ✅ Implemented | `src/rate_limiter.salt` | Cerebras/Groq header parsing, sleep state |
-| **Memory Manager** | ✅ Implemented | Inline in main.salt | 30k/40k token thresholds |
-| **Lettuce Client** | ✅ Implemented | `src/lettuce_client.salt` | SET/GET/DEL commands, RESP protocol |
-| **Tools** | ✅ Implemented | `src/tools.salt` | read/write/edit/bash stubs |
-| **HTTPS Client** | ✅ Implemented | `src/main.salt` | TLS via OpenSSL (salt_tls_* FFI) |
-| **Cerebras API** | ⚠️ Stub | `src/main.salt` | HTTPS works, needs JSON parsing |
-| **TUI** | ❌ Not started | - | Terminal input/output loop |
+| **Rate Limiter** | ✅ Implemented | `src/rate_limiter.salt` | Cerebras/Groq tracking |
+| **Memory Manager** | ✅ Implemented | Inline | 30k/40k token thresholds |
+| **Lettuce Client** | ✅ Implemented | `src/lettuce_client.salt` | SET/GET/DEL, RESP protocol |
+| **Tools** | ✅ Stubs | `src/tools.salt` | read/write/edit/bash |
+| **HTTPS Client** | ✅ Implemented | `src/main.salt` | TLS via OpenSSL FFI |
+| **Config (env vars)** | ⚠️ Removed | - | Needs re-implementation |
+| **JSON Parser** | ⚠️ Removed | - | Needs re-implementation |
+| **Provider Module** | ⚠️ Removed | - | Needs re-implementation |
+| **TUI** | ❌ Not started | - | Terminal input/output |
 | **Agent Loop** | ❌ Not started | - | Core agent logic |
 
 ---
