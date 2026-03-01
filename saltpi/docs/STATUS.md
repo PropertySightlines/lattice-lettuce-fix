@@ -2,7 +2,7 @@
 
 **Date:** March 1, 2026  
 **Phase:** Phase 1 - Foundation  
-**Status:** ✅ HTTP Client Implemented
+**Status:** ✅ HTTPS Client with TLS Implemented
 
 ---
 
@@ -10,7 +10,7 @@
 
 SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq free tier constraints. The project implements observational memory with Lettuce as the memory backend.
 
-**Current Status:** Phase 1 foundation progressing - HTTP client for Cerebras API implemented.
+**Current Status:** Phase 1 foundation progressing - HTTPS client with TLS (OpenSSL) implemented and working.
 
 ---
 
@@ -23,8 +23,8 @@ SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq
 | **Memory Manager** | ✅ Implemented | Inline in main.salt | 30k/40k token thresholds |
 | **Lettuce Client** | ✅ Implemented | `src/lettuce_client.salt` | SET/GET/DEL commands, RESP protocol |
 | **Tools** | ✅ Implemented | `src/tools.salt` | read/write/edit/bash stubs |
-| **HTTP Client** | ✅ Implemented | `src/http_client.salt` | POST request building, response parsing |
-| **Cerebras API** | ⚠️ Stub | `src/main.salt` | HTTP works, needs HTTPS |
+| **HTTPS Client** | ✅ Implemented | `src/main.salt` | TLS via OpenSSL (salt_tls_* FFI) |
+| **Cerebras API** | ⚠️ Stub | `src/main.salt` | HTTPS works, needs JSON parsing |
 | **TUI** | ❌ Not started | - | Terminal input/output loop |
 | **Agent Loop** | ❌ Not started | - | Core agent logic |
 
@@ -36,14 +36,14 @@ SaltPi is a lightspeed coding agent written in Salt, optimized for Cerebras/Groq
 $ cd saltpi && sp build
 📦 Building saltpi v0.1.0 [debug]
    🔨 Compiling 4 module(s)...
-✅ Built ./target/debug/saltpi in 0.7s
+✅ Built ./target/debug/saltpi in 1.3s
 
 $ ./target/debug/saltpi
 SaltPi v0.1.0
-Lightspeed coding agent for Cerebras/Groq
+Lightspeed coding agent
 ------------------------------------------
 Phase 1: Foundation
-Status: Hello World working!
+Status: HTTPS client with TLS implemented
 ```
 
 ---
@@ -88,6 +88,18 @@ fn route(recv_buf: Ptr<u8>, n: i64, send_buf: Ptr<u8>) -> i64 {
     // ... parse request ...
     return write_response(send_buf, 200, content_type, body);
 }
+```
+
+**TLS Pattern (from std/crypto/tls.salt):**
+```salt
+use std.crypto.tls.{TlsContext, TlsStream}
+
+let ctx = TlsContext::client();
+let fd = http_tcp_connect(host, port);
+let ssl = ctx.connect(fd);
+ssl.write(buf, len);
+ssl.read(buf, len);
+ssl.close();
 ```
 
 ### 3. Pi Coding Agent Format
