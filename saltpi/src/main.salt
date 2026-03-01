@@ -1,30 +1,8 @@
-// SaltPi — Lightspeed Coding Agent
-// Minimal coding agent in Salt for Cerebras/Groq free tier limits.
-
 package main
-
-use std.core.ptr.Ptr
 
 extern fn puts(s: Ptr<u8>) -> i32;
 
 fn main() -> i32 {
     puts("SaltPi v0.1.0\0" as Ptr<u8>);
-    puts("Lightspeed coding agent\0" as Ptr<u8>);
-    puts("------------------------------------------\0" as Ptr<u8>);
-    puts("Phase 1: Foundation\0" as Ptr<u8>);
-    puts("\0" as Ptr<u8>);
-    puts("Components implemented:\0" as Ptr<u8>);
-    puts("  - HTTPS client with TLS (OpenSSL)\0" as Ptr<u8>);
-    puts("  - Lettuce client (Redis backend)\0" as Ptr<u8>);
-    puts("  - Rate limiter\0" as Ptr<u8>);
-    puts("  - Memory manager\0" as Ptr<u8>);
-    puts("  - Tools (read/write/edit/bash stubs)\0" as Ptr<u8>);
-    puts("\0" as Ptr<u8>);
-    puts("Next steps:\0" as Ptr<u8>);
-    puts("  - Environment config (API keys)\0" as Ptr<u8>);
-    puts("  - JSON parsing (Cerebras/Groq responses)\0" as Ptr<u8>);
-    puts("  - TUI (terminal input/output)\0" as Ptr<u8>);
-    puts("  - Agent loop integration\0" as Ptr<u8>);
-    
     return 0;
 }
