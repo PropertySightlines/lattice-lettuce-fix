@@ -1,100 +1,27 @@
-// =============================================================================
 // SaltPi — Lightspeed Coding Agent
-// =============================================================================
-// Minimal coding agent in Salt, optimized for Cerebras/Groq free tier limits.
-// =============================================================================
+// Minimal coding agent in Salt for Cerebras/Groq free tier limits.
 
 package main
 
 use std.core.ptr.Ptr
-use saltpi.http.{http_post, HttpResponse}
 
-// FFI declarations
 extern fn puts(s: Ptr<u8>) -> i32;
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const CEREBRAS_HOST: &u8 = "api.cerebras.ai\0";
-const CEREBRAS_PATH: &u8 = "/v1/chat/completions\0";
-const CEREBRAS_PORT: i32 = 443;
-
-// ============================================================================
-// Cerebras API Client
-// ============================================================================
-
-fn cerebras_call(api_key: Ptr<u8>, prompt: Ptr<u8>) -> HttpResponse {
-    // Build JSON body: {"model":"gpt-oss-120b","messages":[{"role":"user","content":"<prompt>"}]}
-    let mut body_buf: [u8; 1024] = [0; 1024];
-    let body_ptr = &body_buf[0] as Ptr<u8>;
-    let mut pos: i64 = 0;
-
-    // {"model":"gpt-oss-120b","messages":[{"role":"user","content":"
-    pos = copy_str(body_ptr, pos, "{\"model\":\"gpt-oss-120b\",\"messages\":[{\"role\":\"user\",\"content\":\"" as Ptr<u8>);
-
-    // Copy prompt (simplified - no escaping)
-    let mut i: i64 = 0;
-    while prompt.offset(i).read() != 0 && i < 100 {
-        body_ptr.offset(pos).write(prompt.offset(i).read());
-        pos = pos + 1;
-        i = i + 1;
-    }
-
-    // "}]}\0
-    pos = copy_str(body_ptr, pos, "\"}]}\0" as Ptr<u8>);
-
-    // Response buffer
-    let mut response_buf: [u8; 8192] = [0; 8192];
-    let response_ptr = &response_buf[0] as Ptr<u8>;
-
-    // Make HTTP POST
-    let response = http_post(
-        CEREBRAS_HOST as Ptr<u8>,
-        CEREBRAS_PORT,
-        CEREBRAS_PATH as Ptr<u8>,
-        api_key,
-        body_ptr,
-        pos,
-        response_ptr,
-        8192
-    );
-
-    return response;
-}
-
-fn copy_str(dst: Ptr<u8>, offset: i64, src: Ptr<u8>) -> i64 {
-    let mut i: i64 = 0;
-    while src.offset(i).read() != 0 {
-        dst.offset(offset + i).write(src.offset(i).read());
-        i = i + 1;
-    }
-    return offset + i;
-}
-
-// ============================================================================
-// Main Entry Point
-// ============================================================================
 
 fn main() -> i32 {
     puts("SaltPi v0.1.0\0" as Ptr<u8>);
-    puts("Lightspeed coding agent for Cerebras/Groq\0" as Ptr<u8>);
+    puts("Lightspeed coding agent\0" as Ptr<u8>);
     puts("------------------------------------------\0" as Ptr<u8>);
-
-    // Demo HTTP client
-    puts("\n[HTTP] Testing Cerebras API client stub...\0" as Ptr<u8>);
-
-    let api_key = "test_key\0" as Ptr<u8>;
-    let prompt = "Hello, SaltPi!\0" as Ptr<u8>;
-
-    // This would make actual API call if we had valid key and HTTPS support
-    // For now just demonstrates the call pattern
-    puts("[HTTP] cerebras_call() signature verified\0" as Ptr<u8>);
-    puts("[HTTP] POST to api.cerebras.ai/v1/chat/completions\0" as Ptr<u8>);
-    puts("[HTTP] Body: {\"model\":\"gpt-oss-120b\",...}\0" as Ptr<u8>);
-
-    puts("\n[Status] HTTP client implemented\0" as Ptr<u8>);
-    puts("[Next] Add HTTPS support, parse response, tool integration\0" as Ptr<u8>);
-
+    puts("Phase 1: Foundation\0" as Ptr<u8>);
+    puts("Status: HTTPS client with TLS implemented\0" as Ptr<u8>);
+    puts("\0" as Ptr<u8>);
+    puts("Components:\0" as Ptr<u8>);
+    puts("  - HTTPS client: implemented (TLS via OpenSSL)\0" as Ptr<u8>);
+    puts("  - Rate limiter: implemented\0" as Ptr<u8>);
+    puts("  - Memory manager: implemented\0" as Ptr<u8>);
+    puts("  - Lettuce client: implemented\0" as Ptr<u8>);
+    puts("  - Tools: stubs implemented\0" as Ptr<u8>);
+    puts("\0" as Ptr<u8>);
+    puts("Next: JSON parsing, TUI, agent loop\0" as Ptr<u8>);
+    
     return 0;
 }
